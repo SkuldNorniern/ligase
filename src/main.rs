@@ -9,6 +9,7 @@ mod explorer;
 mod jobs;
 mod lang;
 mod lsp;
+mod palette;
 mod search;
 mod syntax;
 mod terminal;
@@ -157,7 +158,10 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
         }
     };
     let mut file = bar.add_submenu(a.texts.tr("File"))?;
+    add(&mut file, "Quick Open", Command::QuickOpen)?;
+    file.add_separator()?;
     add(&mut file, "Save", Command::Save)?;
+    add(&mut file, "Close Tab", Command::CloseTab)?;
     let mut edit = bar.add_submenu(a.texts.tr("Edit"))?;
     add(&mut edit, "Undo", Command::Undo)?;
     add(&mut edit, "Redo", Command::Redo)?;
@@ -192,7 +196,12 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut go, "Go to Line", Command::GotoLine)?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
     add(&mut go, "Show Hover", Command::ShowHover)?;
+    go.add_separator()?;
+    add(&mut go, "Next Tab", Command::NextTab)?;
+    add(&mut go, "Previous Tab", Command::PrevTab)?;
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
+    add(&mut view, "Command Palette", Command::Commands)?;
+    view.add_separator()?;
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;
     let terminal = add(&mut view, "Terminal", Command::ToggleTerminal)?;

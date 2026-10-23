@@ -120,6 +120,18 @@ impl Workbench {
         Ok(())
     }
 
+    /// shows the tab `by` places along from `pane` in its group, wrapping
+    /// round. gives the tab now shown.
+    pub fn cycle(&mut self, pane: PaneId, by: isize) -> Option<PaneId> {
+        let plan = self.dock.tree.plan()?;
+        let group = group_of(&plan, pane)?;
+        let at = group.iter().position(|p| *p == pane)?;
+        let len = isize::try_from(group.len()).ok()?;
+        let next = group[usize::try_from((at as isize + by).rem_euclid(len)).ok()?];
+        self.tree().activate(next);
+        Some(next)
+    }
+
     /// shows or hides a tool panel. it comes back at its home spot.
     pub fn toggle(&mut self, panel: Panel) {
         let pane = self.panels.pane(panel);
@@ -285,6 +297,16 @@ impl Workbench {
 
 /// plan with slots swapped for panes. slots that map to none are dropped;
 /// a group left empty goes too and its split collapses.
+/// the tabs of the group holding `pane`, in order.
+fn group_of(plan: &DockPlan<PaneId>, pane: PaneId) -> Option<Vec<PaneId>> {
+    match plan {
+        DockPlan::Tabs { panels, .. } => panels.contains(&pane).then(|| panels.clone()),
+        DockPlan::Split { first, second, .. } => {
+            group_of(first, pane).or_else(|| group_of(second, pane))
+        }
+    }
+}
+
 fn map_plan(
     plan: DockPlan<usize>,
     f: &impl Fn(usize) -> Option<PaneId>,
@@ -375,6 +397,17 @@ mod tests {
         assert_eq!(bench.close(pane, &mut docs), Ok(()));
         assert!(in_tree(&bench, Panel::Welcome));
         assert!(docs.view(view).is_none());
+    }
+
+    #[test]
+    fn tabs_cycle_in_their_group() {
+        let mut docs = Documents::default();
+        let mut bench = Workbench::default();
+        let a = bench.show_editor(open_file(&mut docs, "a.rs"));
+        let b = bench.show_editor(open_file(&mut docs, "b.rs"));
+        assert_eq!(bench.cycle(b, 1), Some(a));
+        assert!(bench.dock.tree.is_active(a));
+        assert_eq!(bench.cycle(a, -1), Some(b));
     }
 
     #[test]

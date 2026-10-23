@@ -22,6 +22,7 @@ use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
 use crate::lsp::{self, Lsp};
+use crate::palette::{self, Kind, Palette};
 use crate::search::{self, Finder};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
@@ -42,6 +43,9 @@ pub enum Id {
     FindField,
     ReplaceField,
     FindButton(u16),
+    Palette,
+    PaletteField,
+    PaletteRow(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +72,48 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    QuickOpen,
+    Commands,
+    CloseTab,
+    NextTab,
+    PrevTab,
 }
+
+/// every command by name, for the palette.
+const COMMANDS: &[(&str, Command)] = &[
+    ("Quick Open", Command::QuickOpen),
+    ("Save", Command::Save),
+    ("Close Tab", Command::CloseTab),
+    ("Next Tab", Command::NextTab),
+    ("Previous Tab", Command::PrevTab),
+    ("Undo", Command::Undo),
+    ("Redo", Command::Redo),
+    ("Cut", Command::Cut),
+    ("Copy", Command::Copy),
+    ("Paste", Command::Paste),
+    ("Select All", Command::SelectAll),
+    ("Select Line", Command::Line(LineOp::Select)),
+    ("Toggle Comment", Command::Line(LineOp::Comment)),
+    ("Move Line Up", Command::Line(LineOp::Move(true))),
+    ("Move Line Down", Command::Line(LineOp::Move(false))),
+    ("Copy Line Up", Command::Line(LineOp::Copy(true))),
+    ("Copy Line Down", Command::Line(LineOp::Copy(false))),
+    ("Delete Line", Command::Line(LineOp::Delete)),
+    ("Find", Command::Find),
+    ("Replace", Command::Replace),
+    ("Find Next", Command::FindNext),
+    ("Find Previous", Command::FindPrev),
+    ("Find in Files", Command::FindInFiles),
+    ("Go to Line", Command::GotoLine),
+    ("Go to Definition", Command::GotoDefinition),
+    ("Show Hover", Command::ShowHover),
+    ("Explorer", Command::ToggleExplorer),
+    ("Terminal", Command::ToggleTerminal),
+    ("Zoom In", Command::ZoomIn),
+    ("Zoom Out", Command::ZoomOut),
+    ("Reset Zoom", Command::ZoomReset),
+    ("Reset Layout", Command::ResetLayout),
+];
 
 /// what the worker hands back.
 enum Done {
@@ -80,6 +125,7 @@ enum Done {
     Shell(Result<vanta::Terminal, String>),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
+    Files(Vec<palette::Item>),
 }
 
 pub struct App {
@@ -103,6 +149,8 @@ pub struct App {
     zoom: f32,
     /// find, replace and go to line for one editor.
     bar: Bar,
+    /// quick open and commands.
+    palette: Palette,
     /// the editor that had the keyboard last, even while a field has it.
     last_editor: Option<ViewId>,
     /// last key or click in an editor; the caret blinks from there.
@@ -148,6 +196,7 @@ impl App {
             line_clip: None,
             zoom: editor::SIZE,
             bar: Bar::default(),
+            palette: Palette::default(),
             last_editor: None,
             typed_at: Instant::now(),
             shell_focus: false,
@@ -199,6 +248,24 @@ impl App {
         }
         if self.ui.popup_open() {
             return self.ui.handle(event);
+        }
+        if self.palette.is_open()
+            && let WindowEvent::KeyInput {
+                key, pressed: true, ..
+            } = event
+        {
+            let rows = palette::view::ROWS;
+            let step = match key {
+                KeyCode::Up => Some(-1),
+                KeyCode::Down => Some(1),
+                KeyCode::PageUp => Some(-(rows as isize)),
+                KeyCode::PageDown => Some(rows as isize),
+                _ => None,
+            };
+            if let Some(by) = step {
+                self.palette.step(by, rows);
+                return true;
+            }
         }
         if let WindowEvent::MouseWheel {
             delta_x,
@@ -424,6 +491,46 @@ impl App {
                 }
                 return;
             }
+            Command::QuickOpen | Command::Commands => {
+                if command == Command::QuickOpen {
+                    self.palette.open(Kind::Files);
+                    self.list_files();
+                } else {
+                    self.palette.commands = COMMANDS
+                        .iter()
+                        .map(|(label, c)| palette::Item {
+                            text: self.texts.tr(label).to_owned(),
+                            note: self
+                                .keymap
+                                .chord_for(c)
+                                .map(|chord| chord.label())
+                                .unwrap_or_default(),
+                        })
+                        .collect();
+                    self.palette.open(Kind::Commands);
+                }
+                self.ui.focus(Id::PaletteField, 0);
+                return;
+            }
+            Command::CloseTab => {
+                if let Some(view) = focus.or(self.last_editor)
+                    && let Some(pane) = self.bench.panels.find(Panel::Editor(view))
+                {
+                    self.close_pane(pane);
+                }
+                return;
+            }
+            Command::NextTab | Command::PrevTab => {
+                let by = if command == Command::NextTab { 1 } else { -1 };
+                if let Some(view) = focus.or(self.last_editor)
+                    && let Some(pane) = self.bench.panels.find(Panel::Editor(view))
+                    && let Some(next) = self.bench.cycle(pane, by)
+                    && let Some(Panel::Editor(v)) = self.bench.panels.get(next)
+                {
+                    self.ui.focus(Id::Editor(v), 1);
+                    self.last_editor = Some(v);
+                }
+            }
             Command::Line(op) => {
                 if let Some(view) = focus {
                     editor::line_op(&mut self.docs, view, op);
@@ -484,6 +591,73 @@ impl App {
             }
         }
         self.layout_dirty = true;
+    }
+
+    /// lists the workspace files on the worker for quick open. the old
+    /// list stays up meanwhile.
+    fn list_files(&mut self) {
+        if self.palette.listing {
+            return;
+        }
+        let root = self.explorer.root().to_path_buf();
+        self.palette.listing = self
+            .jobs
+            .run(move || Done::Files(palette::list_files(&root)));
+    }
+
+    /// a tab asked to close; unsaved work keeps it open.
+    fn close_pane(&mut self, pane: PaneId) {
+        match self.bench.close(pane, &mut self.docs) {
+            Ok(()) => self.layout_dirty = true,
+            Err(Refused::Unsaved) => {
+                self.status = self.texts.tr("save it first, it has changes").to_owned();
+            }
+            Err(Refused::KeepsEditorArea) => {}
+        }
+    }
+
+    /// what the palette asked for.
+    fn palette_ask(&mut self, ask: palette::view::Ask) {
+        let editor = self.last_editor;
+        let (kind, query) = self.palette.wanted();
+        let goto = query.strip_prefix(':').and_then(find::parse_goto);
+        let picked = self.palette.picked();
+        self.palette.close();
+        if ask == palette::view::Ask::Close {
+            if let Some(view) = editor {
+                self.ui.focus(Id::Editor(view), 1);
+            }
+            return;
+        }
+        if let Some((line, column)) = goto {
+            if let Some(view) = editor
+                && let Some(v) = self.docs.view_mut(view)
+            {
+                v.goto = Some((Point::new(line, column), Encoding::Utf32));
+                self.ui.focus(Id::Editor(view), 1);
+            }
+            return;
+        }
+        let Some(item) = picked else { return };
+        match kind {
+            Kind::Files => {
+                let Some(rel) = self.palette.files.get(item).map(|i| i.text.clone()) else {
+                    return;
+                };
+                let path = self.explorer.root().join(rel);
+                let view = self.open_file(&path);
+                self.ui.focus(Id::Editor(view), 1);
+                self.last_editor = Some(view);
+            }
+            Kind::Commands => {
+                if let Some(view) = editor {
+                    self.ui.focus(Id::Editor(view), 1);
+                }
+                if let Some(&(_, command)) = COMMANDS.get(item) {
+                    self.run(command);
+                }
+            }
+        }
     }
 
     /// opens the bar on `view`. find starts from the selection, when it is
@@ -806,6 +980,10 @@ impl App {
                 },
                 Done::Shell(result) => self.shell.started(result),
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
+                Done::Files(files) => {
+                    self.palette.listing = false;
+                    self.palette.files = files;
+                }
                 Done::Server(language, result) => {
                     if let Some(why) = self.lsp.started(language, result) {
                         // a missing server is fine; the editor works without it
@@ -901,6 +1079,7 @@ impl App {
         let zoom = self.zoom;
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
         let mut bar_ask = None;
+        let palette_ask;
         let note = self.found_note();
         let changed;
         let place = self.place();
@@ -989,6 +1168,7 @@ impl App {
                 // its editor is not in sight; the bar goes with it
                 bar.mode = None;
             }
+            palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
             status_bar(&mut ui, status, &message, &place)?;
         }
         self.focus = focus;
@@ -998,6 +1178,9 @@ impl App {
         self.ime = ime;
         if let Some(ask) = bar_ask {
             self.bar_ask(ask);
+        }
+        if let Some(ask) = palette_ask {
+            self.palette_ask(ask);
         }
         self.shell_focus = shell_focus;
         match found {
@@ -1032,13 +1215,7 @@ impl App {
         }
         for event in self.bench.dock.take_tab_events() {
             if let DockTabEvent::CloseRequested(pane) = event {
-                match self.bench.close(pane, &mut self.docs) {
-                    Ok(()) => self.layout_dirty = true,
-                    Err(Refused::Unsaved) => {
-                        self.status = self.texts.tr("save it first, it has changes").to_owned();
-                    }
-                    Err(Refused::KeepsEditorArea) => {}
-                }
+                self.close_pane(pane);
             }
         }
         for click in clicks {
@@ -1163,6 +1340,11 @@ fn keymap() -> Keymap<Command> {
         )
         .bind(Chord::command(KeyCode::L), Command::Line(LineOp::Select))
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
+        .bind(Chord::command(KeyCode::P), Command::QuickOpen)
+        .bind(Chord::command(KeyCode::P).shift(), Command::Commands)
+        .bind(Chord::command(KeyCode::W), Command::CloseTab)
+        .bind(Chord::key(KeyCode::Tab).ctrl(), Command::NextTab)
+        .bind(Chord::key(KeyCode::Tab).ctrl().shift(), Command::PrevTab)
         .bind(Chord::command(KeyCode::F), Command::Find)
         .bind(Chord::command(KeyCode::H), Command::Replace)
         .bind(Chord::key(KeyCode::F3), Command::FindNext)
