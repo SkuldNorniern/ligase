@@ -2,15 +2,21 @@
 //! worker; results come back through `Done`.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use aurea::render::{CanvasId, DrawingContext, Rect, request_canvas_redraw};
+use aurea::render::{
+    CanvasId, DrawingContext, Rect, request_canvas_redraw, request_canvas_redraw_at,
+};
 use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 
-use resolvase::{Encoding, Point, SavePoint};
+use resolvase::{Encoding, Point, Revision, SavePoint};
 
 use crate::document::{self, DocumentId, Documents, ViewId};
+use crate::editor::cursor::Selection;
+use crate::editor::find::{self, Bar, Mode};
 use crate::editor::{self, LineOp, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
@@ -32,6 +38,10 @@ pub enum Id {
     Terminal,
     SearchField,
     SearchList,
+    FindBar,
+    FindField,
+    ReplaceField,
+    FindButton(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,12 +54,20 @@ pub enum Command {
     Paste,
     SelectAll,
     Line(LineOp),
+    Find,
+    Replace,
+    FindNext,
+    FindPrev,
+    GotoLine,
     GotoDefinition,
     ShowHover,
     FindInFiles,
     ToggleExplorer,
     ToggleTerminal,
     ResetLayout,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 /// what the worker hands back.
@@ -61,6 +79,7 @@ enum Done {
     Wrote(DocumentId, String, SavePoint, Result<(), String>),
     Shell(Result<vanta::Terminal, String>),
     Server(&'static str, Result<lsp::server::Server, String>),
+    Found(DocumentId, Revision, String, Vec<Range<usize>>),
 }
 
 pub struct App {
@@ -80,6 +99,14 @@ pub struct App {
     hover: Option<(ViewId, usize, String)>,
     /// a whole line copied with nothing selected; pasting it goes in above.
     line_clip: Option<String>,
+    /// editor font size.
+    zoom: f32,
+    /// find, replace and go to line for one editor.
+    bar: Bar,
+    /// the editor that had the keyboard last, even while a field has it.
+    last_editor: Option<ViewId>,
+    /// last key or click in an editor; the caret blinks from there.
+    typed_at: Instant,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -119,6 +146,10 @@ impl App {
             lsp: Lsp::default(),
             hover: None,
             line_clip: None,
+            zoom: editor::SIZE,
+            bar: Bar::default(),
+            last_editor: None,
+            typed_at: Instant::now(),
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -169,11 +200,50 @@ impl App {
         if self.ui.popup_open() {
             return self.ui.handle(event);
         }
+        if let WindowEvent::MouseWheel {
+            delta_x,
+            delta_y,
+            modifiers,
+        } = event
+        {
+            if modifiers.ctrl && !self.shell_focus && *delta_y != 0.0 {
+                // ctrl and the wheel zoom the editor
+                self.zoom_by(if *delta_y > 0.0 { 1.0 } else { -1.0 });
+                return true;
+            }
+            if modifiers.shift && *delta_x == 0.0 {
+                // shift and the wheel go sideways
+                let sideways = WindowEvent::MouseWheel {
+                    delta_x: *delta_y,
+                    delta_y: 0.0,
+                    modifiers: *modifiers,
+                };
+                return self.ui.handle(&sideways);
+            }
+        }
         if self.shell_focus {
             return self.shell_event(event);
         }
         if let Some(&command) = self.keymap.resolve(event, self.ui.text_focused()) {
             self.run(command);
+            return true;
+        }
+        if self.bar.is_open()
+            && !self.ui.text_focused()
+            && matches!(
+                event,
+                WindowEvent::KeyInput {
+                    key: KeyCode::Escape,
+                    pressed: true,
+                    ..
+                }
+            )
+            && self
+                .focus
+                .and_then(|v| self.docs.view(v))
+                .is_some_and(|v| v.sel.is_empty())
+        {
+            self.bar_ask(find::Ask::Close);
             return true;
         }
         // aurea keeps typed text to its own fields, so the focused editor
@@ -185,6 +255,7 @@ impl App {
         {
             editor::act(&mut self.docs, view, action);
             self.hover = None;
+            self.typed_at = Instant::now();
             return true;
         }
         self.ui.handle(event)
@@ -271,6 +342,7 @@ impl App {
 
     pub fn run(&mut self, command: Command) {
         let focus = self.focus;
+        self.typed_at = Instant::now();
         match command {
             Command::Save => {
                 if let Some(view) = focus {
@@ -328,6 +400,30 @@ impl App {
                 }
                 return;
             }
+            Command::Find | Command::Replace | Command::GotoLine => {
+                let mode = match command {
+                    Command::Find => Mode::Find,
+                    Command::Replace => Mode::Replace,
+                    _ => Mode::Goto,
+                };
+                if let Some(view) = focus.or(self.last_editor) {
+                    self.open_bar(view, mode);
+                }
+                return;
+            }
+            Command::FindNext | Command::FindPrev => {
+                if self.bar.is_open() {
+                    let ask = if command == Command::FindNext {
+                        find::Ask::Next
+                    } else {
+                        find::Ask::Prev
+                    };
+                    self.bar_ask(ask);
+                } else if let Some(view) = focus.or(self.last_editor) {
+                    self.open_bar(view, Mode::Find);
+                }
+                return;
+            }
             Command::Line(op) => {
                 if let Some(view) = focus {
                     editor::line_op(&mut self.docs, view, op);
@@ -360,6 +456,14 @@ impl App {
                 self.bench.show(Panel::Search);
                 self.ui.focus(Id::SearchField, 0);
             }
+            Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
+                match command {
+                    Command::ZoomIn => self.zoom_by(1.0),
+                    Command::ZoomOut => self.zoom_by(-1.0),
+                    _ => self.zoom = editor::SIZE,
+                }
+                return;
+            }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ResetLayout => {
@@ -380,6 +484,180 @@ impl App {
             }
         }
         self.layout_dirty = true;
+    }
+
+    /// opens the bar on `view`. find starts from the selection, when it is
+    /// a bit of one line.
+    fn open_bar(&mut self, view: ViewId, mode: Mode) {
+        let was_open = self.bar.is_open();
+        self.bar.mode = Some(mode);
+        self.bar.view = Some(view);
+        self.bar.opened = !was_open;
+        if mode == Mode::Goto {
+            self.bar.goto.clear();
+        } else {
+            if let Some(picked) = editor::selected(&self.docs, view)
+                && !picked.contains('\n')
+                && picked.len() <= 200
+            {
+                self.bar.query = picked;
+            }
+            self.bar.jump_from = self.docs.view(view).map(|v| v.sel.range().start);
+        }
+        self.ui.focus(Id::FindField, 0);
+    }
+
+    /// what the bar asked for, on its editor.
+    fn bar_ask(&mut self, ask: find::Ask) {
+        let Some(view) = self.bar.view else { return };
+        let Some((doc, sel)) = self.docs.view(view).map(|v| (v.doc, v.sel)) else {
+            self.bar.mode = None;
+            return;
+        };
+        let revision = self.docs.doc(doc).map(|d| d.buffer.revision());
+        let hits: Vec<Range<usize>> = revision
+            .map(|r| self.bar.fresh(doc, r).to_vec())
+            .unwrap_or_default();
+        match ask {
+            find::Ask::Close => {
+                self.bar.mode = None;
+                self.ui.focus(Id::Editor(view), 1);
+            }
+            find::Ask::ToggleReplace => {
+                self.bar.mode = Some(match self.bar.mode {
+                    Some(Mode::Replace) => Mode::Find,
+                    _ => Mode::Replace,
+                });
+            }
+            find::Ask::Changed => {
+                self.bar.jump_from = Some(sel.range().start);
+            }
+            find::Ask::Next => {
+                let i = self
+                    .bar
+                    .after(&hits, sel.range().end.max(sel.range().start + 1));
+                let i = i.or_else(|| self.bar.after(&hits, 0));
+                self.pick_hit(view, &hits, i);
+            }
+            find::Ask::Prev => {
+                let i = self.bar.before(&hits, sel.range().start);
+                self.pick_hit(view, &hits, i);
+            }
+            find::Ask::Replace => {
+                let range = sel.range();
+                if hits.contains(&range) {
+                    let with = self.bar.with.clone();
+                    let next = range.start + with.len();
+                    self.docs.edit(view, vec![(range, with)], false);
+                    self.bar.jump_from = Some(next);
+                } else {
+                    self.bar_ask(find::Ask::Next);
+                }
+            }
+            find::Ask::ReplaceAll => {
+                if hits.is_empty() {
+                    return;
+                }
+                let count = hits.len();
+                let with = self.bar.with.clone();
+                let edits = hits.into_iter().map(|h| (h, with.clone())).collect();
+                if self.docs.edit(view, edits, false) {
+                    self.status = format!("{} {count}", self.texts.tr("replaced"));
+                }
+            }
+            find::Ask::Goto => {
+                if let Some((line, column)) = find::parse_goto(&self.bar.goto)
+                    && let Some(v) = self.docs.view_mut(view)
+                {
+                    v.goto = Some((Point::new(line, column), Encoding::Utf32));
+                    self.bar.mode = None;
+                    self.ui.focus(Id::Editor(view), 1);
+                }
+            }
+        }
+    }
+
+    /// selects match `i` in `view` and brings it into sight.
+    fn pick_hit(&mut self, view: ViewId, hits: &[Range<usize>], i: Option<usize>) {
+        let Some((i, hit)) = i.and_then(|i| hits.get(i).map(|h| (i, h.clone()))) else {
+            return;
+        };
+        if let Some(v) = self.docs.view_mut(view) {
+            v.sel = Selection {
+                anchor: hit.start,
+                head: hit.end,
+            };
+            v.reveal = true;
+            v.goal = None;
+        }
+        self.bar.current = Some(i);
+    }
+
+    /// asks the worker for matches when the query or the text changed.
+    fn find_again(&mut self) {
+        if !matches!(self.bar.mode, Some(Mode::Find | Mode::Replace)) {
+            return;
+        }
+        let Some(view) = self.bar.view else { return };
+        let Some(doc_id) = self.docs.view(view).map(|v| v.doc) else {
+            self.bar.mode = None;
+            return;
+        };
+        let Some(doc) = self.docs.doc(doc_id) else {
+            return;
+        };
+        let key = (doc_id, doc.buffer.revision(), self.bar.query.clone());
+        if self.bar.asked.as_ref() == Some(&key) {
+            return;
+        }
+        self.bar.asked = Some(key.clone());
+        let text = doc.buffer.snapshot();
+        let (d, r, q) = key;
+        let job = move || {
+            let hits = find::find_all(&text, &q);
+            Done::Found(d, r, q, hits)
+        };
+        self.jobs.run(job);
+    }
+
+    fn found(&mut self, key: (DocumentId, Revision, String), hits: Vec<Range<usize>>) {
+        if self.bar.asked.as_ref() != Some(&key) {
+            return;
+        }
+        self.bar.hits = hits;
+        self.bar.found_for = Some(key);
+        let Some(view) = self.bar.view else { return };
+        let hits = self.bar.hits.clone();
+        if let Some(from) = self.bar.jump_from.take() {
+            let i = self.bar.after(&hits, from);
+            self.pick_hit(view, &hits, i);
+        } else {
+            let sel = self.docs.view(view).map(|v| v.sel.range());
+            self.bar.current = sel.and_then(|s| hits.iter().position(|h| *h == s));
+        }
+    }
+
+    /// "3 of 12" for the bar.
+    fn found_note(&self) -> String {
+        let Some((_, _, q)) = &self.bar.found_for else {
+            return String::new();
+        };
+        if self.bar.query.is_empty() || *q != self.bar.query {
+            return String::new();
+        }
+        let total = self.bar.hits.len();
+        if total == 0 {
+            return self.texts.tr("no results").to_owned();
+        }
+        let more = if total >= find::MAX_HITS { "+" } else { "" };
+        match self.bar.current {
+            Some(i) => format!("{} / {total}{more}", i + 1),
+            None => format!("{total}{more}"),
+        }
+    }
+
+    fn zoom_by(&mut self, by: f32) {
+        self.zoom = (self.zoom + by).clamp(8.0, 40.0);
     }
 
     /// is a panel in the dock now; for menu ticks.
@@ -497,6 +775,7 @@ impl App {
                 lsp::Event::Status(text) => self.status = text,
             }
         }
+        self.find_again();
         for language in self.lsp.wanted(&self.docs) {
             self.start_server(language);
         }
@@ -526,6 +805,7 @@ impl App {
                     }
                 },
                 Done::Shell(result) => self.shell.started(result),
+                Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
                 Done::Server(language, result) => {
                     if let Some(why) = self.lsp.started(language, result) {
                         // a missing server is fine; the editor works without it
@@ -616,6 +896,12 @@ impl App {
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
         let mut found = None;
+        let mut blink = None;
+        let idle = self.typed_at.elapsed();
+        let zoom = self.zoom;
+        let mut rects: Vec<(ViewId, Rect)> = Vec::new();
+        let mut bar_ask = None;
+        let note = self.found_note();
         let changed;
         let place = self.place();
         let message = if self.status.is_empty() {
@@ -630,6 +916,7 @@ impl App {
             let shell = &mut self.shell;
             let hover = &self.hover;
             let finder = &mut self.finder;
+            let bar = &mut self.bar;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
@@ -648,10 +935,25 @@ impl App {
                             .as_ref()
                             .filter(|(v, at, _)| *v == view && state.sel.head == *at)
                             .map(|(_, _, text)| text.as_str());
-                        let shown = editor::show(ui, view, doc, &mut state, rect, texts, hover)?;
+                        let found = if bar.is_open() && bar.view == Some(view) {
+                            bar.fresh(doc_id, doc.buffer.revision())
+                        } else {
+                            &[]
+                        };
+                        let current = bar.current.and_then(|i| found.get(i)).cloned();
+                        let look = editor::Look {
+                            size: zoom,
+                            idle,
+                            hover,
+                            found,
+                            current,
+                        };
+                        rects.push((view, rect));
+                        let shown = editor::show(ui, view, doc, &mut state, rect, texts, &look)?;
                         if shown.focused {
                             focus = Some(view);
                             ime = shown.caret;
+                            blink = shown.blink;
                         }
                         if shown.pressed {
                             pressed.push(view);
@@ -679,10 +981,24 @@ impl App {
                 .close_buttons(true)
                 .show(&mut ui, Id::Dock, main)?;
             changed = response.changed;
+            if let Some(view) = bar.view
+                && let Some((_, rect)) = rects.iter().find(|(v, _)| *v == view)
+            {
+                bar_ask = find::show(&mut ui, bar, *rect, &note, texts)?;
+            } else if bar.is_open() {
+                // its editor is not in sight; the bar goes with it
+                bar.mode = None;
+            }
             status_bar(&mut ui, status, &message, &place)?;
         }
         self.focus = focus;
+        if focus.is_some() {
+            self.last_editor = focus;
+        }
         self.ime = ime;
+        if let Some(ask) = bar_ask {
+            self.bar_ask(ask);
+        }
         self.shell_focus = shell_focus;
         match found {
             Some(search::view::Ask::Search) => {
@@ -705,6 +1021,11 @@ impl App {
             if let Some((doc, _)) = self.docs.editable(view) {
                 doc.buffer.break_join();
             }
+            self.typed_at = Instant::now();
+        }
+        // the next blink is its own frame; nothing runs in between
+        if let (Some(wait), Some(canvas)) = (blink, self.canvas) {
+            request_canvas_redraw_at(canvas, Instant::now() + wait);
         }
         if changed {
             self.layout_dirty = true;
@@ -842,8 +1163,16 @@ fn keymap() -> Keymap<Command> {
         )
         .bind(Chord::command(KeyCode::L), Command::Line(LineOp::Select))
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
+        .bind(Chord::command(KeyCode::F), Command::Find)
+        .bind(Chord::command(KeyCode::H), Command::Replace)
+        .bind(Chord::key(KeyCode::F3), Command::FindNext)
+        .bind(Chord::key(KeyCode::F3).shift(), Command::FindPrev)
+        .bind(Chord::command(KeyCode::G), Command::GotoLine)
         .bind(Chord::key(KeyCode::F12), Command::GotoDefinition)
         .bind(Chord::command(KeyCode::I), Command::ShowHover)
+        .bind(Chord::command(KeyCode::Equals), Command::ZoomIn)
+        .bind(Chord::command(KeyCode::Minus), Command::ZoomOut)
+        .bind(Chord::command(KeyCode::Key0), Command::ZoomReset)
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
     map

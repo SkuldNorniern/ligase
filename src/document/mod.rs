@@ -68,6 +68,10 @@ pub struct View {
     pub doc: DocumentId,
     /// scroll from the top, in px.
     pub scroll: f32,
+    /// scroll from the left, in px.
+    pub hscroll: f32,
+    /// the caret's line last frame; the caret glides from there.
+    pub caret_line: Option<usize>,
     pub sel: Selection,
     /// column up and down aim for.
     pub goal: Option<usize>,
@@ -125,6 +129,8 @@ impl Documents {
             View {
                 doc,
                 scroll: 0.0,
+                hscroll: 0.0,
+                caret_line: None,
                 sel: Selection::default(),
                 goal: None,
                 preedit: None,

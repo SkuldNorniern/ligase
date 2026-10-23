@@ -15,7 +15,7 @@ pub const MAX_HITS: usize = 5000;
 /// files past this are skipped.
 const MAX_FILE: u64 = 4 * 1024 * 1024;
 /// folders never searched.
-const SKIP: [&str; 4] = [".git", "target", "node_modules", ".hg"];
+pub const SKIP: [&str; 4] = [".git", "target", "node_modules", ".hg"];
 /// longest line text kept with a hit.
 const MAX_PREVIEW: usize = 200;
 
@@ -118,7 +118,7 @@ impl Finder {
 
 /// smart case: a query with no capitals matches any case. gives the match
 /// as (byte start, byte length) in `line`, always on char edges.
-fn matcher(query: &str) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
+pub fn matcher(query: &str) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
     let fold = !query.chars().any(char::is_uppercase);
     let lower: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
     let ascii = query.to_ascii_lowercase();

@@ -169,6 +169,11 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut edit, "Select All", Command::SelectAll)?;
     add(&mut edit, "Select Line", Command::Line(LineOp::Select))?;
     edit.add_separator()?;
+    add(&mut edit, "Find", Command::Find)?;
+    add(&mut edit, "Replace", Command::Replace)?;
+    add(&mut edit, "Find Next", Command::FindNext)?;
+    add(&mut edit, "Find Previous", Command::FindPrev)?;
+    edit.add_separator()?;
     add(&mut edit, "Toggle Comment", Command::Line(LineOp::Comment))?;
     add(&mut edit, "Move Line Up", Command::Line(LineOp::Move(true)))?;
     add(
@@ -184,12 +189,17 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     )?;
     add(&mut edit, "Delete Line", Command::Line(LineOp::Delete))?;
     let mut go = bar.add_submenu(a.texts.tr("Go"))?;
+    add(&mut go, "Go to Line", Command::GotoLine)?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
     add(&mut go, "Show Hover", Command::ShowHover)?;
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;
     let terminal = add(&mut view, "Terminal", Command::ToggleTerminal)?;
+    view.add_separator()?;
+    add(&mut view, "Zoom In", Command::ZoomIn)?;
+    add(&mut view, "Zoom Out", Command::ZoomOut)?;
+    add(&mut view, "Reset Zoom", Command::ZoomReset)?;
     view.add_separator()?;
     add(&mut view, "Reset Layout", Command::ResetLayout)?;
     Ok(Ticks {

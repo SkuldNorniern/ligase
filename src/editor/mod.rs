@@ -2,32 +2,49 @@
 //! the buffer snapshot, never a copy of the whole file.
 
 pub mod cursor;
+pub mod find;
 pub mod input;
 pub mod lines;
 pub mod pairs;
 
 use std::ops::Range;
+use std::time::Duration;
 
-use aurea::AureaResult;
 use aurea::render::{Color, Font, Point, Rect};
-use aurea::ui::{Align, ScrollArea, Sense, Ui};
+use aurea::ui::{Align, Channel, Palette, ScrollArea, Sense, Ui};
+use aurea::{AureaResult, CursorIcon};
 use resolvase::TextSnapshot;
 
 use crate::app::Id;
 use crate::document::{Document, Documents, Load, View, ViewId};
 use crate::lang::Texts;
+use crate::lsp::{Diag, Severity};
 use crate::syntax::{self, Spans};
 use cursor::Selection;
 use input::Action;
 use lines::Change;
 
-const SIZE: f32 = 14.0;
-const LINE: f32 = 20.0;
+/// font size before any zoom.
+pub const SIZE: f32 = 14.0;
 /// longest part of a line drawn; past this it is cut for now.
 const MAX_DRAWN: usize = 4096;
 /// room the scroll bar takes on the right; clicks there are its.
 const BAR: f32 = 14.0;
 const TAB: &str = "    ";
+/// px a sideways wheel notch moves.
+const H_STEP: f32 = 40.0;
+/// a caret left alone this long stops blinking.
+const BLINK_FOR: Duration = Duration::from_secs(10);
+const BLINK_HALF: Duration = Duration::from_millis(530);
+/// how fast the caret glides, per second.
+const CARET_RATE: f32 = 38.0;
+/// parts and channels of the view's eased values.
+const PART_H: u16 = 2;
+const PART_CARET: u16 = 3;
+const PART_HOVER: u16 = 4;
+const H_SCROLL: u16 = 0;
+const CARET_X: u16 = 0;
+const CARET_Y: u16 = 1;
 
 const MONO: &str = if cfg!(windows) {
     "Consolas"
@@ -87,7 +104,11 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
             let close = pairs::char_after(&text, sel.range().end);
             let opens = matches!(open, Some('(' | '[' | '{'))
                 || (open == Some(':') && doc.language == Some("python"));
-            if opens && open.and_then(pairs::closer) == close {
+            if opens
+                && open
+                    .and_then(pairs::closer)
+                    .is_some_and(|c| Some(c) == close)
+            {
                 // between a pair: the caret gets its own line, deeper
                 let first = format!("{lb}{indent}{TAB}");
                 let change = Change {
@@ -291,6 +312,7 @@ pub fn select_all(docs: &mut Documents, view: ViewId) {
 }
 
 /// what a frame of the view tells the app.
+#[derive(Default)]
 pub struct Shown {
     /// the view has the keyboard.
     pub focused: bool,
@@ -298,6 +320,8 @@ pub struct Shown {
     pub caret: Option<Rect>,
     /// the mouse placed the caret; typing after it is a new undo step.
     pub pressed: bool,
+    /// when the caret blinks next; none once it stays on.
+    pub blink: Option<Duration>,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -353,11 +377,11 @@ fn squiggles(
     ui: &mut Ui<'_, Id>,
     font: &Font,
     laid: &Laid,
-    diags: &[crate::lsp::Diag],
+    diags: &[Diag],
     line: Range<usize>,
     body: Rect,
+    line_h: f32,
 ) -> AureaResult<()> {
-    use crate::lsp::Severity;
     let palette = ui.theme.palette;
     for diag in diags {
         if diag.range.start > line.end || diag.range.end < line.start {
@@ -368,13 +392,8 @@ fn squiggles(
         let x0 = body.x + laid.x_of(ui, font, from);
         // an empty range still gets a mark the width of one char
         let x1 = (body.x + laid.x_of(ui, font, to)).max(x0 + ui.text_width("m", font));
-        let color = match diag.severity {
-            Severity::Error => palette.danger,
-            Severity::Warning => palette.warning,
-            Severity::Info => palette.accent,
-            Severity::Hint => palette.dim,
-        };
-        let y = body.y + LINE - 3.0;
+        let color = severity_colour(&palette, diag.severity);
+        let y = body.y + line_h - 3.0;
         let mut points = Vec::new();
         let mut x = x0;
         let mut up = false;
@@ -391,7 +410,13 @@ fn squiggles(
 
 /// language server hover text in a box under the caret, or over it when
 /// there is no room below.
-fn hover_box(ui: &mut Ui<'_, Id>, text: &str, caret: Rect, seen: Rect) -> AureaResult<()> {
+fn hover_box(
+    ui: &mut Ui<'_, Id>,
+    text: &str,
+    caret: Rect,
+    seen: Rect,
+    alpha: f32,
+) -> AureaResult<()> {
     const MAX_LINES: usize = 16;
     let palette = ui.theme.palette;
     let font = ui.theme.font(13.0);
@@ -411,12 +436,18 @@ fn hover_box(ui: &mut Ui<'_, Id>, text: &str, caret: Rect, seen: Rect) -> AureaR
         (caret.y - height - 4.0).max(seen.y)
     };
     let x = caret.x.min(seen.x + seen.width - width).max(seen.x);
-    let card = Rect::new(x, y, width, height);
-    ui.fill(card, palette.raised)?;
-    ui.border(card, 4.0, 1.0, palette.border)?;
+    // fades in and rises a little as it comes
+    let card = Rect::new(x, y + (1.0 - alpha) * 6.0, width, height);
+    ui.round(card, 6.0, palette.raised.fade(alpha))?;
+    ui.border(card, 6.0, 1.0, palette.border.fade(alpha))?;
     for (i, line) in lines.iter().enumerate() {
-        let at = Rect::new(x + 8.0, y + 6.0 + i as f32 * row, width - 16.0, row);
-        ui.text_clipped(line, at, &font, palette.text, Align::Start)?;
+        let at = Rect::new(
+            card.x + 8.0,
+            card.y + 6.0 + i as f32 * row,
+            width - 16.0,
+            row,
+        );
+        ui.text_clipped(line, at, &font, palette.text.fade(alpha), Align::Start)?;
     }
     Ok(())
 }
@@ -490,6 +521,85 @@ impl Laid {
     }
 }
 
+/// how a view is drawn this frame, from the app.
+pub struct Look<'a> {
+    /// font size; lines are a bit taller.
+    pub size: f32,
+    /// time since the caret last moved or text was typed, for the blink.
+    pub idle: Duration,
+    /// language server hover text, while the caret stays where it was asked.
+    pub hover: Option<&'a str>,
+    /// find bar matches, sorted, and the picked one.
+    pub found: &'a [Range<usize>],
+    pub current: Option<Range<usize>>,
+}
+
+/// line height for a font size.
+pub fn line_height(size: f32) -> f32 {
+    (size * 1.45).round()
+}
+
+/// caret on or off after `idle`, and how long until that flips. a caret
+/// left alone stops blinking, so an idle window draws nothing.
+fn blink(idle: Duration) -> (bool, Option<Duration>) {
+    if idle >= BLINK_FOR {
+        return (true, None);
+    }
+    let half = BLINK_HALF.as_millis();
+    let ms = idle.as_millis();
+    let on = (ms / half).is_multiple_of(2);
+    let left = u64::try_from(half - ms % half).unwrap_or(0);
+    (on, Some(Duration::from_millis(left)))
+}
+
+/// what to light up for the word under the caret, or the selected text:
+/// (needle, whole words only).
+fn needle(text: &TextSnapshot, sel: Selection) -> Option<(String, bool)> {
+    let range = sel.range();
+    if !sel.is_empty() {
+        if range.len() > 200 {
+            return None;
+        }
+        let picked = text.slice(range).ok()?;
+        return (!picked.contains('\n') && !picked.trim().is_empty()).then_some((picked, false));
+    }
+    let word = cursor::word_at(text, sel.head).range();
+    if word.is_empty() || word.len() > 100 {
+        return None;
+    }
+    let found = text.slice(word).ok()?;
+    found
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
+        .then_some((found, true))
+}
+
+/// where `needle` sits in `line`, which starts at buffer offset `at`.
+fn hits(line: &str, at: usize, needle: &str, whole: bool) -> Vec<Range<usize>> {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    line.match_indices(needle)
+        .filter(|(i, _)| {
+            !whole
+                || (!word(line[..*i].chars().next_back())
+                    && !word(line[i + needle.len()..].chars().next()))
+        })
+        .map(|(i, _)| at + i..at + i + needle.len())
+        .collect()
+}
+
+/// indent depth of a line in steps of `TAB`, or none for a blank line.
+fn depth(line: &str) -> Option<usize> {
+    let mut cols = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => cols += 1,
+            '\t' => cols += TAB.len(),
+            _ => return Some(cols / TAB.len()),
+        }
+    }
+    None
+}
+
 pub fn show(
     ui: &mut Ui<'_, Id>,
     id: ViewId,
@@ -497,14 +607,11 @@ pub fn show(
     view: &mut View,
     rect: Rect,
     texts: &Texts,
-    hover: Option<&str>,
+    look: &Look<'_>,
 ) -> AureaResult<Shown> {
-    let mut shown = Shown {
-        focused: false,
-        caret: None,
-        pressed: false,
-    };
-    let font = Font::new(MONO, SIZE);
+    let mut shown = Shown::default();
+    let font = Font::new(MONO, look.size);
+    let line_h = line_height(look.size);
     let palette = ui.theme.palette;
     match &doc.load {
         Load::Loading => {
@@ -521,43 +628,72 @@ pub fn show(
     let text = doc.buffer.text();
     let lines = text.line_count();
     let digits = lines.to_string().len().max(3);
-    let gutter = ui.text_width(&"0".repeat(digits), &font) + 16.0;
-    let height = lines as f32 * LINE + LINE;
-    view.page = ((rect.height / LINE) as usize).saturating_sub(1).max(1);
+    let gutter = ui.text_width(&"0".repeat(digits), &font) + 22.0;
+    // the last line can scroll up to near the top
+    let height = lines as f32 * line_h + (rect.height - 3.0 * line_h).max(line_h);
+    view.page = ((rect.height / line_h) as usize).saturating_sub(1).max(1);
     if let Some((at, encoding)) = view.goto.take() {
         // past the end or mid char: lands on the nearest place before it
         view.sel = Selection::caret(crate::lsp::offset_near(text, at, encoding));
         view.reveal = true;
     }
-    if std::mem::take(&mut view.reveal) {
-        let y = text.line_of(view.sel.head).unwrap_or(0) as f32 * LINE;
-        if y < view.scroll {
-            view.scroll = y;
-        } else if y + LINE > view.scroll + rect.height {
-            view.scroll = y + LINE - rect.height;
+    let reveal = std::mem::take(&mut view.reveal);
+    if reveal {
+        // a couple of lines kept in sight around the caret when there is room
+        let margin = if rect.height > 8.0 * line_h {
+            2.0 * line_h
+        } else {
+            0.0
+        };
+        let y = text.line_of(view.sel.head).unwrap_or(0) as f32 * line_h;
+        if y - margin < view.scroll {
+            view.scroll = (y - margin).max(0.0);
+        } else if y + line_h + margin > view.scroll + rect.height {
+            view.scroll = y + line_h + margin - rect.height;
         }
     }
     let mut sel = view.sel;
     let mut preedit = view.preedit.clone();
-    ScrollArea::new(&mut view.scroll, height).show(
+    let mut hscroll = view.hscroll;
+    let seen_line = view.caret_line;
+    let (_, pull) = ScrollArea::new(&mut view.scroll, height).show(
         ui,
         Id::Editor(id),
         rect,
         |ui, content, seen| {
-            let first = ((seen.y - content.y) / LINE).floor().max(0.0) as usize;
-            let count = (seen.height / LINE).ceil() as usize + 1;
-            let body_x = content.x + gutter + 8.0;
+            let first = ((seen.y - content.y) / line_h).floor().max(0.0) as usize;
+            let count = (seen.height / line_h).ceil() as usize + 1;
+            let last = (first + count).min(lines);
+            let text_x = content.x + gutter;
+            let area = Rect::new(
+                text_x,
+                seen.y,
+                (seen.x + seen.width - BAR - text_x).max(0.0),
+                seen.height,
+            );
+            let hshown = ui.animate(
+                Id::Editor(id),
+                PART_H,
+                Channel::Custom(H_SCROLL),
+                hscroll,
+                ui.theme.motion.slide * 1.4,
+            );
+            let body_x = text_x + 4.0 - hshown;
 
             // pointer: press places the caret, drag stretches it
             let hit = Rect::new(seen.x, seen.y, (seen.width - BAR).max(0.0), seen.height);
             let input = ui.interact(Id::Editor(id), 1, hit, Sense::Click, true);
             shown.focused = input.focused;
+            if input.hovered {
+                ui.set_cursor(CursorIcon::Text);
+            }
             let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
-                let line = ((at.y - content.y) / LINE)
+                let line = ((at.y - content.y) / line_h)
                     .floor()
                     .clamp(0.0, (lines - 1) as f32) as usize;
                 lay(text, span(text, line)).offset_at(ui, &font, at.x - body_x)
             };
+            let mut pull = 0.0;
             if let Some(press) = ui.press(Id::Editor(id), 1) {
                 let at = hit_test(ui, press.at);
                 sel = match press.clicks {
@@ -576,73 +712,256 @@ pub fn show(
                 && let Some(at) = ui.pointer()
             {
                 sel.head = hit_test(ui, at);
+                // past an edge the view follows, faster the further out
+                let above = seen.y - at.y;
+                let below = at.y - (seen.y + seen.height);
+                if above > 0.0 {
+                    pull = -(above * 0.4).min(line_h * 3.0);
+                } else if below > 0.0 {
+                    pull = (below * 0.4).min(line_h * 3.0);
+                }
+                if at.x < area.x {
+                    hscroll = (hscroll - (area.x - at.x) * 0.4).max(0.0);
+                } else if at.x > area.x + area.width {
+                    hscroll += (at.x - area.x - area.width) * 0.4;
+                }
+                if pull != 0.0 || at.x < area.x || at.x > area.x + area.width {
+                    ui.keep_animating();
+                }
+            }
+            // sideways wheel, or shift and the wheel, moves along long lines
+            let (wx, _) = ui.wheel();
+            if wx != 0.0 && ui.pointer().is_some_and(|p| seen.contains(p)) {
+                hscroll = (hscroll - wx * H_STEP).max(0.0);
+                ui.consume_wheel((wx, 0.0));
             }
 
             let range = sel.range();
             let caret_line = text.line_of(sel.head).unwrap_or(0);
-            for line in first..(first + count).min(lines) {
-                let y = content.y + line as f32 * LINE;
-                let row = Rect::new(content.x, y, content.width, LINE);
-                let (number, body) = row.split_left(gutter, 8.0);
-                ui.text(
-                    &(line + 1).to_string(),
-                    number,
-                    &font,
-                    palette.faint,
-                    Align::End,
-                )?;
-                let span = span(text, line);
-                let laid = lay(text, span.clone());
-                // selection behind the text, one extra space when it runs past the line end
-                let from = range.start.max(span.start);
-                let to = range.end.min(span.end);
-                if from < to || (range.start <= span.end && range.end > span.end) {
-                    let x0 = laid.x_of(ui, &font, from);
-                    let mut x1 = laid.x_of(ui, &font, to);
-                    if range.end > span.end {
-                        x1 += ui.text_width(" ", &font);
-                    }
-                    ui.fill(Rect::new(body.x + x0, y, x1 - x0, LINE), palette.selection)?;
-                }
-                paint_line(
-                    ui,
-                    &font,
-                    &laid,
-                    &doc.spans,
-                    span.clone(),
-                    body,
-                    palette.text,
-                )?;
-                squiggles(ui, &font, &laid, &doc.diags, span, body)?;
-                if line == caret_line && shown.focused {
-                    let x = body.x + laid.x_of(ui, &font, sel.head);
-                    let mut caret_x = x;
-                    if let Some((composing, at)) = &preedit {
-                        let width = ui.text_width(composing, &font);
-                        let box_ = Rect::new(x, y, width, LINE);
-                        ui.fill(box_, palette.raised)?;
-                        ui.text(composing, box_, &font, palette.text, Align::Start)?;
-                        ui.fill(Rect::new(x, y + LINE - 2.0, width, 1.0), palette.text)?;
-                        let inside = at.map_or(composing.len(), |c| c.min(composing.len()));
-                        let inside = (0..=inside)
-                            .rev()
-                            .find(|i| composing.is_char_boundary(*i))
-                            .unwrap_or(0);
-                        caret_x = x + ui.text_width(&composing[..inside], &font);
-                    }
-                    ui.fill(Rect::new(caret_x, y + 2.0, 2.0, LINE - 4.0), palette.text)?;
-                    shown.caret = Some(Rect::new(caret_x, y, 2.0, LINE));
+            let char_w = ui.text_width(" ", &font);
+
+            // gutter: numbers, the caret's line brighter, a mark for problems
+            let mut marks: Vec<Option<Severity>> = vec![None; last.saturating_sub(first)];
+            for diag in &doc.diags {
+                if let Ok(l) = text.line_of(diag.range.start)
+                    && (first..last).contains(&l)
+                {
+                    let mark = &mut marks[l - first];
+                    *mark = Some(mark.map_or(diag.severity, |m| m.min(diag.severity)));
                 }
             }
-            if let (Some(text), Some(caret)) = (hover, shown.caret) {
-                hover_box(ui, text, caret, seen)?;
+            for line in first..last {
+                let y = content.y + line as f32 * line_h;
+                let number = Rect::new(content.x, y, gutter - 14.0, line_h);
+                let color = if line == caret_line {
+                    palette.dim
+                } else {
+                    palette.faint
+                };
+                ui.text(&(line + 1).to_string(), number, &font, color, Align::End)?;
+                if let Some(severity) = marks[line - first] {
+                    let bar = Rect::new(content.x + gutter - 8.0, y + 3.0, 3.0, line_h - 6.0);
+                    ui.round(bar, 1.5, severity_colour(&palette, severity))?;
+                }
             }
-            Ok(())
+
+            let focused = shown.focused;
+            let lit = needle(text, sel);
+            let brackets = (focused && sel.is_empty())
+                .then(|| pairs::matching(text, sel.head))
+                .flatten();
+            // the caret's place in text space, lines from the top
+            let caret_laid = lay(text, span(text, caret_line));
+            let mut target_x = caret_laid.x_of(ui, &font, sel.head);
+            let mut preedit_w = 0.0;
+            if let Some((composing, at)) = &preedit {
+                preedit_w = ui.text_width(composing, &font);
+                let inside = at.map_or(composing.len(), |c| c.min(composing.len()));
+                let inside = (0..=inside)
+                    .rev()
+                    .find(|i| composing.is_char_boundary(*i))
+                    .unwrap_or(0);
+                target_x += ui.text_width(&composing[..inside], &font);
+            }
+            if reveal {
+                let room = area.width - 4.0;
+                if target_x < hscroll {
+                    hscroll = (target_x - room / 3.0).max(0.0);
+                } else if target_x + char_w * 2.0 > hscroll + room {
+                    hscroll = target_x + char_w * 2.0 - room + room / 3.0;
+                }
+            }
+            let mut widest: f32 = 0.0;
+            ui.clipped(area, |ui| {
+                let mut carry = 0;
+                if let Some(back) = first.checked_sub(1) {
+                    let s = span(text, back);
+                    carry = depth(&text.slice(s).unwrap_or_default()).unwrap_or(0);
+                }
+                for line in first..last {
+                    let y = content.y + line as f32 * line_h;
+                    let body =
+                        Rect::new(body_x, y, (area.x + area.width - body_x).max(0.0), line_h);
+                    let span = span(text, line);
+                    let raw = text.slice(span.clone()).unwrap_or_default();
+                    let laid = lay(text, span.clone());
+                    if focused && sel.is_empty() && line == caret_line {
+                        let row = Rect::new(area.x, y, area.width, line_h);
+                        ui.fill(row, palette.raised.fade(0.45))?;
+                    }
+                    // indent guides; a blank line keeps the ones above it
+                    let levels = depth(&raw).unwrap_or(carry);
+                    carry = levels;
+                    for level in 1..levels {
+                        let x = (body_x + (level * TAB.len()) as f32 * char_w).round() + 0.5;
+                        ui.fill(Rect::new(x, y, 1.0, line_h), palette.border.fade(0.55))?;
+                    }
+                    if let Some((needle, whole)) = &lit {
+                        for hit in hits(&raw, span.start, needle, *whole) {
+                            if hit == range {
+                                continue;
+                            }
+                            let x0 = laid.x_of(ui, &font, hit.start);
+                            let x1 = laid.x_of(ui, &font, hit.end);
+                            let mark = Rect::new(body.x + x0, y + 1.0, x1 - x0, line_h - 2.0);
+                            ui.round(mark, 3.0, palette.selection.fade(0.4))?;
+                        }
+                    }
+                    let from = look.found.partition_point(|h| h.end <= span.start);
+                    for hit in look.found[from..].iter().take_while(|h| h.start < span.end) {
+                        let x0 = laid.x_of(ui, &font, hit.start.max(span.start));
+                        let x1 = laid.x_of(ui, &font, hit.end.min(span.end));
+                        let mark =
+                            Rect::new(body.x + x0, y + 1.0, (x1 - x0).max(2.0), line_h - 2.0);
+                        if look.current.as_ref() == Some(hit) {
+                            ui.round(mark, 3.0, palette.warning.fade(0.45))?;
+                            ui.border(mark, 3.0, 1.0, palette.warning)?;
+                        } else {
+                            ui.round(mark, 3.0, palette.warning.fade(0.22))?;
+                        }
+                    }
+                    // selection behind the text, one extra space when it runs past the line end
+                    let from = range.start.max(span.start);
+                    let to = range.end.min(span.end);
+                    if from < to || (range.start <= span.end && range.end > span.end) {
+                        let x0 = laid.x_of(ui, &font, from);
+                        let mut x1 = laid.x_of(ui, &font, to);
+                        if range.end > span.end {
+                            x1 += char_w;
+                        }
+                        let picked = Rect::new(body.x + x0, y, x1 - x0, line_h);
+                        ui.round(picked, 3.0, palette.selection)?;
+                    }
+                    if let Some((a, b)) = brackets {
+                        for at in [a, b] {
+                            if span.contains(&at) {
+                                let x0 = laid.x_of(ui, &font, at);
+                                let x1 = laid.x_of(ui, &font, at + 1);
+                                let cell = Rect::new(body.x + x0, y + 1.0, x1 - x0, line_h - 2.0);
+                                ui.fill(cell, palette.accent.fade(0.18))?;
+                                ui.border(cell, 2.0, 1.0, palette.accent.fade(0.7))?;
+                            }
+                        }
+                    }
+                    paint_line(
+                        ui,
+                        &font,
+                        &laid,
+                        &doc.spans,
+                        span.clone(),
+                        body,
+                        palette.text,
+                    )?;
+                    squiggles(ui, &font, &laid, &doc.diags, span, body, line_h)?;
+                    widest = widest.max(ui.text_width(&laid.drawn, &font));
+                }
+
+                // the caret glides to its place; a long jump just lands
+                let target_y = caret_line as f32 * line_h;
+                let jump = preedit.is_some()
+                    || seen_line.is_none_or(|l: usize| l.abs_diff(caret_line) > 6);
+                let (cx, cy) = if jump {
+                    ui.set_animated(
+                        Id::Editor(id),
+                        PART_CARET,
+                        Channel::Custom(CARET_X),
+                        target_x,
+                    );
+                    ui.set_animated(
+                        Id::Editor(id),
+                        PART_CARET,
+                        Channel::Custom(CARET_Y),
+                        target_y,
+                    );
+                    (target_x, target_y)
+                } else {
+                    let rate = CARET_RATE;
+                    (
+                        ui.animate(
+                            Id::Editor(id),
+                            PART_CARET,
+                            Channel::Custom(CARET_X),
+                            target_x,
+                            rate,
+                        ),
+                        ui.animate(
+                            Id::Editor(id),
+                            PART_CARET,
+                            Channel::Custom(CARET_Y),
+                            target_y,
+                            rate,
+                        ),
+                    )
+                };
+                let moving = (cx - target_x).abs() > 0.5 || (cy - target_y).abs() > 0.5;
+                if !focused {
+                    return Ok(());
+                }
+                let y = content.y + target_y;
+                if let Some((composing, _)) = &preedit {
+                    let x = body_x + caret_laid.x_of(ui, &font, sel.head);
+                    let box_ = Rect::new(x, y, preedit_w, line_h);
+                    ui.fill(box_, palette.raised)?;
+                    ui.text(composing, box_, &font, palette.text, Align::Start)?;
+                    ui.fill(Rect::new(x, y + line_h - 2.0, preedit_w, 1.0), palette.text)?;
+                }
+                let (on, next) = blink(look.idle);
+                shown.blink = next;
+                let x = body_x + cx;
+                let drawn_y = content.y + cy;
+                if on || moving || preedit.is_some() {
+                    let bar = Rect::new(x.round() - 0.5, drawn_y + 2.0, 2.0, line_h - 4.0);
+                    ui.fill(bar, palette.accent)?;
+                }
+                shown.caret = Some(Rect::new(body_x + target_x, y, 2.0, line_h));
+                Ok(())
+            })?;
+            // no scrolling far past the longest line in sight
+            hscroll = hscroll.min((widest - area.width * 0.5).max(0.0));
+            if let (Some(text), Some(caret)) = (look.hover, shown.caret) {
+                let alpha = ui.animate(Id::Editor(id), PART_HOVER, Channel::Custom(0), 1.0, 14.0);
+                hover_box(ui, text, caret, seen, alpha)?;
+            } else {
+                ui.set_animated(Id::Editor(id), PART_HOVER, Channel::Custom(0), 0.0);
+            }
+            Ok(pull)
         },
     )?;
+    view.scroll = (view.scroll + pull).max(0.0);
+    view.hscroll = hscroll;
+    view.caret_line = Some(text.line_of(sel.head).unwrap_or(0));
     view.sel = sel;
     view.preedit = preedit;
     Ok(shown)
+}
+
+fn severity_colour(palette: &Palette, severity: Severity) -> Color {
+    match severity {
+        Severity::Error => palette.danger,
+        Severity::Warning => palette.warning,
+        Severity::Info => palette.accent,
+        Severity::Hint => palette.dim,
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +976,33 @@ mod tests {
         let view = docs.add_view(doc);
         docs.loaded(doc, Ok(text.to_owned()));
         (docs, view)
+    }
+
+    #[test]
+    fn blink_flips_then_rests() {
+        assert_eq!(blink(Duration::ZERO), (true, Some(BLINK_HALF)));
+        let (on, next) = blink(BLINK_HALF + Duration::from_millis(30));
+        assert!(!on);
+        assert_eq!(next, Some(BLINK_HALF - Duration::from_millis(30)));
+        assert_eq!(blink(BLINK_FOR), (true, None));
+    }
+
+    #[test]
+    fn word_under_caret_lights_whole_words() {
+        let t = resolvase::TextBuffer::from_text("foo foobar foo").snapshot();
+        assert_eq!(needle(&t, Selection::caret(1)), Some(("foo".into(), true)));
+        assert_eq!(hits("foo foobar foo", 0, "foo", true), vec![0..3, 11..14]);
+        assert_eq!(hits("foo foobar", 5, "oo", false), vec![6..8, 10..12]);
+        assert_eq!(needle(&t, Selection::caret(3)).map(|n| n.1), Some(true));
+        let t = resolvase::TextBuffer::from_text("a + b").snapshot();
+        assert_eq!(needle(&t, Selection::caret(2)), None, "marks are not words");
+    }
+
+    #[test]
+    fn indent_depth_counts_tabs_and_blank_lines() {
+        assert_eq!(depth("        x"), Some(2));
+        assert_eq!(depth("\t  x"), Some(1));
+        assert_eq!(depth("   "), None);
     }
 
     fn text(docs: &Documents, view: ViewId) -> String {
