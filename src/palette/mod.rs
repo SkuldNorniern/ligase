@@ -45,6 +45,8 @@ pub struct Palette {
     pub top: usize,
     /// what `shown` was made for.
     made_for: Option<(Kind, String, usize)>,
+    /// bumped each time the file list is replaced.
+    generation: usize,
     /// just opened; it slides in from here.
     pub opened: bool,
 }
@@ -73,6 +75,13 @@ impl Palette {
         self.kind = None;
     }
 
+    /// a new file list; rows made from the old one are made again.
+    pub fn set_files(&mut self, files: Vec<Item>) {
+        self.files = files;
+        self.listing = false;
+        self.generation += 1;
+    }
+
     /// the list asked for by the query: a `>` in front means commands.
     pub fn wanted(&self) -> (Kind, &str) {
         match self.query.strip_prefix('>') {
@@ -91,7 +100,7 @@ impl Palette {
     /// filters again when the query or the list changed.
     pub fn refresh(&mut self) {
         let (kind, query) = self.wanted();
-        let key = (kind, query.to_owned(), self.items(kind).len());
+        let key = (kind, query.to_owned(), self.generation);
         if self.made_for.as_ref() == Some(&key) {
             return;
         }

@@ -89,6 +89,8 @@ pub struct Bar {
     pub jump_from: Option<usize>,
     /// just opened; it slides in from here.
     pub opened: bool,
+    /// next, back or replace asked while matches were on the way.
+    pub pending: Option<Ask>,
 }
 
 /// what the bar asks the app.

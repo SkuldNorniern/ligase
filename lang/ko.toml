@@ -65,3 +65,4 @@
 "type a command" = "명령 입력"
 "file name, > for commands, : for a line" = "파일 이름, >는 명령, :는 줄 번호"
 "listing files" = "파일 목록 읽는 중"
+"too many matches to replace at once" = "한 번에 바꾸기엔 너무 많아요"

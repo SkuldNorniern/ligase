@@ -132,7 +132,7 @@ pub fn show(
         return Ok(ask);
     }
     // the pick's light glides from row to row
-    let target = (palette.pick - palette.top) as f32 * ROW;
+    let target = palette.pick.saturating_sub(palette.top) as f32 * ROW;
     let y = ui.animate(Id::Palette, 1, Channel::Custom(1), target, 30.0);
     let light = Rect::new(
         list.x,
@@ -148,6 +148,11 @@ pub fn show(
         let last = palette.shown.len().saturating_sub(ROWS);
         let by = if wheel > 0.0 { -3 } else { 3 };
         palette.top = palette.top.saturating_add_signed(by).min(last);
+        // the pick stays among the rows in sight
+        palette.pick = palette
+            .pick
+            .clamp(palette.top, palette.top + ROWS - 1)
+            .min(palette.shown.len() - 1);
         ui.consume_wheel((0.0, wheel));
     }
     for r in 0..rows {

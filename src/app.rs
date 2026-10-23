@@ -608,7 +608,15 @@ impl App {
     /// a tab asked to close; unsaved work keeps it open.
     fn close_pane(&mut self, pane: PaneId) {
         match self.bench.close(pane, &mut self.docs) {
-            Ok(()) => self.layout_dirty = true,
+            Ok(()) => {
+                self.layout_dirty = true;
+                if self
+                    .last_editor
+                    .is_some_and(|v| self.docs.view(v).is_none())
+                {
+                    self.last_editor = None;
+                }
+            }
             Err(Refused::Unsaved) => {
                 self.status = self.texts.tr("save it first, it has changes").to_owned();
             }
@@ -620,13 +628,16 @@ impl App {
     fn palette_ask(&mut self, ask: palette::view::Ask) {
         let editor = self.last_editor;
         let (kind, query) = self.palette.wanted();
-        let goto = query.strip_prefix(':').and_then(find::parse_goto);
+        let goto = (kind == Kind::Files)
+            .then(|| query.strip_prefix(':').and_then(find::parse_goto))
+            .flatten();
         let picked = self.palette.picked();
         self.palette.close();
+        // the keyboard goes back first; whatever runs next may move it on
+        if let Some(view) = editor {
+            self.ui.focus(Id::Editor(view), 1);
+        }
         if ask == palette::view::Ask::Close {
-            if let Some(view) = editor {
-                self.ui.focus(Id::Editor(view), 1);
-            }
             return;
         }
         if let Some((line, column)) = goto {
@@ -634,7 +645,6 @@ impl App {
                 && let Some(v) = self.docs.view_mut(view)
             {
                 v.goto = Some((Point::new(line, column), Encoding::Utf32));
-                self.ui.focus(Id::Editor(view), 1);
             }
             return;
         }
@@ -650,9 +660,6 @@ impl App {
                 self.last_editor = Some(view);
             }
             Kind::Commands => {
-                if let Some(view) = editor {
-                    self.ui.focus(Id::Editor(view), 1);
-                }
                 if let Some(&(_, command)) = COMMANDS.get(item) {
                     self.run(command);
                 }
@@ -692,6 +699,15 @@ impl App {
         let hits: Vec<Range<usize>> = revision
             .map(|r| self.bar.fresh(doc, r).to_vec())
             .unwrap_or_default();
+        let stale = !self.bar.query.is_empty()
+            && revision.is_some_and(|r| {
+                self.bar.found_for.as_ref() != Some(&(doc, r, self.bar.query.clone()))
+            });
+        if stale && matches!(ask, find::Ask::Next | find::Ask::Prev | find::Ask::Replace) {
+            // matches are on the way; this runs once they are in
+            self.bar.pending = Some(ask);
+            return;
+        }
         match ask {
             find::Ask::Close => {
                 self.bar.mode = None;
@@ -730,6 +746,13 @@ impl App {
             }
             find::Ask::ReplaceAll => {
                 if hits.is_empty() {
+                    return;
+                }
+                if hits.len() >= find::MAX_HITS {
+                    self.status = self
+                        .texts
+                        .tr("too many matches to replace at once")
+                        .to_owned();
                     return;
                 }
                 let count = hits.len();
@@ -809,14 +832,18 @@ impl App {
             let sel = self.docs.view(view).map(|v| v.sel.range());
             self.bar.current = sel.and_then(|s| hits.iter().position(|h| *h == s));
         }
+        if let Some(ask) = self.bar.pending.take() {
+            self.bar_ask(ask);
+        }
     }
 
     /// "3 of 12" for the bar.
     fn found_note(&self) -> String {
-        let Some((_, _, q)) = &self.bar.found_for else {
+        let Some((d, r, q)) = &self.bar.found_for else {
             return String::new();
         };
-        if self.bar.query.is_empty() || *q != self.bar.query {
+        let now = self.docs.doc(*d).map(|doc| doc.buffer.revision());
+        if self.bar.query.is_empty() || *q != self.bar.query || now != Some(*r) {
             return String::new();
         }
         let total = self.bar.hits.len();
@@ -980,10 +1007,7 @@ impl App {
                 },
                 Done::Shell(result) => self.shell.started(result),
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
-                Done::Files(files) => {
-                    self.palette.listing = false;
-                    self.palette.files = files;
-                }
+                Done::Files(files) => self.palette.set_files(files),
                 Done::Server(language, result) => {
                     if let Some(why) = self.lsp.started(language, result) {
                         // a missing server is fine; the editor works without it
@@ -1166,7 +1190,7 @@ impl App {
                 bar_ask = find::show(&mut ui, bar, *rect, &note, texts)?;
             } else if bar.is_open() {
                 // its editor is not in sight; the bar goes with it
-                bar.mode = None;
+                bar_ask = Some(find::Ask::Close);
             }
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
             status_bar(&mut ui, status, &message, &place)?;
