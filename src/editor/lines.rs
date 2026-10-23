@@ -54,7 +54,8 @@ pub fn move_lines(text: &TextSnapshot, sel: Selection, up: bool, lb: &str) -> Op
         let region = start(text, prev)..line_end(text, b);
         let mut lines = split(text, region.clone());
         let first = lines.remove(0);
-        let by = -((first.len() + lb.len()) as isize);
+        // the real gap, so a file with mixed breaks lands right too
+        let by = -((start(text, a) - start(text, prev)) as isize);
         lines.push(first);
         ((region, lines.join(lb)), by)
     } else {
@@ -212,13 +213,14 @@ pub fn outdent_lines(text: &TextSnapshot, sel: Selection, unit: &str) -> Change 
     let edits: Vec<_> = (a..=b)
         .filter_map(|l| {
             let s = start(text, l);
-            let head = text
-                .slice(s..line_end(text, l).min(s + unit.len()))
-                .unwrap_or_default();
-            let take = if head.starts_with('\t') {
+            let line = text.slice(s..line_end(text, l)).unwrap_or_default();
+            let take = if line.starts_with('\t') {
                 1
             } else {
-                head.len() - head.trim_start_matches(' ').len()
+                line.bytes()
+                    .take(unit.len())
+                    .take_while(|b| *b == b' ')
+                    .count()
             };
             (take > 0).then(|| (s..s + take, String::new()))
         })
@@ -343,5 +345,7 @@ mod tests {
         );
         let c = outdent_lines(&t, all, "    ");
         assert_eq!(run(src, &c), "a\n\nb\nc");
+        let c = outdent_lines(&snap("  한글"), Selection::caret(2), "    ");
+        assert_eq!(run("  한글", &c), "한글");
     }
 }
