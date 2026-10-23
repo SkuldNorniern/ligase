@@ -1080,6 +1080,17 @@ mod tests {
     }
 
     #[test]
+    fn enter_after_python_colon_at_the_end() {
+        let mut docs = Documents::default();
+        let (doc, _) = docs.open(Path::new("t.py"));
+        let v = docs.add_view(doc);
+        docs.loaded(doc, Ok("def f():".to_owned()));
+        caret(&mut docs, v, 8);
+        act(&mut docs, v, Action::Newline);
+        assert_eq!(text(&docs, v), "def f():\n    ");
+    }
+
+    #[test]
     fn backspace_in_indent_goes_to_tab_stop() {
         let (mut docs, v) = open("      x");
         caret(&mut docs, v, 6);
