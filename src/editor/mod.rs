@@ -7,13 +7,14 @@ pub mod input;
 use std::ops::Range;
 
 use aurea::AureaResult;
-use aurea::render::{Font, Point, Rect};
+use aurea::render::{Color, Font, Point, Rect};
 use aurea::ui::{Align, ScrollArea, Sense, Ui};
 use resolvase::TextSnapshot;
 
 use crate::app::Id;
 use crate::document::{Document, Documents, Load, View, ViewId};
 use crate::lang::Texts;
+use crate::syntax::{self, Spans};
 use cursor::Selection;
 use input::Action;
 
@@ -140,6 +141,46 @@ struct Laid {
     drawn: String,
     /// (buffer offset, drawn offset) per char, plus one past the end.
     marks: Vec<(usize, usize)>,
+}
+
+/// draws one line in runs: plain text between spans, each span in its colour.
+fn paint_line(
+    ui: &mut Ui<'_, Id>,
+    font: &Font,
+    laid: &Laid,
+    spans: &Spans,
+    line: Range<usize>,
+    body: Rect,
+    plain: Color,
+) -> AureaResult<()> {
+    let run = |ui: &mut Ui<'_, Id>, from: usize, to: usize, color: Color| {
+        let (a, b) = (laid.drawn_at(from), laid.drawn_at(to));
+        if a >= b {
+            return Ok(());
+        }
+        let x = ui.text_width(&laid.drawn[..a], font);
+        let at = Rect::new(body.x + x, body.y, (body.width - x).max(0.0), body.height);
+        ui.text(&laid.drawn[a..b], at, font, color, Align::Start)
+    };
+    // the span just before the line can reach into it, like a block comment
+    let first = spans
+        .partition_point(|(r, _)| r.start < line.start)
+        .saturating_sub(1);
+    let mut at = line.start;
+    for (range, kind) in &spans[first..] {
+        if range.start >= line.end {
+            break;
+        }
+        let from = range.start.max(at);
+        let to = range.end.min(line.end);
+        if from >= to {
+            continue;
+        }
+        run(ui, at, from, plain)?;
+        run(ui, from, to, syntax::colour(*kind))?;
+        at = to;
+    }
+    run(ui, at, line.end, plain)
 }
 
 /// a line's text without its line break, `\r` included, so no click or
@@ -319,7 +360,7 @@ pub fn show(
                     }
                     ui.fill(Rect::new(body.x + x0, y, x1 - x0, LINE), palette.selection)?;
                 }
-                ui.text(&laid.drawn, body, &font, palette.text, Align::Start)?;
+                paint_line(ui, &font, &laid, &doc.spans, span, body, palette.text)?;
                 if line == caret_line && shown.focused {
                     let x = body.x + laid.x_of(ui, &font, sel.head);
                     let mut caret_x = x;

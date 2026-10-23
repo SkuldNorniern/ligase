@@ -15,6 +15,7 @@ use crate::editor::{self, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
+use crate::syntax::Syntax;
 use crate::workbench::panels::{PaneId, Panel};
 use crate::workbench::{self, Refused, Workbench};
 
@@ -59,6 +60,7 @@ pub struct App {
     docs: Documents,
     explorer: Explorer,
     jobs: Jobs<Done>,
+    syntax: Syntax,
     /// session file for this workspace; none when there is no config dir.
     session: Option<PathBuf>,
     status: String,
@@ -89,6 +91,7 @@ impl App {
             docs: Documents::default(),
             explorer: Explorer::new(root),
             jobs: Jobs::default(),
+            syntax: Syntax::default(),
             session: workbench::session_path(root),
             status: String::new(),
             focus: None,
@@ -111,6 +114,7 @@ impl App {
 
     pub fn set_canvas(&mut self, id: CanvasId) {
         self.jobs.set_canvas(id);
+        self.syntax.set_canvas(id);
     }
 
     pub fn busy(&self) -> bool {
@@ -313,6 +317,12 @@ impl App {
     }
 
     fn poll(&mut self) {
+        while let Some(parsed) = self.syntax.take() {
+            self.docs.coloured(parsed);
+        }
+        for (doc, language, text) in self.docs.wanting_colours() {
+            self.syntax.ask(doc, language, text);
+        }
         while let Some(done) = self.jobs.take() {
             match done {
                 Done::Listed(path, Ok(entries)) => self.explorer.listed(&path, entries),

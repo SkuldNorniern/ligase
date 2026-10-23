@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use resolvase::{Bias, ChangeSet, SavePoint, TextBuffer, TextSnapshot};
+use resolvase::{Bias, ChangeSet, Revision, SavePoint, TextBuffer, TextSnapshot};
 
 use crate::editor::cursor::Selection;
+use crate::syntax::{self, Parsed, Spans};
 
 /// files bigger than this are refused for now.
 pub const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -31,6 +32,12 @@ pub struct Document {
     pub load: Load,
     /// the file used `\r\n`; new lines follow it.
     pub crlf: bool,
+    /// sylven language, from the file extension.
+    pub language: Option<&'static str>,
+    /// syntax colours, moved along with edits between parses.
+    pub spans: Spans,
+    /// newest revision sent for colouring.
+    asked: Option<Revision>,
 }
 
 impl Document {
@@ -94,6 +101,9 @@ impl Documents {
                 buffer: TextBuffer::new(),
                 load: Load::Loading,
                 crlf: false,
+                language: syntax::language_for(path),
+                spans: Spans::new(),
+                asked: None,
             },
         );
         (id, true)
@@ -173,6 +183,9 @@ impl Documents {
         let Some(doc) = self.views.get(&actor).map(|v| v.doc) else {
             return;
         };
+        if let Some(d) = self.docs.get_mut(&doc) {
+            syntax::follow(&mut d.spans, set);
+        }
         for (&id, v) in self.views.iter_mut().filter(|(_, v)| v.doc == doc) {
             // others stay put when text lands right at their caret
             let bias = if id == actor { Bias::Right } else { Bias::Left };
@@ -196,6 +209,32 @@ impl Documents {
         let (doc, _) = self.editable(view)?;
         let point = doc.buffer.save_point();
         Some((id, doc.path.clone(), doc.buffer.snapshot(), point))
+    }
+
+    /// loaded documents whose current text has not been sent for colours.
+    pub fn wanting_colours(&mut self) -> Vec<(DocumentId, &'static str, TextSnapshot)> {
+        let mut out = Vec::new();
+        for (&id, doc) in &mut self.docs {
+            let Some(language) = doc.language else {
+                continue;
+            };
+            let now = doc.buffer.revision();
+            if doc.load == Load::Ready && doc.asked != Some(now) {
+                doc.asked = Some(now);
+                out.push((id, language, doc.buffer.snapshot()));
+            }
+        }
+        out
+    }
+
+    /// colours are back. kept only when they match the text now; older
+    /// ones would sit on the wrong text, the moved spans are better.
+    pub fn coloured(&mut self, parsed: Parsed) {
+        if let Some(doc) = self.docs.get_mut(&parsed.doc)
+            && doc.buffer.revision() == parsed.revision
+        {
+            doc.spans = parsed.spans;
+        }
     }
 
     /// a save is done. ignored when the document was closed meanwhile.
@@ -417,6 +456,34 @@ mod tests {
         assert!(!docs.doc(a).unwrap().is_dirty());
         assert!(!dir.join(".a.txt.ligase-save").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn colours_asked_once_per_revision_and_kept_only_when_current() {
+        let mut docs = Documents::default();
+        let (a, _) = docs.open(Path::new("a.rs"));
+        let (_txt, _) = docs.open(Path::new("notes.txt"));
+        let v = docs.add_view(a);
+        assert!(docs.wanting_colours().is_empty(), "still loading");
+        docs.loaded(a, Ok("fn x() {}".into()));
+        let asked = docs.wanting_colours();
+        assert_eq!(asked.len(), 1, "only the file with a language");
+        assert!(docs.wanting_colours().is_empty());
+        let old = asked[0].2.revision();
+        docs.edit(v, vec![(0..0, " ".into())], false);
+        docs.coloured(Parsed {
+            doc: a,
+            revision: old,
+            spans: vec![(0..2, sylven::HighlightKind::Keyword)],
+        });
+        assert!(docs.doc(a).unwrap().spans.is_empty(), "stale parse dropped");
+        let now = docs.wanting_colours()[0].2.revision();
+        docs.coloured(Parsed {
+            doc: a,
+            revision: now,
+            spans: vec![(1..3, sylven::HighlightKind::Keyword)],
+        });
+        assert_eq!(docs.doc(a).unwrap().spans.len(), 1);
     }
 
     #[test]

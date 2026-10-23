@@ -10,3 +10,5 @@ repository = "https://github.com/SkuldNorniern/ligase"
 aurea = { git = "https://github.com/SkuldNorniern/aurea", rev = "e123ae3a326180fe39cbba02b0fb8c89b47e6d13" }
 resolvase = { path = "../resolvase" }
 toml = "1"
+sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
+sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
