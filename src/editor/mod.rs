@@ -44,12 +44,14 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
         Action::Move(motion, extend) => {
             v.sel = cursor::motion(&text, sel, motion, extend, &mut v.goal);
             v.reveal = true;
+            v.preedit = None;
             // typing after a move is a new undo step
             doc.buffer.break_join();
             return true;
         }
         Action::Collapse => {
             v.sel = Selection::caret(sel.head);
+            v.preedit = None;
             return true;
         }
         Action::Preedit(composing, at) => {
@@ -128,6 +130,8 @@ pub struct Shown {
     pub focused: bool,
     /// caret box in window space, for the ime window.
     pub caret: Option<Rect>,
+    /// the mouse placed the caret; typing after it is a new undo step.
+    pub pressed: bool,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -136,6 +140,12 @@ struct Laid {
     drawn: String,
     /// (buffer offset, drawn offset) per char, plus one past the end.
     marks: Vec<(usize, usize)>,
+}
+
+/// a line's text without its line break, `\r` included, so no click or
+/// drag can land between `\r` and `\n`.
+fn span(text: &TextSnapshot, line: usize) -> Range<usize> {
+    text.line_start(line).unwrap_or(0)..cursor::line_end(text, line)
 }
 
 fn lay(text: &TextSnapshot, range: Range<usize>) -> Laid {
@@ -157,7 +167,6 @@ fn lay(text: &TextSnapshot, range: Range<usize>) -> Laid {
         laid.marks.push((at, laid.drawn.len()));
         match c {
             '\t' => laid.drawn.push_str(TAB),
-            '\r' => {}
             c => laid.drawn.push(c),
         }
         at += c.len_utf8();
@@ -213,6 +222,7 @@ pub fn show(
     let mut shown = Shown {
         focused: false,
         caret: None,
+        pressed: false,
     };
     let font = Font::new(MONO, SIZE);
     let palette = ui.theme.palette;
@@ -234,9 +244,8 @@ pub fn show(
     let gutter = ui.text_width(&"0".repeat(digits), &font) + 16.0;
     let height = lines as f32 * LINE + LINE;
     view.page = ((rect.height / LINE) as usize).saturating_sub(1).max(1);
-    let caret_line = text.line_of(view.sel.head).unwrap_or(0);
     if std::mem::take(&mut view.reveal) {
-        let y = caret_line as f32 * LINE;
+        let y = text.line_of(view.sel.head).unwrap_or(0) as f32 * LINE;
         if y < view.scroll {
             view.scroll = y;
         } else if y + LINE > view.scroll + rect.height {
@@ -244,7 +253,7 @@ pub fn show(
         }
     }
     let mut sel = view.sel;
-    let preedit = view.preedit.clone();
+    let mut preedit = view.preedit.clone();
     ScrollArea::new(&mut view.scroll, height).show(
         ui,
         Id::Editor(id),
@@ -262,8 +271,7 @@ pub fn show(
                 let line = ((at.y - content.y) / LINE)
                     .floor()
                     .clamp(0.0, (lines - 1) as f32) as usize;
-                let range = text.line_range(line).unwrap_or(0..0);
-                lay(text, range).offset_at(ui, &font, at.x - body_x)
+                lay(text, span(text, line)).offset_at(ui, &font, at.x - body_x)
             };
             if let Some(press) = ui.press(Id::Editor(id), 1) {
                 let at = hit_test(ui, press.at);
@@ -276,6 +284,9 @@ pub fn show(
                     },
                     _ => Selection::caret(at),
                 };
+                // a click ends composing and the typing run
+                preedit = None;
+                shown.pressed = true;
             } else if input.held
                 && let Some(at) = ui.pointer()
             {
@@ -283,6 +294,7 @@ pub fn show(
             }
 
             let range = sel.range();
+            let caret_line = text.line_of(sel.head).unwrap_or(0);
             for line in first..(first + count).min(lines) {
                 let y = content.y + line as f32 * LINE;
                 let row = Rect::new(content.x, y, content.width, LINE);
@@ -294,9 +306,7 @@ pub fn show(
                     palette.faint,
                     Align::End,
                 )?;
-                let Ok(span) = text.line_range(line) else {
-                    continue;
-                };
+                let span = span(text, line);
                 let laid = lay(text, span.clone());
                 // selection behind the text, one extra space when it runs past the line end
                 let from = range.start.max(span.start);
@@ -334,6 +344,7 @@ pub fn show(
         },
     )?;
     view.sel = sel;
+    view.preedit = preedit;
     Ok(shown)
 }
 
@@ -372,6 +383,16 @@ mod tests {
         // the whole typing run is one step
         assert!(docs.undo(v));
         assert_eq!(text(&docs, v), "");
+    }
+
+    #[test]
+    fn crlf_lines_lay_out_without_cr() {
+        let (docs, v) = open("ab\r\ncd");
+        let text = docs.doc_of(v).unwrap().buffer.text();
+        assert_eq!(span(text, 0), 0..2);
+        let laid = lay(text, span(text, 0));
+        assert_eq!(laid.drawn, "ab");
+        assert_eq!(laid.marks.last(), Some(&(2, 2)));
     }
 
     #[test]

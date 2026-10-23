@@ -349,25 +349,27 @@ impl App {
             return;
         }
         let Some(text) = text else { return };
-        let mut opened: Vec<(DocumentId, PathBuf, ViewId)> = Vec::new();
+        let mut made: Vec<ViewId> = Vec::new();
+        let mut fresh: Vec<(DocumentId, PathBuf)> = Vec::new();
         let docs = &mut self.docs;
         let bench = Workbench::restore(&text, |path| {
             let (doc, new) = docs.open(path);
             let view = docs.add_view(doc);
+            made.push(view);
             if new {
-                opened.push((doc, path.to_path_buf(), view));
+                fresh.push((doc, path.to_path_buf()));
             }
             Some(view)
         });
         match bench {
             Some(bench) => {
                 self.bench = bench;
-                for (doc, path, _) in opened {
+                for (doc, path) in fresh {
                     self.load(doc, &path);
                 }
             }
             None => {
-                for (_, _, view) in opened {
+                for view in made {
                     self.docs.close_view(view);
                 }
             }
@@ -409,6 +411,7 @@ impl App {
         let mut clicks: Vec<Click> = Vec::new();
         let mut focus = None;
         let mut ime = None;
+        let mut pressed: Vec<ViewId> = Vec::new();
         let changed;
         let place = self.place();
         {
@@ -433,6 +436,9 @@ impl App {
                             focus = Some(view);
                             ime = shown.caret;
                         }
+                        if shown.pressed {
+                            pressed.push(view);
+                        }
                     }
                     if let Some(v) = docs.view_mut(view) {
                         *v = state;
@@ -453,6 +459,11 @@ impl App {
         }
         self.focus = focus;
         self.ime = ime;
+        for view in pressed {
+            if let Some((doc, _)) = self.docs.editable(view) {
+                doc.buffer.break_join();
+            }
+        }
         if changed {
             self.layout_dirty = true;
         }

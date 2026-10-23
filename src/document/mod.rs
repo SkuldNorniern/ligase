@@ -287,6 +287,15 @@ pub fn read_text(path: &Path) -> Result<String, String> {
 pub fn write_atomic(path: &Path, text: &TextSnapshot) -> Result<(), String> {
     use std::io::Write;
 
+    // a link is saved through: write its target and keep the link
+    let target;
+    let path = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            target = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+            target.as_path()
+        }
+        _ => path,
+    };
     let name = path
         .file_name()
         .ok_or_else(|| "no file name".to_owned())?
