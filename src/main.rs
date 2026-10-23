@@ -9,6 +9,7 @@ mod explorer;
 mod jobs;
 mod lang;
 mod syntax;
+mod terminal;
 mod workbench;
 
 use std::cell::RefCell;

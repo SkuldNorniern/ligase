@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use aurea::render::{CanvasId, DrawingContext, Rect};
+use aurea::render::{CanvasId, DrawingContext, Rect, request_canvas_redraw};
 use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 
@@ -16,6 +16,7 @@ use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
 use crate::syntax::Syntax;
+use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
 use crate::workbench::{self, Refused, Workbench};
 
@@ -26,6 +27,7 @@ pub enum Id {
     Dock,
     Explorer,
     Editor(ViewId),
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +51,7 @@ enum Done {
     Session(Option<String>),
     Saved(Result<(), String>),
     Wrote(DocumentId, String, SavePoint, Result<(), String>),
+    Shell(Result<ozone_term::Terminal, String>),
 }
 
 pub struct App {
@@ -61,6 +64,10 @@ pub struct App {
     explorer: Explorer,
     jobs: Jobs<Done>,
     syntax: Syntax,
+    shell: Shell,
+    /// the terminal panel had the keyboard last frame.
+    shell_focus: bool,
+    canvas: Option<CanvasId>,
     /// session file for this workspace; none when there is no config dir.
     session: Option<PathBuf>,
     status: String,
@@ -92,6 +99,9 @@ impl App {
             explorer: Explorer::new(root),
             jobs: Jobs::default(),
             syntax: Syntax::default(),
+            shell: Shell::default(),
+            shell_focus: false,
+            canvas: None,
             session: workbench::session_path(root),
             status: String::new(),
             focus: None,
@@ -115,6 +125,7 @@ impl App {
     pub fn set_canvas(&mut self, id: CanvasId) {
         self.jobs.set_canvas(id);
         self.syntax.set_canvas(id);
+        self.canvas = Some(id);
     }
 
     pub fn busy(&self) -> bool {
@@ -139,6 +150,9 @@ impl App {
         if self.ui.popup_open() {
             return self.ui.handle(event);
         }
+        if self.shell_focus {
+            return self.shell_event(event);
+        }
         if let Some(&command) = self.keymap.resolve(event, self.ui.text_focused()) {
             self.run(command);
             return true;
@@ -154,6 +168,61 @@ impl App {
             return true;
         }
         self.ui.handle(event)
+    }
+
+    /// keys while the terminal has focus: panel shortcuts still work, paste
+    /// pastes into the shell, everything else is the shell's.
+    fn shell_event(&mut self, event: &WindowEvent) -> bool {
+        match self.keymap.resolve(event, false) {
+            Some(
+                command
+                @ (Command::ToggleTerminal | Command::ToggleExplorer | Command::ResetLayout),
+            ) => {
+                let command = *command;
+                self.run(command);
+                return true;
+            }
+            Some(Command::Paste) => {
+                if let Some(text) = aurea::clipboard::clipboard_text() {
+                    self.shell.write(&text);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        let Some(bytes) = terminal::bytes(event) else {
+            return self.ui.handle(event);
+        };
+        if self.shell.state == terminal::State::Ended {
+            if bytes == "\r" {
+                self.start_shell();
+            }
+        } else {
+            self.shell.write(&bytes);
+        }
+        true
+    }
+
+    /// starts the shell on the worker, in the workspace folder. its output
+    /// wakes the canvas.
+    fn start_shell(&mut self) {
+        self.shell.state = terminal::State::Starting;
+        let root = self.explorer.root().to_path_buf();
+        let canvas = self.canvas;
+        let job = move || {
+            let wake = move || {
+                if let Some(id) = canvas {
+                    request_canvas_redraw(id);
+                }
+            };
+            Done::Shell(
+                ozone_term::Terminal::spawn_in(Some(&root), wake).map_err(|e| e.to_string()),
+            )
+        };
+        if !self.jobs.run(job) {
+            self.shell
+                .started(Err("the file worker is not running".to_owned()));
+        }
     }
 
     pub fn run(&mut self, command: Command) {
@@ -341,6 +410,7 @@ impl App {
                         self.status = format!("{} {name}: {why}", self.texts.tr("can't save"));
                     }
                 },
+                Done::Shell(result) => self.shell.started(result),
                 Done::Saved(result) => {
                     if let Err(why) = result {
                         self.status = format!("{}: {why}", self.texts.tr("can't save the layout"));
@@ -422,11 +492,13 @@ impl App {
         let mut focus = None;
         let mut ime = None;
         let mut pressed: Vec<ViewId> = Vec::new();
+        let mut shell_focus = false;
         let changed;
         let place = self.place();
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
+            let shell = &mut self.shell;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
@@ -455,7 +527,10 @@ impl App {
                     }
                     Ok(())
                 }
-                Some(Panel::Terminal) => hint(ui, rect, texts.tr("the terminal comes later")),
+                Some(Panel::Terminal) => {
+                    shell_focus = terminal::show(ui, shell, rect, texts)?;
+                    Ok(())
+                }
                 Some(Panel::Welcome) | None => {
                     hint(ui, rect, texts.tr("open a file from the explorer"))
                 }
@@ -469,6 +544,11 @@ impl App {
         }
         self.focus = focus;
         self.ime = ime;
+        self.shell_focus = shell_focus;
+        // the shell starts the first time its panel is drawn, not before
+        if self.shell.state == terminal::State::NotStarted && self.shows(Panel::Terminal) {
+            self.start_shell();
+        }
         for view in pressed {
             if let Some((doc, _)) = self.docs.editable(view) {
                 doc.buffer.break_join();
