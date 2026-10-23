@@ -51,23 +51,29 @@ fn run() -> AureaResult<()> {
     let canvas = Canvas::new(WIDTH, HEIGHT, RendererBackend::Cpu)?;
     let id = canvas.id();
     app.borrow_mut().set_canvas(id);
-    // the window only exists once built; menus and frames reach it here
+    let mut ticks = menus(&mut window, &app, id)?;
+    // the window only exists once built; frames reach it here
     let shown: Rc<RefCell<Weak<Window>>> = Rc::default();
-    let mut ticks = menus(&mut window, &app, &shown, id)?;
 
     let drawn = Rc::clone(&app);
     let shown_in_draw = Rc::clone(&shown);
     canvas.set_draw_callback(move |ctx| {
-        let mut a = drawn.borrow_mut();
-        let result = a.draw(ctx);
-        ticks.update(&a);
-        if let Some(window) = shown_in_draw.borrow().upgrade() {
-            a.ui.sync_window(&window);
-            if std::mem::take(&mut a.close_now) {
-                window.close();
+        let window = shown_in_draw.borrow().upgrade();
+        let (result, close, again) = {
+            let mut a = drawn.borrow_mut();
+            let result = a.draw(ctx);
+            ticks.update(&a);
+            if let Some(window) = &window {
+                a.ui.sync_window(window);
             }
+            let close = std::mem::take(&mut a.close_now);
+            (result, close, a.ui.wants_frame() || a.busy())
+        };
+        // the app is not borrowed past here; closing may send events back
+        if close && let Some(window) = &window {
+            window.close();
         }
-        if a.ui.wants_frame() || a.busy() {
+        if again {
             request_canvas_redraw(id);
         }
         if let Err(e) = &result {
@@ -86,10 +92,14 @@ fn run() -> AureaResult<()> {
     let input = Rc::clone(&app);
     let weak = Rc::downgrade(&window);
     window.on_event(move |event| {
-        let redraw = input.borrow_mut().event(&event);
-        if let Some(window) = weak.upgrade()
-            && std::mem::take(&mut input.borrow_mut().close_now)
-        {
+        let Ok(mut a) = input.try_borrow_mut() else {
+            // an event sent from inside a frame; the frame redraws anyway
+            return;
+        };
+        let redraw = a.event(&event);
+        let close = std::mem::take(&mut a.close_now);
+        drop(a);
+        if close && let Some(window) = weak.upgrade() {
             window.close();
         }
         if redraw {
@@ -118,25 +128,14 @@ impl Ticks {
     }
 }
 
-fn menus(
-    window: &mut Window,
-    app: &Rc<RefCell<App>>,
-    shown: &Rc<RefCell<Weak<Window>>>,
-    id: CanvasId,
-) -> AureaResult<Ticks> {
+fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResult<Ticks> {
     let a = app.borrow();
     let bar = window.create_menu_bar()?;
     let call = |command: Command| {
         let app = Rc::clone(app);
-        let shown = Rc::clone(shown);
         move || {
             if let Ok(mut a) = app.try_borrow_mut() {
                 a.run(command);
-            }
-            if let Some(window) = shown.borrow().upgrade()
-                && std::mem::take(&mut app.borrow_mut().close_now)
-            {
-                window.close();
             }
             request_canvas_redraw(id);
         }

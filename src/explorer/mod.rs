@@ -20,6 +20,8 @@ struct Node {
     open: bool,
     /// none until scanned.
     children: Option<Vec<usize>>,
+    /// a scan is out for this folder.
+    scanning: bool,
 }
 
 /// one visible row.
@@ -65,6 +67,7 @@ impl Explorer {
                 depth: 0,
                 open: true,
                 children: None,
+                scanning: false,
             }],
             rows: Vec::new(),
             scroll: 0.0,
@@ -101,7 +104,8 @@ impl Explorer {
             return Some(Click::Open(node.path.clone()));
         }
         node.open = !node.open;
-        let scan = node.open && node.children.is_none();
+        let scan = node.open && node.children.is_none() && !node.scanning;
+        node.scanning |= scan;
         let path = node.path.clone();
         self.rebuild();
         Some(if scan {
@@ -111,11 +115,17 @@ impl Explorer {
         })
     }
 
-    /// scan result for `path`. ignored when the folder is gone from the tree.
+    /// scan result for `path`. ignored when the folder is gone from the tree
+    /// or already listed.
     pub fn listed(&mut self, path: &Path, entries: Vec<(String, bool)>) {
-        let Some(parent) = self.nodes.iter().position(|n| n.dir && n.path == path) else {
+        let Some(parent) = self
+            .nodes
+            .iter()
+            .position(|n| n.dir && n.path == path && n.children.is_none())
+        else {
             return;
         };
+        self.nodes[parent].scanning = false;
         let depth = self.nodes[parent].depth + 1;
         let mut children = Vec::with_capacity(entries.len());
         for (name, dir) in entries {
@@ -127,18 +137,23 @@ impl Explorer {
                 depth,
                 open: false,
                 children: None,
+                scanning: false,
             });
         }
         self.nodes[parent].children = Some(children);
         self.rebuild();
     }
 
-    /// folders that are open but not scanned yet, like the root at start.
-    pub fn pending(&self) -> Vec<PathBuf> {
+    /// folders open but never scanned, like the root at start. marks them as
+    /// scanning, so each one is handed out once.
+    pub fn take_pending(&mut self) -> Vec<PathBuf> {
         self.nodes
-            .iter()
-            .filter(|n| n.dir && n.open && n.children.is_none())
-            .map(|n| n.path.clone())
+            .iter_mut()
+            .filter(|n| n.dir && n.open && n.children.is_none() && !n.scanning)
+            .map(|n| {
+                n.scanning = true;
+                n.path.clone()
+            })
             .collect()
     }
 
@@ -196,13 +211,14 @@ mod tests {
     fn folders_open_lazily() {
         let root = Path::new("proj");
         let mut explorer = Explorer::new(root);
-        assert_eq!(explorer.pending(), [PathBuf::from("proj")]);
+        assert_eq!(explorer.take_pending(), [PathBuf::from("proj")]);
+        assert!(explorer.take_pending().is_empty(), "handed out once");
         explorer.listed(
             root,
             vec![("src".into(), true), ("Cargo.toml".into(), false)],
         );
         assert_eq!(names(&explorer), ["proj", "src", "Cargo.toml"]);
-        assert!(explorer.pending().is_empty());
+        assert!(explorer.take_pending().is_empty());
 
         assert_eq!(
             explorer.click(1),
@@ -235,6 +251,19 @@ mod tests {
             explorer.row(explorer.selected.unwrap()).unwrap().name,
             "b.txt"
         );
+    }
+
+    #[test]
+    fn folder_toggled_during_scan_scans_once() {
+        let root = Path::new("p");
+        let mut explorer = Explorer::new(root);
+        explorer.listed(root, vec![("a".into(), true)]);
+        assert_eq!(explorer.click(1), Some(Click::Scan(PathBuf::from("p/a"))));
+        assert_eq!(explorer.click(1), Some(Click::Toggled));
+        assert_eq!(explorer.click(1), Some(Click::Toggled), "scan still out");
+        explorer.listed(Path::new("p/a"), vec![("x".into(), false)]);
+        explorer.listed(Path::new("p/a"), vec![("x".into(), false)]);
+        assert_eq!(explorer.len(), 3, "second listing ignored");
     }
 
     #[test]

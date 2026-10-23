@@ -107,6 +107,10 @@ impl Documents {
         self.view(view).and_then(|v| self.doc(v.doc))
     }
 
+    pub fn any_dirty(&self) -> bool {
+        self.docs.values().any(Document::is_dirty)
+    }
+
     /// true when this is the last view of a document with unsaved changes;
     /// closing it would drop work.
     pub fn close_loses_work(&self, view: ViewId) -> bool {
@@ -148,11 +152,21 @@ impl Documents {
 /// reads a text file. runs on the worker. refuses big and non UTF-8 files
 /// instead of guessing, so nothing gets mangled.
 pub fn read_text(path: &Path) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if meta.len() > MAX_FILE {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("not a regular file".to_owned());
+    }
+    // read through a cap: the size can change after the check, and some
+    // special files report none
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_FILE {
         return Err(format!("file is over {} MiB", MAX_FILE / 1024 / 1024));
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_owned())
 }
 

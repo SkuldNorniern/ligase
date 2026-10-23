@@ -49,6 +49,8 @@ pub struct App {
     docs: Documents,
     explorer: Explorer,
     jobs: Jobs<Done>,
+    /// session file for this workspace; none when there is no config dir.
+    session: Option<PathBuf>,
     status: String,
     /// the layout changed since it was last written.
     layout_dirty: bool,
@@ -73,6 +75,7 @@ impl App {
             docs: Documents::default(),
             explorer: Explorer::new(root),
             jobs: Jobs::default(),
+            session: workbench::session_path(root),
             status: String::new(),
             layout_dirty: false,
             restored: false,
@@ -80,7 +83,7 @@ impl App {
             close_now: false,
         };
         app.scan_pending();
-        match workbench::session_path() {
+        match app.session.clone() {
             Some(path) => {
                 app.jobs
                     .run(move || Done::Session(std::fs::read_to_string(path).ok()));
@@ -159,7 +162,12 @@ impl App {
         if self.closing {
             return;
         }
-        if self.save_layout() {
+        if self.docs.any_dirty() {
+            self.status = self.texts.tr("save it first, it has changes").to_owned();
+            return;
+        }
+        // before the saved session is back, writing would wipe it
+        if self.restored && self.save_layout() {
             self.closing = true;
         } else {
             self.close_now = true;
@@ -168,7 +176,7 @@ impl App {
 
     /// queues a session write. false when there is nowhere to write.
     fn save_layout(&mut self) -> bool {
-        let Some(path) = workbench::session_path() else {
+        let Some(path) = self.session.clone() else {
             return false;
         };
         let text = self.bench.save(&self.docs);
@@ -178,10 +186,18 @@ impl App {
     }
 
     fn scan_pending(&mut self) {
-        for path in self.explorer.pending() {
-            let at = path.clone();
-            self.jobs
-                .run(move || Done::Listed(at.clone(), explorer::scan(&at)));
+        for path in self.explorer.take_pending() {
+            self.scan(path);
+        }
+    }
+
+    fn scan(&mut self, path: PathBuf) {
+        let at = path.clone();
+        if !self
+            .jobs
+            .run(move || Done::Listed(at.clone(), explorer::scan(&at)))
+        {
+            self.explorer.listed(&path, Vec::new());
         }
     }
 
@@ -202,8 +218,13 @@ impl App {
 
     fn load(&mut self, doc: DocumentId, path: &Path) {
         let path = path.to_path_buf();
-        self.jobs
-            .run(move || Done::Loaded(doc, document::read_text(&path)));
+        if !self
+            .jobs
+            .run(move || Done::Loaded(doc, document::read_text(&path)))
+        {
+            self.docs
+                .loaded(doc, Err("the file worker is not running".to_owned()));
+        }
     }
 
     fn poll(&mut self) {
@@ -346,7 +367,7 @@ impl App {
         for click in clicks {
             match click {
                 Click::Open(path) => self.open_file(&path),
-                Click::Scan(_) => self.scan_pending(),
+                Click::Scan(path) => self.scan(path),
                 Click::Toggled => {}
             }
         }

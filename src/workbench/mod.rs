@@ -293,9 +293,17 @@ fn map_plan(
     }
 }
 
-/// where the session file lives.
-pub fn session_path() -> Option<PathBuf> {
-    aurea::config_dir("Ligase").map(|dir| dir.join("session.toml"))
+/// where the session file for workspace `root` lives. one file per folder,
+/// named by a hash of its path.
+pub fn session_path(root: &Path) -> Option<PathBuf> {
+    // fnv-1a: tiny, and stable across rust versions unlike `DefaultHasher`
+    let hash = root
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    aurea::config_dir("Ligase").map(|dir| dir.join("sessions").join(format!("{hash:016x}.toml")))
 }
 
 /// writes the session file through a temp file, so a crash mid-write
@@ -415,6 +423,18 @@ mod tests {
         assert!(Workbench::restore("not toml [", |_| None).is_none());
         assert!(Workbench::restore("version = 0\nlayout = \"\"", |_| None).is_none());
         assert!(Workbench::restore("version = 1\nlayout = \"tabs(\"", |_| None).is_none());
+    }
+
+    #[test]
+    fn sessions_differ_per_folder() {
+        let (Some(a), Some(b)) = (
+            session_path(Path::new("C:/work/a")),
+            session_path(Path::new("C:/work/b")),
+        ) else {
+            return;
+        };
+        assert_ne!(a, b);
+        assert_eq!(session_path(Path::new("C:/work/a")), Some(a));
     }
 
     #[test]

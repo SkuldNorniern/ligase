@@ -1,6 +1,6 @@
-use aurea::AureaResult;
 use aurea::render::{Point, Rect};
 use aurea::ui::{Align, ListView, Ui};
+use aurea::{AureaResult, KeyCode};
 
 use super::{Click, Explorer};
 use crate::app::Id;
@@ -41,8 +41,23 @@ pub fn show(
         })?;
     explorer.scroll = scroll;
     explorer.selected = selected;
-    let picked = selected.filter(|_| selected != before || response.clicked);
-    Ok(picked.and_then(|row| explorer.click(row)))
+    // a click picks a row; arrow keys only move the selection.
+    // double click or enter acts on the row already picked.
+    let keyed = ui.keys().any(|(key, _)| {
+        matches!(
+            key,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        )
+    });
+    let acted = (selected != before && !keyed) || response.activated;
+    Ok(selected
+        .filter(|_| acted)
+        .and_then(|row| explorer.click(row)))
 }
 
 /// small arrow: right when closed, down when open.
