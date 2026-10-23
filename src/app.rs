@@ -8,8 +8,10 @@ use aurea::render::{CanvasId, DrawingContext, Rect};
 use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 
+use resolvase::{Encoding, SavePoint};
+
 use crate::document::{self, DocumentId, Documents, ViewId};
-use crate::editor;
+use crate::editor::{self, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
@@ -27,6 +29,13 @@ pub enum Id {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    Save,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
     ToggleExplorer,
     ToggleTerminal,
     ResetLayout,
@@ -38,6 +47,7 @@ enum Done {
     Loaded(DocumentId, Result<String, String>),
     Session(Option<String>),
     Saved(Result<(), String>),
+    Wrote(DocumentId, String, SavePoint, Result<(), String>),
 }
 
 pub struct App {
@@ -52,6 +62,10 @@ pub struct App {
     /// session file for this workspace; none when there is no config dir.
     session: Option<PathBuf>,
     status: String,
+    /// the editor view with the keyboard, from the last frame.
+    focus: Option<ViewId>,
+    /// caret box of that view, for the ime window.
+    pub ime: Option<Rect>,
     /// the layout changed since it was last written.
     layout_dirty: bool,
     /// the saved session came back, or there was none.
@@ -77,6 +91,8 @@ impl App {
             jobs: Jobs::default(),
             session: workbench::session_path(root),
             status: String::new(),
+            focus: None,
+            ime: None,
             layout_dirty: false,
             restored: false,
             closing: false,
@@ -123,11 +139,64 @@ impl App {
             self.run(command);
             return true;
         }
+        // aurea keeps typed text to its own fields, so the focused editor
+        // takes its keys here, before the ui sees them
+        if let Some(view) = self.focus
+            && !self.ui.text_focused()
+            && let Some(v) = self.docs.view(view)
+            && let Some(action) = input::action(event, v.page, !v.sel.is_empty())
+        {
+            editor::act(&mut self.docs, view, action);
+            return true;
+        }
         self.ui.handle(event)
     }
 
     pub fn run(&mut self, command: Command) {
+        let focus = self.focus;
         match command {
+            Command::Save => {
+                if let Some(view) = focus {
+                    self.save(view);
+                }
+                return;
+            }
+            Command::Undo | Command::Redo => {
+                if let Some(view) = focus {
+                    if command == Command::Undo {
+                        self.docs.undo(view);
+                    } else {
+                        self.docs.redo(view);
+                    }
+                }
+                return;
+            }
+            Command::Copy | Command::Cut => {
+                let Some(view) = focus else { return };
+                let Some(text) = editor::selected(&self.docs, view) else {
+                    return;
+                };
+                if let Err(e) = aurea::clipboard::set_clipboard_text(&text) {
+                    self.status = e.to_string();
+                } else if command == Command::Cut {
+                    editor::act(&mut self.docs, view, input::Action::Delete);
+                }
+                return;
+            }
+            Command::Paste => {
+                if let Some(view) = focus
+                    && let Some(text) = aurea::clipboard::clipboard_text()
+                {
+                    editor::paste(&mut self.docs, view, &text);
+                }
+                return;
+            }
+            Command::SelectAll => {
+                if let Some(view) = focus {
+                    editor::select_all(&mut self.docs, view);
+                }
+                return;
+            }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ResetLayout => {
@@ -185,6 +254,22 @@ impl App {
             .run(move || Done::Saved(workbench::write_session(&path, &text)))
     }
 
+    fn save(&mut self, view: ViewId) {
+        let Some((doc, path, text, point)) = self.docs.save_job(view) else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let job = move || Done::Wrote(doc, name, point, document::write_atomic(&path, &text));
+        if !self.jobs.run(job) {
+            self.status = format!(
+                "{}: the file worker is not running",
+                self.texts.tr("can't save")
+            );
+        }
+    }
+
     fn scan_pending(&mut self) {
         for path in self.explorer.take_pending() {
             self.scan(path);
@@ -237,6 +322,15 @@ impl App {
                 }
                 Done::Loaded(doc, result) => self.docs.loaded(doc, result),
                 Done::Session(text) => self.restore(text),
+                Done::Wrote(doc, name, point, result) => match result {
+                    Ok(()) => {
+                        self.docs.saved(doc, point);
+                        self.status = format!("{} {name}", self.texts.tr("saved"));
+                    }
+                    Err(why) => {
+                        self.status = format!("{} {name}: {why}", self.texts.tr("can't save"));
+                    }
+                },
                 Done::Saved(result) => {
                     if let Err(why) = result {
                         self.status = format!("{}: {why}", self.texts.tr("can't save the layout"));
@@ -313,7 +407,10 @@ impl App {
         let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
         let titles = self.titles();
         let mut clicks: Vec<Click> = Vec::new();
+        let mut focus = None;
+        let mut ime = None;
         let changed;
+        let place = self.place();
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
@@ -331,7 +428,11 @@ impl App {
                     };
                     let mut state = docs.view(view).cloned().expect("view exists");
                     if let Some(doc) = docs.doc(doc_id) {
-                        editor::show(ui, view, doc, &mut state, rect, texts)?;
+                        let shown = editor::show(ui, view, doc, &mut state, rect, texts)?;
+                        if shown.focused {
+                            focus = Some(view);
+                            ime = shown.caret;
+                        }
                     }
                     if let Some(v) = docs.view_mut(view) {
                         *v = state;
@@ -348,8 +449,10 @@ impl App {
                 .close_buttons(true)
                 .show(&mut ui, Id::Dock, main)?;
             changed = response.changed;
-            status_bar(&mut ui, status, &self.status)?;
+            status_bar(&mut ui, status, &self.status, &place)?;
         }
+        self.focus = focus;
+        self.ime = ime;
         if changed {
             self.layout_dirty = true;
         }
@@ -378,30 +481,54 @@ impl App {
     }
 }
 
+impl App {
+    /// "Ln 3, Col 7" for the focused editor.
+    fn place(&self) -> String {
+        let Some(view) = self.focus.and_then(|v| self.docs.view(v)) else {
+            return String::new();
+        };
+        let Some(doc) = self.docs.doc(view.doc) else {
+            return String::new();
+        };
+        doc.buffer
+            .text()
+            .point(view.sel.head, Encoding::Utf32)
+            .map_or_else(
+                |_| String::new(),
+                |p| format!("Ln {}, Col {}", p.line + 1, p.column + 1),
+            )
+    }
+}
+
 fn hint(ui: &mut Ui<'_, Id>, rect: Rect, text: &str) -> AureaResult<()> {
     let font = ui.theme.font(13.0);
     let color = ui.theme.palette.dim;
     ui.text(text, rect, &font, color, Align::Center)
 }
 
-fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str) -> AureaResult<()> {
+fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> AureaResult<()> {
     let palette = ui.theme.palette;
     ui.fill(rect, palette.surface)?;
     ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
     let font = ui.theme.font(12.0);
-    ui.text_clipped(
-        message,
-        rect.inset_xy(10.0, 0.0),
-        &font,
-        palette.dim,
-        Align::Start,
-    )?;
+    let inner = rect.inset_xy(10.0, 0.0);
+    let (right, left) = inner.split_right(140.0, 8.0);
+    ui.text_clipped(message, left, &font, palette.dim, Align::Start)?;
+    ui.text(place, right, &font, palette.dim, Align::End)?;
     Ok(())
 }
 
 fn keymap() -> Keymap<Command> {
     let mut map = Keymap::new();
-    map.bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
+    map.bind(Chord::command(KeyCode::S), Command::Save)
+        .bind(Chord::command(KeyCode::Z), Command::Undo)
+        .bind(Chord::command(KeyCode::Z).shift(), Command::Redo)
+        .bind(Chord::command(KeyCode::Y), Command::Redo)
+        .bind(Chord::command(KeyCode::X), Command::Cut)
+        .bind(Chord::command(KeyCode::C), Command::Copy)
+        .bind(Chord::command(KeyCode::V), Command::Paste)
+        .bind(Chord::command(KeyCode::A), Command::SelectAll)
+        .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
     map
 }

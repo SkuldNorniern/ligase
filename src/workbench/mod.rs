@@ -360,8 +360,7 @@ mod tests {
 
         let view = open_file(&mut docs, "a.rs");
         let pane = bench.show_editor(view);
-        let doc = docs.view(view).unwrap().doc;
-        docs.doc_mut(doc).unwrap().buffer.insert(0, "x").unwrap();
+        assert!(docs.edit(view, vec![(0..0, "x".into())], false));
         assert_eq!(bench.close(pane, &mut docs), Err(Refused::Unsaved));
         assert!(bench.dock.tree.contains(pane));
         assert!(docs.view(view).is_some());

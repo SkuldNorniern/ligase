@@ -2,9 +2,12 @@
 //! per document; views hold scroll and cursor, never their own text copy.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use resolvase::TextBuffer;
+use resolvase::{Bias, ChangeSet, SavePoint, TextBuffer, TextSnapshot};
+
+use crate::editor::cursor::Selection;
 
 /// files bigger than this are refused for now.
 pub const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -26,6 +29,8 @@ pub struct Document {
     pub path: PathBuf,
     pub buffer: TextBuffer,
     pub load: Load,
+    /// the file used `\r\n`; new lines follow it.
+    pub crlf: bool,
 }
 
 impl Document {
@@ -39,6 +44,10 @@ impl Document {
     pub fn is_dirty(&self) -> bool {
         !self.buffer.is_saved()
     }
+
+    pub fn line_break(&self) -> &'static str {
+        if self.crlf { "\r\n" } else { "\n" }
+    }
 }
 
 /// one presentation of a document.
@@ -47,6 +56,15 @@ pub struct View {
     pub doc: DocumentId,
     /// scroll from the top, in px.
     pub scroll: f32,
+    pub sel: Selection,
+    /// column up and down aim for.
+    pub goal: Option<usize>,
+    /// ime text not committed yet, and the caret inside it.
+    pub preedit: Option<(String, Option<usize>)>,
+    /// scroll the caret into sight next frame.
+    pub reveal: bool,
+    /// lines that fit, from the last frame; for page up and down.
+    pub page: usize,
 }
 
 #[derive(Default)]
@@ -75,6 +93,7 @@ impl Documents {
                 path: path.to_path_buf(),
                 buffer: TextBuffer::new(),
                 load: Load::Loading,
+                crlf: false,
             },
         );
         (id, true)
@@ -82,7 +101,18 @@ impl Documents {
 
     pub fn add_view(&mut self, doc: DocumentId) -> ViewId {
         let id = ViewId(self.take_id());
-        self.views.insert(id, View { doc, scroll: 0.0 });
+        self.views.insert(
+            id,
+            View {
+                doc,
+                scroll: 0.0,
+                sel: Selection::default(),
+                goal: None,
+                preedit: None,
+                reveal: false,
+                page: 20,
+            },
+        );
         id
     }
 
@@ -90,9 +120,89 @@ impl Documents {
         self.docs.get(&id)
     }
 
-    #[cfg(test)]
-    pub fn doc_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
-        self.docs.get_mut(&id)
+    /// a loaded document and one of its views, for edits. none while the
+    /// file is loading or failed, so nothing can save over it.
+    pub fn editable(&mut self, view: ViewId) -> Option<(&mut Document, &mut View)> {
+        let v = self.views.get_mut(&view)?;
+        let doc = self.docs.get_mut(&v.doc)?;
+        (doc.load == Load::Ready).then_some((doc, v))
+    }
+
+    /// applies edits as one undo step and moves every view's selection
+    /// along. the acting view's caret lands after the new text.
+    pub fn edit(&mut self, view: ViewId, edits: Vec<(Range<usize>, String)>, join: bool) -> bool {
+        let Some((doc, _)) = self.editable(view) else {
+            return false;
+        };
+        let mut tx = doc.buffer.transaction().join(join);
+        for (range, text) in edits {
+            tx = tx.replace(range, text);
+        }
+        match tx.commit() {
+            Ok(set) => {
+                self.follow(view, &set);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn undo(&mut self, view: ViewId) -> bool {
+        let Some((doc, _)) = self.editable(view) else {
+            return false;
+        };
+        let Some(set) = doc.buffer.undo() else {
+            return false;
+        };
+        self.follow(view, &set);
+        true
+    }
+
+    pub fn redo(&mut self, view: ViewId) -> bool {
+        let Some((doc, _)) = self.editable(view) else {
+            return false;
+        };
+        let Some(set) = doc.buffer.redo() else {
+            return false;
+        };
+        self.follow(view, &set);
+        true
+    }
+
+    fn follow(&mut self, actor: ViewId, set: &ChangeSet) {
+        let Some(doc) = self.views.get(&actor).map(|v| v.doc) else {
+            return;
+        };
+        for (&id, v) in self.views.iter_mut().filter(|(_, v)| v.doc == doc) {
+            // others stay put when text lands right at their caret
+            let bias = if id == actor { Bias::Right } else { Bias::Left };
+            v.sel.anchor = set.map(v.sel.anchor, bias);
+            v.sel.head = set.map(v.sel.head, bias);
+            if id == actor {
+                v.sel.anchor = v.sel.head;
+                v.goal = None;
+                v.reveal = true;
+            }
+        }
+    }
+
+    /// what a save of `view`'s document writes: path, text, and the state to
+    /// mark saved once the write is done. none unless loaded.
+    pub fn save_job(
+        &mut self,
+        view: ViewId,
+    ) -> Option<(DocumentId, PathBuf, TextSnapshot, SavePoint)> {
+        let id = self.views.get(&view)?.doc;
+        let (doc, _) = self.editable(view)?;
+        let point = doc.buffer.save_point();
+        Some((id, doc.path.clone(), doc.buffer.snapshot(), point))
+    }
+
+    /// a save is done. ignored when the document was closed meanwhile.
+    pub fn saved(&mut self, id: DocumentId, point: SavePoint) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.buffer.mark_saved_at(point);
+        }
     }
 
     pub fn view(&self, id: ViewId) -> Option<&View> {
@@ -141,6 +251,7 @@ impl Documents {
         };
         match result {
             Ok(text) => {
+                doc.crlf = text.contains("\r\n");
                 doc.buffer = TextBuffer::from_text(&text);
                 doc.load = Load::Ready;
             }
@@ -168,6 +279,40 @@ pub fn read_text(path: &Path) -> Result<String, String> {
         return Err(format!("file is over {} MiB", MAX_FILE / 1024 / 1024));
     }
     String::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_owned())
+}
+
+/// writes `text` over `path` without ever leaving half a file: a temp file
+/// next to it, flushed to disk, then renamed over. the old file keeps its
+/// place until the new one is whole. runs on the worker.
+pub fn write_atomic(path: &Path, text: &TextSnapshot) -> Result<(), String> {
+    use std::io::Write;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| "no file name".to_owned())?
+        .to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.ligase-save"));
+    let result = (|| {
+        let file = std::fs::File::create(&temp)?;
+        let mut out = std::io::BufWriter::new(file);
+        for chunk in text.chunks(0..text.len()).into_iter().flatten() {
+            out.write_all(chunk.as_bytes())?;
+        }
+        let file = out
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        // keep the old file's permissions, like read-only bits
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -199,12 +344,7 @@ mod tests {
         let v1 = docs.add_view(a);
         let v2 = docs.add_view(a);
         docs.loaded(a, Ok("x".into()));
-        docs.docs
-            .get_mut(&a)
-            .unwrap()
-            .buffer
-            .insert(1, "y")
-            .unwrap();
+        assert!(docs.edit(v1, vec![(1..1, "y".into())], false));
         assert!(!docs.close_loses_work(v1));
         docs.close_view(v1);
         assert!(docs.close_loses_work(v2));
@@ -218,6 +358,65 @@ mod tests {
         docs.close_view(v);
         docs.loaded(a, Ok("x".into()));
         assert!(docs.doc(a).is_none());
+    }
+
+    #[test]
+    fn edits_move_every_view() {
+        let mut docs = Documents::default();
+        let (a, _) = docs.open(Path::new("a.rs"));
+        let v1 = docs.add_view(a);
+        let v2 = docs.add_view(a);
+        assert!(
+            !docs.edit(v1, vec![(0..0, "x".into())], false),
+            "not loaded yet"
+        );
+        docs.loaded(a, Ok("hello".into()));
+        docs.view_mut(v2).unwrap().sel = Selection::caret(5);
+        docs.view_mut(v1).unwrap().sel = Selection::caret(5);
+        assert!(docs.edit(v1, vec![(5..5, "!".into())], true));
+        assert_eq!(docs.view(v1).unwrap().sel, Selection::caret(6));
+        assert_eq!(
+            docs.view(v2).unwrap().sel,
+            Selection::caret(5),
+            "other view stays"
+        );
+        assert!(docs.edit(v2, vec![(0..0, ">".into())], false));
+        assert_eq!(docs.view(v1).unwrap().sel, Selection::caret(7));
+        assert!(docs.undo(v1));
+        assert_eq!(docs.doc(a).unwrap().buffer.text().to_string(), "hello!");
+    }
+
+    #[test]
+    fn save_writes_whole_file_and_marks_saved() {
+        let dir = std::env::temp_dir().join(format!("ligase-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "old\r\n").unwrap();
+        let mut docs = Documents::default();
+        let (a, _) = docs.open(&path);
+        let v = docs.add_view(a);
+        docs.loaded(a, read_text(&path));
+        assert!(docs.doc(a).unwrap().crlf);
+        docs.edit(v, vec![(0..3, "new".into())], false);
+        let (id, at, text, point) = docs.save_job(v).unwrap();
+        docs.edit(v, vec![(0..0, "more ".into())], false);
+        write_atomic(&at, &text).unwrap();
+        docs.saved(id, point);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\r\n");
+        assert!(docs.doc(a).unwrap().is_dirty(), "edit after the snapshot");
+        docs.undo(v);
+        assert!(!docs.doc(a).unwrap().is_dirty());
+        assert!(!dir.join(".a.txt.ligase-save").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_load_is_never_saved() {
+        let mut docs = Documents::default();
+        let (a, _) = docs.open(Path::new("a.rs"));
+        let v = docs.add_view(a);
+        docs.loaded(a, Err("nope".into()));
+        assert!(docs.save_job(v).is_none());
     }
 
     #[test]
