@@ -116,34 +116,36 @@ impl Finder {
     }
 }
 
-/// smart case: a query with no capitals matches any case.
+/// smart case: a query with no capitals matches any case. gives the match
+/// as (byte start, byte length) in `line`, always on char edges.
 fn matcher(query: &str) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
     let fold = !query.chars().any(char::is_uppercase);
-    let lower = query.to_lowercase();
+    let lower: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let ascii = query.to_ascii_lowercase();
     move |line: &str| {
-        if fold {
-            // find in the lowered line, then map back to bytes of the real one
-            let lowered = line.to_lowercase();
-            let at = lowered.find(&lower)?;
-            if lowered.len() == line.len() {
-                return Some((at, query.len()));
-            }
-            // case folding changed lengths; fall back to a char walk
-            let mut chars = line.char_indices();
-            loop {
-                let (start, _) = chars.next()?;
-                if line[start..].to_lowercase().starts_with(&lower) {
-                    let end = line[start..]
-                        .char_indices()
-                        .map(|(i, c)| start + i + c.len_utf8())
-                        .find(|&end| line[start..end].to_lowercase() == lower)
-                        .unwrap_or(line.len());
-                    return Some((start, end - start));
+        if !fold {
+            return line.find(query).map(|at| (at, query.len()));
+        }
+        if line.is_ascii() && query.is_ascii() {
+            // ascii folding keeps lengths, so offsets carry over
+            let at = line.to_ascii_lowercase().find(&ascii)?;
+            return Some((at, query.len()));
+        }
+        // fold char by char, no copies; a char may fold to more than one
+        'start: for (start, _) in line.char_indices() {
+            let mut want = lower.iter();
+            for (i, c) in line[start..].char_indices() {
+                for folded in c.to_lowercase() {
+                    if want.next() != Some(&folded) {
+                        continue 'start;
+                    }
+                }
+                if want.as_slice().is_empty() {
+                    return Some((start, i + c.len_utf8()));
                 }
             }
-        } else {
-            line.find(query).map(|at| (at, query.len()))
         }
+        None
     }
 }
 
@@ -170,6 +172,9 @@ fn walk(
         entries.sort_by_key(std::fs::DirEntry::file_name);
         let mut dirs = Vec::new();
         for entry in entries {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
@@ -245,6 +250,13 @@ mod tests {
         let line = "İx i";
         let (at, len) = find(line).unwrap();
         assert!(line.is_char_boundary(at) && line.is_char_boundary(at + len));
+        assert_eq!(
+            &line[at..at + len],
+            "i",
+            "İ folds to two chars, not a match"
+        );
+        assert_eq!(matcher("가나")("x 가나다"), Some((2, 6)));
+        assert_eq!(matcher("abc")("xAbC"), Some((1, 3)));
     }
 
     #[test]

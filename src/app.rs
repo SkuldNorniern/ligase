@@ -181,8 +181,10 @@ impl App {
     fn shell_event(&mut self, event: &WindowEvent) -> bool {
         match self.keymap.resolve(event, false) {
             Some(
-                command
-                @ (Command::ToggleTerminal | Command::ToggleExplorer | Command::ResetLayout),
+                command @ (Command::ToggleTerminal
+                | Command::ToggleExplorer
+                | Command::FindInFiles
+                | Command::ResetLayout),
             ) => {
                 let command = *command;
                 self.run(command);

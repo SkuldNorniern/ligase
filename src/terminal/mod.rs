@@ -4,7 +4,7 @@
 use aurea::render::{Color, Font, Rect};
 use aurea::ui::{Align, ScrollArea, Sense, Ui};
 use aurea::{AureaResult, KeyCode, Modifiers, WindowEvent};
-use ozone_term::{Cell, Color as TermColor, Terminal};
+use ozone_term::{Color as TermColor, Terminal};
 
 use crate::app::Id;
 use crate::lang::Texts;
@@ -42,6 +42,9 @@ const ANSI: [Color; 16] = [
     Color::rgb(0xe6, 0xea, 0xf0),
 ];
 
+/// escape, the start of every key sequence below.
+const ESC: &str = "\x1b";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub enum State {
     #[default]
@@ -56,9 +59,6 @@ pub enum State {
 pub struct Shell {
     term: Option<Terminal>,
     pub state: State,
-    seen: u64,
-    cells: Vec<Vec<Cell>>,
-    cursor: (usize, usize),
     size: (u16, u16),
     scroll: f32,
     /// stay at the bottom as output comes in, until the user scrolls up.
@@ -72,7 +72,6 @@ impl Shell {
             Ok(term) => {
                 self.term = Some(term);
                 self.state = State::Running;
-                self.seen = u64::MAX;
                 self.size = (0, 0);
                 self.follow = true;
             }
@@ -88,15 +87,8 @@ impl Shell {
     }
 
     fn refresh(&mut self) {
-        let Some(term) = &self.term else { return };
-        if !term.is_running() {
+        if self.term.as_ref().is_some_and(|t| !t.is_running()) {
             self.state = State::Ended;
-        }
-        let version = term.version();
-        if version != self.seen {
-            self.seen = version;
-            self.cells = term.cell_snapshot();
-            self.cursor = term.cursor();
         }
     }
 }
@@ -113,70 +105,96 @@ pub fn bytes(event: &WindowEvent) -> Option<String> {
             key,
             pressed: true,
             modifiers,
-        } => key_bytes(*key, *modifiers)
-            .map(str::to_owned)
-            .or_else(|| control(*key, *modifiers).map(|b| char::from(b).to_string())),
+        } => key_bytes(*key, *modifiers),
         _ => None,
     }
 }
 
-fn key_bytes(key: KeyCode, m: Modifiers) -> Option<&'static str> {
-    if m.ctrl || m.alt || m.meta {
-        return None;
-    }
-    Some(match key {
-        KeyCode::Enter => "\r",
-        KeyCode::Backspace => "\x7f",
-        KeyCode::Tab => "\t",
-        KeyCode::Escape => "\x1b",
-        KeyCode::Up => "\x1b[A",
-        KeyCode::Down => "\x1b[B",
-        KeyCode::Right => "\x1b[C",
-        KeyCode::Left => "\x1b[D",
-        KeyCode::Home => "\x1b[H",
-        KeyCode::End => "\x1b[F",
-        KeyCode::Delete => "\x1b[3~",
-        KeyCode::PageUp => "\x1b[5~",
-        KeyCode::PageDown => "\x1b[6~",
-        _ => return None,
-    })
-}
+const LETTERS: [KeyCode; 26] = [
+    KeyCode::A,
+    KeyCode::B,
+    KeyCode::C,
+    KeyCode::D,
+    KeyCode::E,
+    KeyCode::F,
+    KeyCode::G,
+    KeyCode::H,
+    KeyCode::I,
+    KeyCode::J,
+    KeyCode::K,
+    KeyCode::L,
+    KeyCode::M,
+    KeyCode::N,
+    KeyCode::O,
+    KeyCode::P,
+    KeyCode::Q,
+    KeyCode::R,
+    KeyCode::S,
+    KeyCode::T,
+    KeyCode::U,
+    KeyCode::V,
+    KeyCode::W,
+    KeyCode::X,
+    KeyCode::Y,
+    KeyCode::Z,
+];
 
-/// ctrl+letter as its control byte, like ctrl+c = 3.
-fn control(key: KeyCode, m: Modifiers) -> Option<u8> {
-    if !m.ctrl || m.alt || m.meta {
+/// a key as xterm sends it. alt puts ESC in front, ctrl+letter is its
+/// control byte, arrows carry shift/alt/ctrl as `ESC [ 1 ; n X`.
+fn key_bytes(key: KeyCode, m: Modifiers) -> Option<String> {
+    if m.meta {
         return None;
     }
-    const LETTERS: [KeyCode; 26] = [
-        KeyCode::A,
-        KeyCode::B,
-        KeyCode::C,
-        KeyCode::D,
-        KeyCode::E,
-        KeyCode::F,
-        KeyCode::G,
-        KeyCode::H,
-        KeyCode::I,
-        KeyCode::J,
-        KeyCode::K,
-        KeyCode::L,
-        KeyCode::M,
-        KeyCode::N,
-        KeyCode::O,
-        KeyCode::P,
-        KeyCode::Q,
-        KeyCode::R,
-        KeyCode::S,
-        KeyCode::T,
-        KeyCode::U,
-        KeyCode::V,
-        KeyCode::W,
-        KeyCode::X,
-        KeyCode::Y,
-        KeyCode::Z,
-    ];
-    let index = LETTERS.iter().position(|k| *k == key)?;
-    u8::try_from(index + 1).ok()
+    let arrow = match key {
+        KeyCode::Up => Some('A'),
+        KeyCode::Down => Some('B'),
+        KeyCode::Right => Some('C'),
+        KeyCode::Left => Some('D'),
+        KeyCode::Home => Some('H'),
+        KeyCode::End => Some('F'),
+        _ => None,
+    };
+    if let Some(end) = arrow {
+        let code = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
+        return Some(if code == 1 {
+            format!("{ESC}[{end}")
+        } else {
+            format!("{ESC}[1;{code}{end}")
+        });
+    }
+    if key == KeyCode::Tab && m.shift && !m.ctrl && !m.alt {
+        return Some(format!("{ESC}[Z"));
+    }
+    let plain = match key {
+        KeyCode::Enter => Some("\r".to_owned()),
+        KeyCode::Backspace => Some("\x7f".to_owned()),
+        KeyCode::Tab => Some("\t".to_owned()),
+        KeyCode::Escape => Some(ESC.to_owned()),
+        KeyCode::Delete => Some(format!("{ESC}[3~")),
+        KeyCode::PageUp => Some(format!("{ESC}[5~")),
+        KeyCode::PageDown => Some(format!("{ESC}[6~")),
+        _ => None,
+    };
+    if let Some(plain) = plain {
+        if m.ctrl {
+            return None;
+        }
+        return Some(if m.alt {
+            format!("{ESC}{plain}")
+        } else {
+            plain
+        });
+    }
+    let letter = u8::try_from(LETTERS.iter().position(|k| *k == key)?).ok()?;
+    match (m.ctrl, m.alt) {
+        (true, false) => Some(char::from(letter + 1).to_string()),
+        (true, true) => Some(format!("{ESC}{}", char::from(letter + 1))),
+        (false, true) => {
+            let c = if m.shift { b'A' } else { b'a' } + letter;
+            Some(format!("{ESC}{}", char::from(c)))
+        }
+        (false, false) => None,
+    }
 }
 
 fn resolve(color: TermColor, default: Color) -> Color {
@@ -231,17 +249,20 @@ pub fn show(
         }
     }
     let ended = shell.state == State::Ended;
-    let lines = shell.cells.len() + usize::from(ended);
+    let Some(term) = &shell.term else {
+        return Ok(false);
+    };
+    // only the lines in sight are copied out, never the whole scrollback
+    let total = term.cell_window(0, 0).lines;
+    let lines = total + usize::from(ended);
     let height = lines as f32 * LINE + 2.0 * PAD;
     if shell.follow {
         shell.scroll = (height - rect.height).max(0.0);
     }
-    let Shell {
-        cells,
-        cursor,
-        scroll,
-        ..
-    } = shell;
+    let Shell { term, scroll, .. } = shell;
+    let Some(term) = term.as_ref() else {
+        return Ok(false);
+    };
     let mut focused = false;
     ScrollArea::new(scroll, height).show(ui, Id::Terminal, rect, |ui, content, seen| {
         let hit = Rect::new(seen.x, seen.y, (seen.width - BAR).max(0.0), seen.height);
@@ -251,8 +272,9 @@ pub fn show(
         let first = ((seen.y - content.y - PAD) / LINE).floor().max(0.0) as usize;
         let count = (seen.height / LINE).ceil() as usize + 1;
         let x0 = content.x + PAD;
-        for (row, line) in cells.iter().enumerate().skip(first).take(count) {
-            let y = content.y + PAD + row as f32 * LINE;
+        let window = term.cell_window(first, count);
+        for (i, line) in window.rows.iter().enumerate() {
+            let y = content.y + PAD + (first + i) as f32 * LINE;
             let mut col = 0;
             while col < line.len() {
                 // one run of cells with the same look
@@ -280,7 +302,7 @@ pub fn show(
             }
         }
         if ended {
-            let y = content.y + PAD + cells.len() as f32 * LINE;
+            let y = content.y + PAD + window.lines as f32 * LINE;
             let row = Rect::new(x0, y, content.width, LINE);
             let small = ui.theme.font(12.0);
             ui.text(
@@ -291,7 +313,7 @@ pub fn show(
                 Align::Start,
             )?;
         } else if focused {
-            let (line, col) = *cursor;
+            let (line, col) = window.cursor;
             let at = Rect::new(
                 x0 + col as f32 * cell,
                 content.y + PAD + line as f32 * LINE,
@@ -323,10 +345,20 @@ mod tests {
     fn keys_turn_into_xterm_bytes() {
         let none = Modifiers::default();
         let ctrl = Modifiers { ctrl: true, ..none };
-        assert_eq!(bytes(&key(KeyCode::Enter, none)).as_deref(), Some("\r"));
-        assert_eq!(bytes(&key(KeyCode::Up, none)).as_deref(), Some("\x1b[A"));
-        assert_eq!(bytes(&key(KeyCode::C, ctrl)).as_deref(), Some("\x03"));
-        assert_eq!(bytes(&key(KeyCode::A, none)), None, "letters come as text");
+        let alt = Modifiers { alt: true, ..none };
+        let shift = Modifiers {
+            shift: true,
+            ..none
+        };
+        let sent = |k, m| bytes(&key(k, m));
+        assert_eq!(sent(KeyCode::Enter, none).as_deref(), Some("\r"));
+        assert_eq!(sent(KeyCode::Up, none).as_deref(), Some("\x1b[A"));
+        assert_eq!(sent(KeyCode::C, ctrl).as_deref(), Some("\x03"));
+        assert_eq!(sent(KeyCode::A, none), None, "letters come as text");
+        assert_eq!(sent(KeyCode::B, alt).as_deref(), Some("\x1bb"));
+        assert_eq!(sent(KeyCode::Backspace, alt).as_deref(), Some("\x1b\x7f"));
+        assert_eq!(sent(KeyCode::Left, ctrl).as_deref(), Some("\x1b[1;5D"));
+        assert_eq!(sent(KeyCode::Tab, shift).as_deref(), Some("\x1b[Z"));
         let typed = WindowEvent::TextInput {
             text: "ls\u{3}".into(),
         };
