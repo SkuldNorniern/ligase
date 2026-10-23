@@ -15,6 +15,7 @@ use crate::editor::{self, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
+use crate::search::{self, Finder};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
@@ -28,6 +29,8 @@ pub enum Id {
     Explorer,
     Editor(ViewId),
     Terminal,
+    SearchField,
+    SearchList,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +42,7 @@ pub enum Command {
     Copy,
     Paste,
     SelectAll,
+    FindInFiles,
     ToggleExplorer,
     ToggleTerminal,
     ResetLayout,
@@ -65,6 +69,7 @@ pub struct App {
     jobs: Jobs<Done>,
     syntax: Syntax,
     shell: Shell,
+    finder: Finder,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -100,6 +105,7 @@ impl App {
             jobs: Jobs::default(),
             syntax: Syntax::default(),
             shell: Shell::default(),
+            finder: Finder::default(),
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -270,6 +276,10 @@ impl App {
                 }
                 return;
             }
+            Command::FindInFiles => {
+                self.bench.show(Panel::Search);
+                self.ui.focus(Id::SearchField, 0);
+            }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ResetLayout => {
@@ -359,7 +369,7 @@ impl App {
         }
     }
 
-    fn open_file(&mut self, path: &Path) {
+    fn open_file(&mut self, path: &Path) -> ViewId {
         let (doc, new) = self.docs.open(path);
         if new {
             self.load(doc, path);
@@ -372,6 +382,7 @@ impl App {
         let view = existing.unwrap_or_else(|| self.docs.add_view(doc));
         self.bench.show_editor(view);
         self.layout_dirty = true;
+        view
     }
 
     fn load(&mut self, doc: DocumentId, path: &Path) {
@@ -386,6 +397,7 @@ impl App {
     }
 
     fn poll(&mut self) {
+        self.finder.poll();
         while let Some(parsed) = self.syntax.take() {
             self.docs.coloured(parsed);
         }
@@ -463,6 +475,7 @@ impl App {
             .map(|(id, panel)| {
                 let title = match panel {
                     Panel::Explorer => self.texts.tr("Explorer").to_owned(),
+                    Panel::Search => self.texts.tr("Search").to_owned(),
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
                     Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
@@ -493,12 +506,15 @@ impl App {
         let mut ime = None;
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
+        let mut found = None;
         let changed;
         let place = self.place();
+        let root = self.explorer.root().to_path_buf();
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
             let shell = &mut self.shell;
+            let finder = &mut self.finder;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
@@ -527,6 +543,10 @@ impl App {
                     }
                     Ok(())
                 }
+                Some(Panel::Search) => {
+                    found = search::view::show(ui, finder, &root, rect, texts)?;
+                    Ok(())
+                }
                 Some(Panel::Terminal) => {
                     shell_focus = terminal::show(ui, shell, rect, texts)?;
                     Ok(())
@@ -545,6 +565,19 @@ impl App {
         self.focus = focus;
         self.ime = ime;
         self.shell_focus = shell_focus;
+        match found {
+            Some(search::view::Ask::Search) => {
+                let root = self.explorer.root().to_path_buf();
+                self.finder.start(&root, self.canvas);
+            }
+            Some(search::view::Ask::Open(hit)) => {
+                let view = self.open_file(&hit.path);
+                if let Some(v) = self.docs.view_mut(view) {
+                    v.goto = Some((hit.line, hit.column));
+                }
+            }
+            None => {}
+        }
         // the shell starts the first time its panel is drawn, not before
         if self.shell.state == terminal::State::NotStarted && self.shows(Panel::Terminal) {
             self.start_shell();
@@ -570,7 +603,9 @@ impl App {
         }
         for click in clicks {
             match click {
-                Click::Open(path) => self.open_file(&path),
+                Click::Open(path) => {
+                    self.open_file(&path);
+                }
                 Click::Scan(path) => self.scan(path),
                 Click::Toggled => {}
             }
@@ -629,6 +664,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::C), Command::Copy)
         .bind(Chord::command(KeyCode::V), Command::Paste)
         .bind(Chord::command(KeyCode::A), Command::SelectAll)
+        .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
     map

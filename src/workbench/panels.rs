@@ -9,6 +9,7 @@ pub struct PaneId(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Panel {
     Explorer,
+    Search,
     Terminal,
     /// stands in the editor area when no file is open.
     Welcome,

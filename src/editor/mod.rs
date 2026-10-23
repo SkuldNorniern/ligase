@@ -285,6 +285,17 @@ pub fn show(
     let gutter = ui.text_width(&"0".repeat(digits), &font) + 16.0;
     let height = lines as f32 * LINE + LINE;
     view.page = ((rect.height / LINE) as usize).saturating_sub(1).max(1);
+    if let Some((line, column)) = view.goto.take() {
+        // past the end or mid char: land on the nearest place before it
+        let line = line.min(text.line_count() - 1);
+        let start = text.line_start(line).unwrap_or(0);
+        let mut at = (start + column).min(cursor::line_end(text, line));
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        view.sel = Selection::caret(at);
+        view.reveal = true;
+    }
     if std::mem::take(&mut view.reveal) {
         let y = text.line_of(view.sel.head).unwrap_or(0) as f32 * LINE;
         if y < view.scroll {

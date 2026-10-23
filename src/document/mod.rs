@@ -72,6 +72,8 @@ pub struct View {
     pub reveal: bool,
     /// lines that fit, from the last frame; for page up and down.
     pub page: usize,
+    /// line and byte column to put the caret on once the text is loaded.
+    pub goto: Option<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -121,6 +123,7 @@ impl Documents {
                 preedit: None,
                 reveal: false,
                 page: 20,
+                goto: None,
             },
         );
         id

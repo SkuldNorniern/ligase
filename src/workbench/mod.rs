@@ -35,6 +35,9 @@ impl Default for Workbench {
         let mut tree = DockTree::new(welcome);
         let explorer = panels.pane(Panel::Explorer);
         tree.insert_sized(explorer, welcome, DockSide::Left, 0.22);
+        let search = panels.pane(Panel::Search);
+        tree.insert(search, explorer, DockSide::Center);
+        tree.activate(explorer);
         let terminal = panels.pane(Panel::Terminal);
         tree.insert_sized(terminal, welcome, DockSide::Bottom, 0.28);
         tree.activate(welcome);
@@ -93,7 +96,7 @@ impl Workbench {
                 self.tree().remove(pane);
             }
             Some(Panel::Welcome) => return Err(Refused::KeepsEditorArea),
-            Some(Panel::Explorer | Panel::Terminal) => {
+            Some(Panel::Explorer | Panel::Search | Panel::Terminal) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
             }
@@ -124,14 +127,38 @@ impl Workbench {
             self.tree().remove(pane);
             return;
         }
-        let Some(area) = self.editor_area() else {
-            return;
-        };
-        let (side, share) = match panel {
-            Panel::Terminal => (DockSide::Bottom, 0.28),
-            _ => (DockSide::Left, 0.22),
-        };
-        self.tree().insert_sized(pane, area, side, share);
+        self.show(panel);
+    }
+
+    /// puts a tool panel in front, at its home spot if it was hidden:
+    /// terminal under the editors, explorer and search side by side as tabs
+    /// on the left.
+    pub fn show(&mut self, panel: Panel) {
+        let pane = self.panels.pane(panel);
+        if !self.dock.tree.contains(pane) {
+            let sibling = match panel {
+                Panel::Explorer => Some(Panel::Search),
+                Panel::Search => Some(Panel::Explorer),
+                _ => None,
+            }
+            .and_then(|p| self.panels.find(p))
+            .filter(|id| self.dock.tree.contains(*id));
+            match sibling {
+                Some(beside) => {
+                    self.tree().insert(pane, beside, DockSide::Center);
+                }
+                None => {
+                    let Some(area) = self.editor_area() else {
+                        return;
+                    };
+                    let (side, share) = match panel {
+                        Panel::Terminal => (DockSide::Bottom, 0.28),
+                        _ => (DockSide::Left, 0.22),
+                    };
+                    self.tree().insert_sized(pane, area, side, share);
+                }
+            }
+        }
         self.tree().activate(pane);
     }
 
@@ -144,6 +171,7 @@ impl Workbench {
             .map(|(id, panel)| {
                 let name = match panel {
                     Panel::Explorer => "explorer".to_owned(),
+                    Panel::Search => "search".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
                     Panel::Editor(view) => {
@@ -218,6 +246,7 @@ impl Workbench {
             .map(|name| {
                 let panel = match name.as_str() {
                     "explorer" => Panel::Explorer,
+                    "search" => Panel::Search,
                     "terminal" => Panel::Terminal,
                     "welcome" => Panel::Welcome,
                     other => {
@@ -364,6 +393,24 @@ mod tests {
         assert_eq!(bench.close(pane, &mut docs), Err(Refused::Unsaved));
         assert!(bench.dock.tree.contains(pane));
         assert!(docs.view(view).is_some());
+    }
+
+    #[test]
+    fn search_sits_with_explorer() {
+        let mut bench = Workbench::default();
+        let explorer = bench.panels.find(Panel::Explorer).unwrap();
+        assert!(bench.dock.tree.is_active(explorer));
+        bench.show(Panel::Search);
+        let search = bench.panels.find(Panel::Search).unwrap();
+        assert!(bench.dock.tree.is_active(search));
+        assert!(
+            !bench.dock.tree.is_active(explorer),
+            "same group, one shows"
+        );
+        bench.toggle(Panel::Search);
+        assert!(!in_tree(&bench, Panel::Search));
+        bench.toggle(Panel::Search);
+        assert!(bench.dock.tree.is_active(search));
     }
 
     #[test]
