@@ -1,0 +1,386 @@
+//! app state, input routing and one frame. long work goes to the file
+//! worker; results come back through `Done`.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use aurea::render::{CanvasId, DrawingContext, Rect};
+use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
+use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
+
+use crate::document::{self, DocumentId, Documents, ViewId};
+use crate::editor;
+use crate::explorer::{self, Click, Explorer};
+use crate::jobs::Jobs;
+use crate::lang::{Lang, Texts};
+use crate::workbench::panels::{PaneId, Panel};
+use crate::workbench::{self, Refused, Workbench};
+
+const STATUS_HEIGHT: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Id {
+    Dock,
+    Explorer,
+    Editor(ViewId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    ToggleExplorer,
+    ToggleTerminal,
+    ResetLayout,
+}
+
+/// what the worker hands back.
+enum Done {
+    Listed(PathBuf, Result<Vec<(String, bool)>, String>),
+    Loaded(DocumentId, Result<String, String>),
+    Session(Option<String>),
+    Saved(Result<(), String>),
+}
+
+pub struct App {
+    pub ui: UiState<Id>,
+    theme: Theme,
+    pub texts: Texts,
+    pub keymap: Keymap<Command>,
+    bench: Workbench,
+    docs: Documents,
+    explorer: Explorer,
+    jobs: Jobs<Done>,
+    status: String,
+    /// the layout changed since it was last written.
+    layout_dirty: bool,
+    /// the saved session came back, or there was none.
+    restored: bool,
+    /// a save is out and the window closes once it is back.
+    closing: bool,
+    /// the window should close now; main does it.
+    pub close_now: bool,
+}
+
+impl App {
+    pub fn new(root: &Path, lang: Lang) -> Self {
+        let mut theme = Theme::dark();
+        lang.font_family().clone_into(&mut theme.font_family);
+        let mut app = Self {
+            ui: UiState::new(),
+            theme,
+            texts: Texts::new(lang),
+            keymap: keymap(),
+            bench: Workbench::default(),
+            docs: Documents::default(),
+            explorer: Explorer::new(root),
+            jobs: Jobs::default(),
+            status: String::new(),
+            layout_dirty: false,
+            restored: false,
+            closing: false,
+            close_now: false,
+        };
+        app.scan_pending();
+        match workbench::session_path() {
+            Some(path) => {
+                app.jobs
+                    .run(move || Done::Session(std::fs::read_to_string(path).ok()));
+            }
+            None => app.restored = true,
+        }
+        app
+    }
+
+    pub fn set_canvas(&mut self, id: CanvasId) {
+        self.jobs.set_canvas(id);
+    }
+
+    pub fn busy(&self) -> bool {
+        self.jobs.busy()
+    }
+
+    pub fn title(&self) -> String {
+        let root = self.explorer.root();
+        let name = root.file_name().map_or_else(
+            || root.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        format!("{name} - {}", self.texts.tr("Ligase"))
+    }
+
+    /// one window event. true when something needs a redraw.
+    pub fn event(&mut self, event: &WindowEvent) -> bool {
+        if matches!(event, WindowEvent::CloseRequested) {
+            self.request_close();
+            return true;
+        }
+        if self.ui.popup_open() {
+            return self.ui.handle(event);
+        }
+        if let Some(&command) = self.keymap.resolve(event, self.ui.text_focused()) {
+            self.run(command);
+            return true;
+        }
+        self.ui.handle(event)
+    }
+
+    pub fn run(&mut self, command: Command) {
+        match command {
+            Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
+            Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
+            Command::ResetLayout => {
+                // editors stay open, only their places reset
+                let views: Vec<ViewId> = self
+                    .bench
+                    .panels
+                    .iter()
+                    .filter_map(|(_, p)| match p {
+                        Panel::Editor(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect();
+                self.bench = Workbench::default();
+                for view in views {
+                    self.bench.show_editor(view);
+                }
+            }
+        }
+        self.layout_dirty = true;
+    }
+
+    /// is a panel in the dock now; for menu ticks.
+    pub fn shows(&self, panel: Panel) -> bool {
+        self.bench
+            .panels
+            .find(panel)
+            .is_some_and(|id| self.bench.dock.tree.contains(id))
+    }
+
+    fn request_close(&mut self) {
+        if self.closing {
+            return;
+        }
+        if self.save_layout() {
+            self.closing = true;
+        } else {
+            self.close_now = true;
+        }
+    }
+
+    /// queues a session write. false when there is nowhere to write.
+    fn save_layout(&mut self) -> bool {
+        let Some(path) = workbench::session_path() else {
+            return false;
+        };
+        let text = self.bench.save(&self.docs);
+        self.layout_dirty = false;
+        self.jobs
+            .run(move || Done::Saved(workbench::write_session(&path, &text)))
+    }
+
+    fn scan_pending(&mut self) {
+        for path in self.explorer.pending() {
+            let at = path.clone();
+            self.jobs
+                .run(move || Done::Listed(at.clone(), explorer::scan(&at)));
+        }
+    }
+
+    fn open_file(&mut self, path: &Path) {
+        let (doc, new) = self.docs.open(path);
+        if new {
+            self.load(doc, path);
+        }
+        // a tab on this document already: show it, don't make another
+        let existing = self.bench.panels.iter().find_map(|(_, p)| match p {
+            Panel::Editor(v) if self.docs.view(v).is_some_and(|v| v.doc == doc) => Some(v),
+            _ => None,
+        });
+        let view = existing.unwrap_or_else(|| self.docs.add_view(doc));
+        self.bench.show_editor(view);
+        self.layout_dirty = true;
+    }
+
+    fn load(&mut self, doc: DocumentId, path: &Path) {
+        let path = path.to_path_buf();
+        self.jobs
+            .run(move || Done::Loaded(doc, document::read_text(&path)));
+    }
+
+    fn poll(&mut self) {
+        while let Some(done) = self.jobs.take() {
+            match done {
+                Done::Listed(path, Ok(entries)) => self.explorer.listed(&path, entries),
+                Done::Listed(path, Err(why)) => {
+                    self.status = format!("{}: {why}", path.display());
+                    self.explorer.listed(&path, Vec::new());
+                }
+                Done::Loaded(doc, result) => self.docs.loaded(doc, result),
+                Done::Session(text) => self.restore(text),
+                Done::Saved(result) => {
+                    if let Err(why) = result {
+                        self.status = format!("{}: {why}", self.texts.tr("can't save the layout"));
+                    }
+                    if self.closing {
+                        self.close_now = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore(&mut self, text: Option<String>) {
+        if std::mem::replace(&mut self.restored, true) || self.layout_dirty {
+            // the user already moved things; theirs wins
+            return;
+        }
+        let Some(text) = text else { return };
+        let mut opened: Vec<(DocumentId, PathBuf, ViewId)> = Vec::new();
+        let docs = &mut self.docs;
+        let bench = Workbench::restore(&text, |path| {
+            let (doc, new) = docs.open(path);
+            let view = docs.add_view(doc);
+            if new {
+                opened.push((doc, path.to_path_buf(), view));
+            }
+            Some(view)
+        });
+        match bench {
+            Some(bench) => {
+                self.bench = bench;
+                for (doc, path, _) in opened {
+                    self.load(doc, &path);
+                }
+            }
+            None => {
+                for (_, _, view) in opened {
+                    self.docs.close_view(view);
+                }
+            }
+        }
+    }
+
+    fn titles(&self) -> HashMap<PaneId, String> {
+        self.bench
+            .panels
+            .iter()
+            .map(|(id, panel)| {
+                let title = match panel {
+                    Panel::Explorer => self.texts.tr("Explorer").to_owned(),
+                    Panel::Terminal => self.texts.tr("Terminal").to_owned(),
+                    Panel::Welcome => self.texts.tr("Welcome").to_owned(),
+                    Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
+                        if d.is_dirty() {
+                            format!("{} *", d.name())
+                        } else {
+                            d.name()
+                        }
+                    }),
+                };
+                (id, title)
+            })
+            .collect()
+    }
+
+    /// one frame.
+    ///
+    /// # Errors
+    ///
+    /// what drawing reports.
+    pub fn draw(&mut self, ctx: &mut dyn DrawingContext) -> AureaResult<()> {
+        self.poll();
+        ctx.clear(self.theme.palette.background)?;
+        let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
+        let titles = self.titles();
+        let mut clicks: Vec<Click> = Vec::new();
+        let changed;
+        {
+            let Workbench { dock, panels } = &mut self.bench;
+            let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
+            let mut ui = self.ui.frame(ctx, &self.theme);
+            let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
+            let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
+            let content = |ui: &mut Ui<'_, Id>, pane: PaneId, rect: Rect| match panels.get(pane) {
+                Some(Panel::Explorer) => {
+                    clicks.extend(explorer::view::show(ui, explorer, rect)?);
+                    Ok(())
+                }
+                Some(Panel::Editor(view)) => {
+                    let Some(doc_id) = docs.view(view).map(|v| v.doc) else {
+                        return Ok(());
+                    };
+                    let mut state = docs.view(view).cloned().expect("view exists");
+                    if let Some(doc) = docs.doc(doc_id) {
+                        editor::show(ui, view, doc, &mut state, rect, texts)?;
+                    }
+                    if let Some(v) = docs.view_mut(view) {
+                        *v = state;
+                    }
+                    Ok(())
+                }
+                Some(Panel::Terminal) => hint(ui, rect, texts.tr("the terminal comes later")),
+                Some(Panel::Welcome) | None => {
+                    hint(ui, rect, texts.tr("open a file from the explorer"))
+                }
+            };
+            let response = DockView::new(dock, title, content)
+                .style(DockStyle::new(&self.theme))
+                .close_buttons(true)
+                .show(&mut ui, Id::Dock, main)?;
+            changed = response.changed;
+            status_bar(&mut ui, status, &self.status)?;
+        }
+        if changed {
+            self.layout_dirty = true;
+        }
+        for event in self.bench.dock.take_tab_events() {
+            if let DockTabEvent::CloseRequested(pane) = event {
+                match self.bench.close(pane, &mut self.docs) {
+                    Ok(()) => self.layout_dirty = true,
+                    Err(Refused::Unsaved) => {
+                        self.status = self.texts.tr("save it first, it has changes").to_owned();
+                    }
+                    Err(Refused::KeepsEditorArea) => {}
+                }
+            }
+        }
+        for click in clicks {
+            match click {
+                Click::Open(path) => self.open_file(&path),
+                Click::Scan(_) => self.scan_pending(),
+                Click::Toggled => {}
+            }
+        }
+        if self.layout_dirty && self.restored && self.bench.dock.dragging().is_none() {
+            self.save_layout();
+        }
+        Ok(())
+    }
+}
+
+fn hint(ui: &mut Ui<'_, Id>, rect: Rect, text: &str) -> AureaResult<()> {
+    let font = ui.theme.font(13.0);
+    let color = ui.theme.palette.dim;
+    ui.text(text, rect, &font, color, Align::Center)
+}
+
+fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    ui.fill(rect, palette.surface)?;
+    ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
+    let font = ui.theme.font(12.0);
+    ui.text_clipped(
+        message,
+        rect.inset_xy(10.0, 0.0),
+        &font,
+        palette.dim,
+        Align::Start,
+    )?;
+    Ok(())
+}
+
+fn keymap() -> Keymap<Command> {
+    let mut map = Keymap::new();
+    map.bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
+        .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
+    map
+}
