@@ -8,6 +8,7 @@ mod editor;
 mod explorer;
 mod jobs;
 mod lang;
+mod lsp;
 mod search;
 mod syntax;
 mod terminal;
@@ -165,6 +166,9 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut edit, "Paste", Command::Paste)?;
     edit.add_separator()?;
     add(&mut edit, "Select All", Command::SelectAll)?;
+    let mut go = bar.add_submenu(a.texts.tr("Go"))?;
+    add(&mut go, "Go to Definition", Command::GotoDefinition)?;
+    add(&mut go, "Show Hover", Command::ShowHover)?;
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;

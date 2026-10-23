@@ -1,13 +1,14 @@
 //! open documents and the views on them. one document per path, many views
 //! per document; views hold scroll and cursor, never their own text copy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use resolvase::{Bias, ChangeSet, Revision, SavePoint, TextBuffer, TextSnapshot};
+use resolvase::{Bias, ChangeSet, Encoding, Point, Revision, SavePoint, TextBuffer, TextSnapshot};
 
 use crate::editor::cursor::Selection;
+use crate::lsp::Diag;
 use crate::syntax::{self, Parsed, Spans};
 
 /// files bigger than this are refused for now.
@@ -38,6 +39,10 @@ pub struct Document {
     pub spans: Spans,
     /// newest revision sent for colouring.
     asked: Option<Revision>,
+    /// language server diagnostics, moved along with edits.
+    pub diags: Vec<Diag>,
+    /// the last few edits, to move late results onto the text now.
+    recent: VecDeque<ChangeSet>,
 }
 
 impl Document {
@@ -72,8 +77,8 @@ pub struct View {
     pub reveal: bool,
     /// lines that fit, from the last frame; for page up and down.
     pub page: usize,
-    /// line and byte column to put the caret on once the text is loaded.
-    pub goto: Option<(usize, usize)>,
+    /// where to put the caret once the text is loaded.
+    pub goto: Option<(Point, Encoding)>,
 }
 
 #[derive(Default)]
@@ -106,6 +111,8 @@ impl Documents {
                 language: syntax::language_for(path),
                 spans: Spans::new(),
                 asked: None,
+                diags: Vec::new(),
+                recent: VecDeque::new(),
             },
         );
         (id, true)
@@ -188,6 +195,13 @@ impl Documents {
         };
         if let Some(d) = self.docs.get_mut(&doc) {
             syntax::follow(&mut d.spans, set);
+            for diag in &mut d.diags {
+                diag.range = map_range(set, diag.range.clone());
+            }
+            d.recent.push_back(set.clone());
+            if d.recent.len() > RECENT {
+                d.recent.pop_front();
+            }
         }
         for (&id, v) in self.views.iter_mut().filter(|(_, v)| v.doc == doc) {
             // others stay put when text lands right at their caret
@@ -238,6 +252,37 @@ impl Documents {
         {
             doc.spans = parsed.spans;
         }
+    }
+
+    /// every open document.
+    pub fn all(&self) -> impl Iterator<Item = &Document> {
+        self.docs.values()
+    }
+
+    pub fn all_with_ids(&self) -> impl Iterator<Item = (DocumentId, &Document)> {
+        self.docs.iter().map(|(id, d)| (*id, d))
+    }
+
+    /// diagnostics made for the text at `revision`, moved onto the text
+    /// now through the recent edits. too old to move: dropped, the server
+    /// sends fresh ones anyway.
+    pub fn set_diags(&mut self, id: DocumentId, revision: Revision, mut diags: Vec<Diag>) {
+        let Some(doc) = self.docs.get_mut(&id) else {
+            return;
+        };
+        let now = doc.buffer.revision();
+        if revision != now {
+            let Some(from) = doc.recent.iter().position(|set| set.before == revision) else {
+                return;
+            };
+            for set in doc.recent.iter().skip(from) {
+                for diag in &mut diags {
+                    diag.range = map_range(set, diag.range.clone());
+                }
+            }
+        }
+        diags.sort_by_key(|d| (d.range.start, d.severity));
+        doc.diags = diags;
     }
 
     /// a save is done. ignored when the document was closed meanwhile.
@@ -321,6 +366,16 @@ pub fn read_text(path: &Path) -> Result<String, String> {
         return Err(format!("file is over {} MiB", MAX_FILE / 1024 / 1024));
     }
     String::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_owned())
+}
+
+/// edits kept per document for moving late results.
+const RECENT: usize = 64;
+
+/// a range through an edit; text typed at its edges stays outside.
+fn map_range(set: &ChangeSet, range: Range<usize>) -> Range<usize> {
+    let start = set.map(range.start, Bias::Right);
+    let end = set.map(range.end, Bias::Left).max(start);
+    start..end
 }
 
 /// writes `text` over `path` without ever leaving half a file: a temp file
@@ -487,6 +542,39 @@ mod tests {
             spans: vec![(1..3, sylven::HighlightKind::Keyword)],
         });
         assert_eq!(docs.doc(a).unwrap().spans.len(), 1);
+    }
+
+    #[test]
+    fn late_diagnostics_move_onto_text_now() {
+        use crate::lsp::Severity;
+        let mut docs = Documents::default();
+        let (a, _) = docs.open(Path::new("a.rs"));
+        let v = docs.add_view(a);
+        docs.loaded(a, Ok("let x = y;".into()));
+        let old = docs.doc(a).unwrap().buffer.revision();
+        docs.edit(v, vec![(0..0, "// hi\n".into())], false);
+        let diag = Diag {
+            range: 8..9,
+            severity: Severity::Error,
+            message: "no y".into(),
+        };
+        docs.set_diags(a, old, vec![diag.clone()]);
+        assert_eq!(docs.doc(a).unwrap().diags[0].range, 14..15);
+        // typing in front moves it again
+        docs.edit(v, vec![(0..0, "x".into())], false);
+        assert_eq!(docs.doc(a).unwrap().diags[0].range, 15..16);
+        // a revision never seen is dropped
+        let mut stranger = resolvase::TextBuffer::from_text("");
+        stranger.insert(0, "zzzzzzz").unwrap();
+        for _ in 0..80 {
+            docs.edit(v, vec![(0..0, "q".into())], false);
+        }
+        docs.set_diags(a, old, vec![diag]);
+        assert_eq!(
+            docs.doc(a).unwrap().diags[0].range.start,
+            15 + 80,
+            "kept the moved ones"
+        );
     }
 
     #[test]

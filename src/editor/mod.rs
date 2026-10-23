@@ -183,6 +183,79 @@ fn paint_line(
     run(ui, at, line.end, plain)
 }
 
+/// wavy underlines under the diagnostics that touch this line.
+fn squiggles(
+    ui: &mut Ui<'_, Id>,
+    font: &Font,
+    laid: &Laid,
+    diags: &[crate::lsp::Diag],
+    line: Range<usize>,
+    body: Rect,
+) -> AureaResult<()> {
+    use crate::lsp::Severity;
+    let palette = ui.theme.palette;
+    for diag in diags {
+        if diag.range.start > line.end || diag.range.end < line.start {
+            continue;
+        }
+        let from = diag.range.start.max(line.start);
+        let to = diag.range.end.min(line.end);
+        let x0 = body.x + laid.x_of(ui, font, from);
+        // an empty range still gets a mark the width of one char
+        let x1 = (body.x + laid.x_of(ui, font, to)).max(x0 + ui.text_width("m", font));
+        let color = match diag.severity {
+            Severity::Error => palette.danger,
+            Severity::Warning => palette.warning,
+            Severity::Info => palette.accent,
+            Severity::Hint => palette.dim,
+        };
+        let y = body.y + LINE - 3.0;
+        let mut points = Vec::new();
+        let mut x = x0;
+        let mut up = false;
+        while x < x1 {
+            points.push(Point::new(x, if up { y - 1.5 } else { y + 1.5 }));
+            x += 3.0;
+            up = !up;
+        }
+        points.push(Point::new(x1, y));
+        ui.polyline(&points, 1.0, color)?;
+    }
+    Ok(())
+}
+
+/// language server hover text in a box under the caret, or over it when
+/// there is no room below.
+fn hover_box(ui: &mut Ui<'_, Id>, text: &str, caret: Rect, seen: Rect) -> AureaResult<()> {
+    const MAX_LINES: usize = 16;
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(13.0);
+    let lines: Vec<&str> = text.lines().take(MAX_LINES).collect();
+    let row = 18.0;
+    let width = lines
+        .iter()
+        .map(|l| ui.text_width(l, &font))
+        .fold(120.0_f32, f32::max)
+        .min(seen.width * 0.8)
+        + 16.0;
+    let height = lines.len() as f32 * row + 12.0;
+    let below = caret.y + caret.height + 4.0;
+    let y = if below + height <= seen.y + seen.height {
+        below
+    } else {
+        (caret.y - height - 4.0).max(seen.y)
+    };
+    let x = caret.x.min(seen.x + seen.width - width).max(seen.x);
+    let card = Rect::new(x, y, width, height);
+    ui.fill(card, palette.raised)?;
+    ui.border(card, 4.0, 1.0, palette.border)?;
+    for (i, line) in lines.iter().enumerate() {
+        let at = Rect::new(x + 8.0, y + 6.0 + i as f32 * row, width - 16.0, row);
+        ui.text_clipped(line, at, &font, palette.text, Align::Start)?;
+    }
+    Ok(())
+}
+
 /// a line's text without its line break, `\r` included, so no click or
 /// drag can land between `\r` and `\n`.
 fn span(text: &TextSnapshot, line: usize) -> Range<usize> {
@@ -259,6 +332,7 @@ pub fn show(
     view: &mut View,
     rect: Rect,
     texts: &Texts,
+    hover: Option<&str>,
 ) -> AureaResult<Shown> {
     let mut shown = Shown {
         focused: false,
@@ -285,15 +359,9 @@ pub fn show(
     let gutter = ui.text_width(&"0".repeat(digits), &font) + 16.0;
     let height = lines as f32 * LINE + LINE;
     view.page = ((rect.height / LINE) as usize).saturating_sub(1).max(1);
-    if let Some((line, column)) = view.goto.take() {
-        // past the end or mid char: land on the nearest place before it
-        let line = line.min(text.line_count() - 1);
-        let start = text.line_start(line).unwrap_or(0);
-        let mut at = (start + column).min(cursor::line_end(text, line));
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        view.sel = Selection::caret(at);
+    if let Some((at, encoding)) = view.goto.take() {
+        // past the end or mid char: lands on the nearest place before it
+        view.sel = Selection::caret(crate::lsp::offset_near(text, at, encoding));
         view.reveal = true;
     }
     if std::mem::take(&mut view.reveal) {
@@ -371,7 +439,16 @@ pub fn show(
                     }
                     ui.fill(Rect::new(body.x + x0, y, x1 - x0, LINE), palette.selection)?;
                 }
-                paint_line(ui, &font, &laid, &doc.spans, span, body, palette.text)?;
+                paint_line(
+                    ui,
+                    &font,
+                    &laid,
+                    &doc.spans,
+                    span.clone(),
+                    body,
+                    palette.text,
+                )?;
+                squiggles(ui, &font, &laid, &doc.diags, span, body)?;
                 if line == caret_line && shown.focused {
                     let x = body.x + laid.x_of(ui, &font, sel.head);
                     let mut caret_x = x;
@@ -391,6 +468,9 @@ pub fn show(
                     ui.fill(Rect::new(caret_x, y + 2.0, 2.0, LINE - 4.0), palette.text)?;
                     shown.caret = Some(Rect::new(caret_x, y, 2.0, LINE));
                 }
+            }
+            if let (Some(text), Some(caret)) = (hover, shown.caret) {
+                hover_box(ui, text, caret, seen)?;
             }
             Ok(())
         },

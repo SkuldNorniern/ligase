@@ -8,13 +8,14 @@ use aurea::render::{CanvasId, DrawingContext, Rect, request_canvas_redraw};
 use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 
-use resolvase::{Encoding, SavePoint};
+use resolvase::{Encoding, Point, SavePoint};
 
 use crate::document::{self, DocumentId, Documents, ViewId};
 use crate::editor::{self, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
+use crate::lsp::{self, Lsp};
 use crate::search::{self, Finder};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
@@ -42,6 +43,8 @@ pub enum Command {
     Copy,
     Paste,
     SelectAll,
+    GotoDefinition,
+    ShowHover,
     FindInFiles,
     ToggleExplorer,
     ToggleTerminal,
@@ -56,6 +59,7 @@ enum Done {
     Saved(Result<(), String>),
     Wrote(DocumentId, String, SavePoint, Result<(), String>),
     Shell(Result<vanta::Terminal, String>),
+    Server(&'static str, Result<lsp::server::Server, String>),
 }
 
 pub struct App {
@@ -70,6 +74,9 @@ pub struct App {
     syntax: Syntax,
     shell: Shell,
     finder: Finder,
+    lsp: Lsp,
+    /// hover text for a view, while its caret stays where it was asked.
+    hover: Option<(ViewId, usize, String)>,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -106,6 +113,8 @@ impl App {
             syntax: Syntax::default(),
             shell: Shell::default(),
             finder: Finder::default(),
+            lsp: Lsp::default(),
+            hover: None,
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -171,6 +180,7 @@ impl App {
             && let Some(action) = input::action(event, v.page, !v.sel.is_empty())
         {
             editor::act(&mut self.docs, view, action);
+            self.hover = None;
             return true;
         }
         self.ui.handle(event)
@@ -209,6 +219,30 @@ impl App {
             self.shell.write(&bytes);
         }
         true
+    }
+
+    /// starts a language server on the worker, in the workspace folder.
+    fn start_server(&mut self, language: &'static str) {
+        let Some((command, args, _)) = lsp::server_for(language) else {
+            return;
+        };
+        let root = self.explorer.root().to_path_buf();
+        let canvas = self.canvas;
+        let job = move || {
+            let wake = move || {
+                if let Some(id) = canvas {
+                    request_canvas_redraw(id);
+                }
+            };
+            Done::Server(
+                language,
+                lsp::server::Server::spawn(command, args, &root, wake),
+            )
+        };
+        if !self.jobs.run(job) {
+            self.lsp
+                .started(language, Err("the file worker is not running".to_owned()));
+        }
     }
 
     /// starts the shell on the worker, in the workspace folder. its output
@@ -267,6 +301,22 @@ impl App {
                     && let Some(text) = aurea::clipboard::clipboard_text()
                 {
                     editor::paste(&mut self.docs, view, &text);
+                }
+                return;
+            }
+            Command::GotoDefinition => {
+                if let Some(view) = focus
+                    && !self.lsp.definition(&self.docs, view)
+                {
+                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                }
+                return;
+            }
+            Command::ShowHover => {
+                if let Some(view) = focus
+                    && !self.lsp.hover(&self.docs, view)
+                {
+                    self.status = self.texts.tr("no language server for this yet").to_owned();
                 }
                 return;
             }
@@ -398,6 +448,29 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        for event in self.lsp.poll() {
+            match event {
+                lsp::Event::Diagnostics(doc, revision, diags) => {
+                    self.docs.set_diags(doc, revision, diags);
+                }
+                lsp::Event::Goto(path, at, encoding) => {
+                    let view = self.open_file(&path);
+                    if let Some(v) = self.docs.view_mut(view) {
+                        v.goto = Some((at, encoding));
+                    }
+                }
+                lsp::Event::Hover(view, at, text) => {
+                    if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
+                        self.hover = Some((view, at, text));
+                    }
+                }
+                lsp::Event::Status(text) => self.status = text,
+            }
+        }
+        for language in self.lsp.wanted(&self.docs) {
+            self.start_server(language);
+        }
+        self.lsp.sync(&self.docs);
         while let Some(parsed) = self.syntax.take() {
             self.docs.coloured(parsed);
         }
@@ -423,6 +496,12 @@ impl App {
                     }
                 },
                 Done::Shell(result) => self.shell.started(result),
+                Done::Server(language, result) => {
+                    if let Some(why) = self.lsp.started(language, result) {
+                        // a missing server is fine; the editor works without it
+                        self.status = format!("{}: {why}", self.texts.tr("no language server"));
+                    }
+                }
                 Done::Saved(result) => {
                     if let Err(why) = result {
                         self.status = format!("{}: {why}", self.texts.tr("can't save the layout"));
@@ -509,11 +588,17 @@ impl App {
         let mut found = None;
         let changed;
         let place = self.place();
+        let message = if self.status.is_empty() {
+            self.diag_here()
+        } else {
+            self.status.clone()
+        };
         let root = self.explorer.root().to_path_buf();
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
             let shell = &mut self.shell;
+            let hover = &self.hover;
             let finder = &mut self.finder;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
@@ -529,7 +614,11 @@ impl App {
                     };
                     let mut state = docs.view(view).cloned().expect("view exists");
                     if let Some(doc) = docs.doc(doc_id) {
-                        let shown = editor::show(ui, view, doc, &mut state, rect, texts)?;
+                        let hover = hover
+                            .as_ref()
+                            .filter(|(v, at, _)| *v == view && state.sel.head == *at)
+                            .map(|(_, _, text)| text.as_str());
+                        let shown = editor::show(ui, view, doc, &mut state, rect, texts, hover)?;
                         if shown.focused {
                             focus = Some(view);
                             ime = shown.caret;
@@ -560,7 +649,7 @@ impl App {
                 .close_buttons(true)
                 .show(&mut ui, Id::Dock, main)?;
             changed = response.changed;
-            status_bar(&mut ui, status, &self.status, &place)?;
+            status_bar(&mut ui, status, &message, &place)?;
         }
         self.focus = focus;
         self.ime = ime;
@@ -573,7 +662,7 @@ impl App {
             Some(search::view::Ask::Open(hit)) => {
                 let view = self.open_file(&hit.path);
                 if let Some(v) = self.docs.view_mut(view) {
-                    v.goto = Some((hit.line, hit.column));
+                    v.goto = Some((Point::new(hit.line, hit.column), Encoding::Utf8));
                 }
             }
             None => {}
@@ -626,13 +715,46 @@ impl App {
         let Some(doc) = self.docs.doc(view.doc) else {
             return String::new();
         };
-        doc.buffer
+        let errors = doc
+            .diags
+            .iter()
+            .filter(|d| d.severity == lsp::Severity::Error)
+            .count();
+        let warnings = doc
+            .diags
+            .iter()
+            .filter(|d| d.severity == lsp::Severity::Warning)
+            .count();
+        let at = doc
+            .buffer
             .text()
             .point(view.sel.head, Encoding::Utf32)
             .map_or_else(
                 |_| String::new(),
                 |p| format!("Ln {}, Col {}", p.line + 1, p.column + 1),
-            )
+            );
+        if errors + warnings == 0 {
+            at
+        } else {
+            format!("E {errors}  W {warnings}   {at}")
+        }
+    }
+
+    /// the message of the diagnostic under the caret, for the status bar.
+    fn diag_here(&self) -> String {
+        let Some(view) = self.focus.and_then(|v| self.docs.view(v)) else {
+            return String::new();
+        };
+        let Some(doc) = self.docs.doc(view.doc) else {
+            return String::new();
+        };
+        let at = view.sel.head;
+        doc.diags
+            .iter()
+            .filter(|d| d.range.start <= at && at <= d.range.end)
+            .min_by_key(|d| d.severity)
+            .map(|d| d.message.lines().next().unwrap_or_default().to_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -648,7 +770,7 @@ fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> Au
     ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
     let font = ui.theme.font(12.0);
     let inner = rect.inset_xy(10.0, 0.0);
-    let (right, left) = inner.split_right(140.0, 8.0);
+    let (right, left) = inner.split_right(220.0, 8.0);
     ui.text_clipped(message, left, &font, palette.dim, Align::Start)?;
     ui.text(place, right, &font, palette.dim, Align::End)?;
     Ok(())
@@ -665,6 +787,8 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::V), Command::Paste)
         .bind(Chord::command(KeyCode::A), Command::SelectAll)
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
+        .bind(Chord::key(KeyCode::F12), Command::GotoDefinition)
+        .bind(Chord::command(KeyCode::I), Command::ShowHover)
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
     map

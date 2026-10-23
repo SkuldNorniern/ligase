@@ -11,5 +11,6 @@ aurea = { git = "https://github.com/SkuldNorniern/aurea", rev = "e123ae3a326180f
 resolvase = { path = "../resolvase" }
 vanta = { path = "../vanta" }
 toml = "1"
+serde_json = "1"
 sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
 sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
