@@ -25,6 +25,7 @@ use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
 use aurea::{AureaResult, Container, Window};
 
 use crate::app::{App, Command};
+use crate::editor::LineOp;
 use crate::lang::Lang;
 use crate::workbench::panels::Panel;
 
@@ -166,6 +167,22 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut edit, "Paste", Command::Paste)?;
     edit.add_separator()?;
     add(&mut edit, "Select All", Command::SelectAll)?;
+    add(&mut edit, "Select Line", Command::Line(LineOp::Select))?;
+    edit.add_separator()?;
+    add(&mut edit, "Toggle Comment", Command::Line(LineOp::Comment))?;
+    add(&mut edit, "Move Line Up", Command::Line(LineOp::Move(true)))?;
+    add(
+        &mut edit,
+        "Move Line Down",
+        Command::Line(LineOp::Move(false)),
+    )?;
+    add(&mut edit, "Copy Line Up", Command::Line(LineOp::Copy(true)))?;
+    add(
+        &mut edit,
+        "Copy Line Down",
+        Command::Line(LineOp::Copy(false)),
+    )?;
+    add(&mut edit, "Delete Line", Command::Line(LineOp::Delete))?;
     let mut go = bar.add_submenu(a.texts.tr("Go"))?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
     add(&mut go, "Show Hover", Command::ShowHover)?;

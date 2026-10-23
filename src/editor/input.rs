@@ -14,6 +14,11 @@ pub enum Action {
     Delete,
     Newline,
     Indent,
+    Outdent,
+    /// a new line under the caret's line, or above it (true).
+    OpenLine(bool),
+    /// a word forward (true) or back.
+    DeleteWord(bool),
     /// drop the selection, keep the caret.
     Collapse,
     /// ime text being composed; empty ends it.
@@ -65,10 +70,14 @@ fn key_action(key: KeyCode, m: Modifiers, page: usize, has_selection: bool) -> O
         KeyCode::End => Motion::LineEnd,
         _ => {
             return match key {
+                KeyCode::Backspace if word => Some(Action::DeleteWord(false)),
+                KeyCode::Delete if word => Some(Action::DeleteWord(true)),
                 KeyCode::Backspace => Some(Action::Backspace),
                 KeyCode::Delete => Some(Action::Delete),
-                KeyCode::Enter if !m.ctrl && !m.alt && !m.meta => Some(Action::Newline),
-                KeyCode::Tab if !shift && !m.ctrl && !m.alt => Some(Action::Indent),
+                KeyCode::Enter if m.ctrl || (mac && m.meta) => Some(Action::OpenLine(shift)),
+                KeyCode::Enter if !m.alt && !m.meta => Some(Action::Newline),
+                KeyCode::Tab if shift && !m.ctrl && !m.alt => Some(Action::Outdent),
+                KeyCode::Tab if !m.ctrl && !m.alt => Some(Action::Indent),
                 KeyCode::Escape if has_selection => Some(Action::Collapse),
                 _ => None,
             };

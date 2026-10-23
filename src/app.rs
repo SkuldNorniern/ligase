@@ -11,7 +11,7 @@ use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 use resolvase::{Encoding, Point, SavePoint};
 
 use crate::document::{self, DocumentId, Documents, ViewId};
-use crate::editor::{self, input};
+use crate::editor::{self, LineOp, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
@@ -43,6 +43,7 @@ pub enum Command {
     Copy,
     Paste,
     SelectAll,
+    Line(LineOp),
     GotoDefinition,
     ShowHover,
     FindInFiles,
@@ -77,6 +78,8 @@ pub struct App {
     lsp: Lsp,
     /// hover text for a view, while its caret stays where it was asked.
     hover: Option<(ViewId, usize, String)>,
+    /// a whole line copied with nothing selected; pasting it goes in above.
+    line_clip: Option<String>,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -115,6 +118,7 @@ impl App {
             finder: Finder::default(),
             lsp: Lsp::default(),
             hover: None,
+            line_clip: None,
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -286,13 +290,28 @@ impl App {
             }
             Command::Copy | Command::Cut => {
                 let Some(view) = focus else { return };
-                let Some(text) = editor::selected(&self.docs, view) else {
-                    return;
+                // nothing selected takes the whole line
+                let (text, line) = match editor::selected(&self.docs, view) {
+                    Some(text) => (text, None),
+                    None => match editor::caret_line(&self.docs, view) {
+                        Some((range, text)) => (text, Some(range)),
+                        None => return,
+                    },
                 };
                 if let Err(e) = aurea::clipboard::set_clipboard_text(&text) {
                     self.status = e.to_string();
-                } else if command == Command::Cut {
-                    editor::act(&mut self.docs, view, input::Action::Delete);
+                    return;
+                }
+                self.line_clip = line.is_some().then(|| text.clone());
+                if command == Command::Cut {
+                    match line {
+                        Some(range) => {
+                            self.docs.edit(view, vec![(range, String::new())], false);
+                        }
+                        None => {
+                            editor::act(&mut self.docs, view, input::Action::Delete);
+                        }
+                    }
                 }
                 return;
             }
@@ -300,7 +319,18 @@ impl App {
                 if let Some(view) = focus
                     && let Some(text) = aurea::clipboard::clipboard_text()
                 {
-                    editor::paste(&mut self.docs, view, &text);
+                    let empty = self.docs.view(view).is_some_and(|v| v.sel.is_empty());
+                    if empty && self.line_clip.as_deref() == Some(text.as_str()) {
+                        editor::paste_line(&mut self.docs, view, &text);
+                    } else {
+                        editor::paste(&mut self.docs, view, &text);
+                    }
+                }
+                return;
+            }
+            Command::Line(op) => {
+                if let Some(view) = focus {
+                    editor::line_op(&mut self.docs, view, op);
                 }
                 return;
             }
@@ -786,6 +816,31 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::C), Command::Copy)
         .bind(Chord::command(KeyCode::V), Command::Paste)
         .bind(Chord::command(KeyCode::A), Command::SelectAll)
+        .bind(
+            Chord::key(KeyCode::Up).alt(),
+            Command::Line(LineOp::Move(true)),
+        )
+        .bind(
+            Chord::key(KeyCode::Down).alt(),
+            Command::Line(LineOp::Move(false)),
+        )
+        .bind(
+            Chord::key(KeyCode::Up).alt().shift(),
+            Command::Line(LineOp::Copy(true)),
+        )
+        .bind(
+            Chord::key(KeyCode::Down).alt().shift(),
+            Command::Line(LineOp::Copy(false)),
+        )
+        .bind(
+            Chord::command(KeyCode::K).shift(),
+            Command::Line(LineOp::Delete),
+        )
+        .bind(
+            Chord::command(KeyCode::Slash),
+            Command::Line(LineOp::Comment),
+        )
+        .bind(Chord::command(KeyCode::L), Command::Line(LineOp::Select))
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
         .bind(Chord::key(KeyCode::F12), Command::GotoDefinition)
         .bind(Chord::command(KeyCode::I), Command::ShowHover)

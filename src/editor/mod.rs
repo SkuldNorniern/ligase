@@ -3,6 +3,8 @@
 
 pub mod cursor;
 pub mod input;
+pub mod lines;
+pub mod pairs;
 
 use std::ops::Range;
 
@@ -17,6 +19,7 @@ use crate::lang::Texts;
 use crate::syntax::{self, Spans};
 use cursor::Selection;
 use input::Action;
+use lines::Change;
 
 const SIZE: f32 = 14.0;
 const LINE: f32 = 20.0;
@@ -62,19 +65,84 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
         }
         Action::Insert(typed) => {
             v.preedit = None;
+            if let Some(change) = pairs::typed(&text, sel, &typed) {
+                return apply(docs, view, change, true);
+            }
             ((sel.range(), typed), true)
         }
+        Action::Indent if lines::block(&text, sel).0 != lines::block(&text, sel).1 => {
+            let change = lines::indent_lines(&text, sel, TAB);
+            return apply(docs, view, change, false);
+        }
         Action::Indent => ((sel.range(), TAB.to_owned()), true),
+        Action::Outdent => {
+            let change = lines::outdent_lines(&text, sel, TAB);
+            return apply(docs, view, change, false);
+        }
         Action::Newline => {
             let start = sel.range().start;
-            let line = format!(
-                "{}{}",
-                doc.line_break(),
-                cursor::indent_before(&text, start)
-            );
-            ((sel.range(), line), false)
+            let lb = doc.line_break();
+            let indent = cursor::indent_before(&text, start);
+            let open = pairs::char_before(&text, start);
+            let close = pairs::char_after(&text, sel.range().end);
+            let opens = matches!(open, Some('(' | '[' | '{'))
+                || (open == Some(':') && doc.language == Some("python"));
+            if opens && open.and_then(pairs::closer) == close {
+                // between a pair: the caret gets its own line, deeper
+                let first = format!("{lb}{indent}{TAB}");
+                let change = Change {
+                    sel: Selection::caret(start + first.len()),
+                    edits: vec![(sel.range(), format!("{first}{lb}{indent}"))],
+                };
+                return apply(docs, view, change, false);
+            }
+            let deeper = if opens { TAB } else { "" };
+            ((sel.range(), format!("{lb}{indent}{deeper}")), false)
         }
+        Action::OpenLine(above) => {
+            let line = text.line_of(sel.head).unwrap_or(0);
+            let lb = doc.line_break();
+            let indent = cursor::indent_before(&text, cursor::line_end(&text, line));
+            let change = if above {
+                let at = text.line_start(line).unwrap_or(0);
+                Change {
+                    sel: Selection::caret(at + indent.len()),
+                    edits: vec![(at..at, format!("{indent}{lb}"))],
+                }
+            } else {
+                let at = cursor::line_end(&text, line);
+                Change {
+                    sel: Selection::caret(at + lb.len() + indent.len()),
+                    edits: vec![(at..at, format!("{lb}{indent}"))],
+                }
+            };
+            return apply(docs, view, change, false);
+        }
+        Action::DeleteWord(forward) if sel.is_empty() => {
+            let motion = if forward {
+                cursor::Motion::WordRight
+            } else {
+                cursor::Motion::WordLeft
+            };
+            let to = cursor::motion(&text, sel, motion, false, &mut None).head;
+            ((to.min(sel.head)..to.max(sel.head), String::new()), false)
+        }
+        Action::DeleteWord(_) => ((sel.range(), String::new()), false),
         Action::Backspace if sel.is_empty() => {
+            if let Some(change) = pairs::backspace(&text, sel.head) {
+                return apply(docs, view, change, true);
+            }
+            // in the indent, back to the last tab stop
+            let line = text.line_of(sel.head).unwrap_or(0);
+            let start = text.line_start(line).unwrap_or(0);
+            let before = text.slice(start..sel.head).unwrap_or_default();
+            if !before.is_empty() && before.bytes().all(|b| b == b' ') {
+                let take = match before.len() % TAB.len() {
+                    0 => TAB.len(),
+                    n => n,
+                };
+                return docs.edit(view, vec![(sel.head - take..sel.head, String::new())], true);
+            }
             let Some(prev) = text.prev_grapheme(sel.head).ok().flatten() else {
                 return false;
             };
@@ -89,6 +157,103 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
         Action::Backspace | Action::Delete => ((sel.range(), String::new()), false),
     };
     docs.edit(view, vec![edit], join)
+}
+
+/// makes `change` and puts its selection on the view.
+pub fn apply(docs: &mut Documents, view: ViewId, change: Change, join: bool) -> bool {
+    let done = change.edits.is_empty() || docs.edit(view, change.edits, join);
+    if done && let Some(v) = docs.view_mut(view) {
+        v.sel = change.sel;
+        v.goal = None;
+        v.reveal = true;
+    }
+    done
+}
+
+/// a line edit the app asks for by command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineOp {
+    Move(bool),
+    Copy(bool),
+    Delete,
+    Comment,
+    Select,
+}
+
+/// does `op` on the lines under the selection. true when something changed.
+pub fn line_op(docs: &mut Documents, view: ViewId, op: LineOp) -> bool {
+    let Some((doc, v)) = docs.editable(view) else {
+        return false;
+    };
+    let text = doc.buffer.snapshot();
+    let lb = doc.line_break();
+    let sel = v.sel;
+    let change = match op {
+        LineOp::Move(up) => lines::move_lines(&text, sel, up, lb),
+        LineOp::Copy(up) => Some(lines::copy_lines(&text, sel, up, lb)),
+        LineOp::Delete => Some(lines::delete_lines(&text, sel)),
+        LineOp::Comment => lines::comment_for(doc.language)
+            .and_then(|mark| lines::toggle_comment(&text, sel, mark)),
+        LineOp::Select => {
+            // again and again takes the next line too
+            let (a, b) = lines::block(&text, sel);
+            let from = text.line_start(a).unwrap_or(0);
+            let to = cursor::line_at(&text, text.line_start(b).unwrap_or(0)).head;
+            let to = if sel.range() == (from..to) {
+                cursor::line_at(&text, to).head
+            } else {
+                to
+            };
+            v.sel = Selection {
+                anchor: from,
+                head: to,
+            };
+            v.reveal = true;
+            return true;
+        }
+    };
+    // each line edit is its own undo step
+    doc.buffer.break_join();
+    change.is_some_and(|c| apply(docs, view, c, false))
+}
+
+/// the whole line under the caret with its break; what copy and cut take
+/// when nothing is selected.
+pub fn caret_line(docs: &Documents, view: ViewId) -> Option<(Range<usize>, String)> {
+    let v = docs.view(view)?;
+    let doc = docs.doc(v.doc)?;
+    let text = doc.buffer.text();
+    let range = cursor::line_at(text, v.sel.head).range();
+    let mut line = text.slice(range.clone()).ok()?;
+    if !line.ends_with('\n') {
+        line.push_str(doc.line_break());
+    }
+    Some((range, line))
+}
+
+/// pastes a whole line copied with nothing selected: it goes in above the
+/// caret's line, the caret stays where it was in the text.
+pub fn paste_line(docs: &mut Documents, view: ViewId, line: &str) -> bool {
+    let Some(v) = docs.view(view) else {
+        return false;
+    };
+    let Some(doc) = docs.doc(v.doc) else {
+        return false;
+    };
+    let text = doc.buffer.text();
+    let at = text
+        .line_start(text.line_of(v.sel.head).unwrap_or(0))
+        .unwrap_or(0);
+    let sel = Selection::caret(v.sel.head + line.len());
+    apply(
+        docs,
+        view,
+        Change {
+            edits: vec![(at..at, line.to_owned())],
+            sel,
+        },
+        false,
+    )
 }
 
 /// the selected text of `view`.
@@ -557,6 +722,49 @@ mod tests {
         select_all(&mut docs, v);
         act(&mut docs, v, Action::Delete);
         assert_eq!(text(&docs, v), "");
+    }
+
+    #[test]
+    fn enter_between_braces_opens_a_line() {
+        let (mut docs, v) = open("  f {}");
+        caret(&mut docs, v, 5);
+        act(&mut docs, v, Action::Newline);
+        assert_eq!(text(&docs, v), "  f {\n      \n  }");
+        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(12));
+    }
+
+    #[test]
+    fn backspace_in_indent_goes_to_tab_stop() {
+        let (mut docs, v) = open("      x");
+        caret(&mut docs, v, 6);
+        act(&mut docs, v, Action::Backspace);
+        assert_eq!(text(&docs, v), "    x");
+        act(&mut docs, v, Action::Backspace);
+        assert_eq!(text(&docs, v), "x");
+    }
+
+    #[test]
+    fn typing_pairs_and_word_delete() {
+        let (mut docs, v) = open("");
+        act(&mut docs, v, Action::Insert("(".into()));
+        act(&mut docs, v, Action::Insert("a".into()));
+        act(&mut docs, v, Action::Insert(")".into()));
+        assert_eq!(text(&docs, v), "(a)");
+        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(3));
+        act(&mut docs, v, Action::Insert(" word".into()));
+        act(&mut docs, v, Action::DeleteWord(false));
+        assert_eq!(text(&docs, v), "(a) ");
+    }
+
+    #[test]
+    fn line_copy_pastes_above() {
+        let (mut docs, v) = open("a\nb");
+        caret(&mut docs, v, 3);
+        let (_, line) = caret_line(&docs, v).unwrap();
+        assert_eq!(line, "b\n");
+        paste_line(&mut docs, v, &line);
+        assert_eq!(text(&docs, v), "a\nb\nb");
+        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(5));
     }
 
     #[test]
