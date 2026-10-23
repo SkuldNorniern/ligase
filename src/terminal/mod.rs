@@ -1,10 +1,13 @@
-//! terminal panel: one shell from ozone-term, started the first time the
-//! panel is drawn. while the panel has focus its keys go to the shell.
+//! terminal panel: one shell from vanta, started the first time the panel
+//! is drawn. while the panel has focus its keys go to the shell.
+
+use std::path::Path;
 
 use aurea::render::{Color, Font, Rect};
 use aurea::ui::{Align, ScrollArea, Sense, Ui};
 use aurea::{AureaResult, KeyCode, Modifiers, WindowEvent};
-use ozone_term::{Color as TermColor, Terminal};
+use vanta::vt::Attrs;
+use vanta::{Cell, CellKind, Color as TermColor, SpawnConfig, Terminal};
 
 use crate::app::Id;
 use crate::lang::Texts;
@@ -63,6 +66,18 @@ pub struct Shell {
     scroll: f32,
     /// stay at the bottom as output comes in, until the user scrolls up.
     follow: bool,
+    /// the shell asked for `ESC O` arrows (DECCKM), seen last frame.
+    app_keys: bool,
+}
+
+/// starts a shell in `root`. runs on the worker; `wake` runs on vanta's
+/// reader thread after each chunk of output.
+pub fn spawn(root: &Path, wake: impl Fn() + Send + 'static) -> Result<Terminal, String> {
+    let config = SpawnConfig {
+        cwd: Some(root.to_path_buf()),
+        ..SpawnConfig::default()
+    };
+    Terminal::spawn_notify(&config, wake).map_err(|e| e.to_string())
 }
 
 impl Shell {
@@ -82,19 +97,26 @@ impl Shell {
     /// sends typed bytes to the shell.
     pub fn write(&self, bytes: &str) {
         if let Some(term) = &self.term {
-            term.write_str(bytes);
+            let _ = term.write_str(bytes);
         }
     }
 
-    fn refresh(&mut self) {
-        if self.term.as_ref().is_some_and(|t| !t.is_running()) {
-            self.state = State::Ended;
+    /// pastes text, in bracketed-paste markers when the shell wants them.
+    pub fn paste(&self, text: &str) {
+        if let Some(term) = &self.term {
+            let _ = term.paste_str(text);
         }
+    }
+
+    /// bytes for a window event, in the key mode the shell asked for.
+    pub fn bytes(&self, event: &WindowEvent) -> Option<String> {
+        bytes(event, self.app_keys)
     }
 }
 
 /// bytes a key or typed text sends to the shell, the way xterm sends them.
-pub fn bytes(event: &WindowEvent) -> Option<String> {
+/// `app_keys` is DECCKM: plain arrows as `ESC O A` instead of `ESC [ A`.
+pub fn bytes(event: &WindowEvent, app_keys: bool) -> Option<String> {
     match event {
         WindowEvent::TextInput { text } => {
             // control chars come through key events instead
@@ -105,7 +127,7 @@ pub fn bytes(event: &WindowEvent) -> Option<String> {
             key,
             pressed: true,
             modifiers,
-        } => key_bytes(*key, *modifiers),
+        } => key_bytes(*key, *modifiers, app_keys),
         _ => None,
     }
 }
@@ -141,7 +163,7 @@ const LETTERS: [KeyCode; 26] = [
 
 /// a key as xterm sends it. alt puts ESC in front, ctrl+letter is its
 /// control byte, arrows carry shift/alt/ctrl as `ESC [ 1 ; n X`.
-fn key_bytes(key: KeyCode, m: Modifiers) -> Option<String> {
+fn key_bytes(key: KeyCode, m: Modifiers, app_keys: bool) -> Option<String> {
     if m.meta {
         return None;
     }
@@ -156,10 +178,10 @@ fn key_bytes(key: KeyCode, m: Modifiers) -> Option<String> {
     };
     if let Some(end) = arrow {
         let code = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
-        return Some(if code == 1 {
-            format!("{ESC}[{end}")
-        } else {
-            format!("{ESC}[1;{code}{end}")
+        return Some(match (code, app_keys) {
+            (1, true) => format!("{ESC}O{end}"),
+            (1, false) => format!("{ESC}[{end}"),
+            _ => format!("{ESC}[1;{code}{end}"),
         });
     }
     if key == KeyCode::Tab && m.shift && !m.ctrl && !m.alt {
@@ -214,6 +236,65 @@ fn resolve(color: TermColor, default: Color) -> Color {
     }
 }
 
+/// a cell's look, for grouping cells into runs.
+fn look(cell: &Cell) -> (TermColor, TermColor, bool) {
+    (cell.fg, cell.bg, cell.attrs.contains(Attrs::INVERSE))
+}
+
+fn push_text(cell: &Cell, out: &mut String) {
+    match &cell.kind {
+        CellKind::Empty => out.push(' '),
+        CellKind::Char(c) => out.push(*c),
+        CellKind::Cluster(s) => out.push_str(s),
+        CellKind::Continuation => {}
+    }
+}
+
+/// one line: runs of narrow cells as text, wide cells one by one at their
+/// column so a font's own width can't push the grid out of line.
+fn draw_row(
+    ui: &mut Ui<'_, Id>,
+    line: &[Cell],
+    x0: f32,
+    y: f32,
+    cell: f32,
+    font: &Font,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let mut col = 0;
+    while col < line.len() {
+        let first = &line[col];
+        let wide = first.width > 1;
+        let end = if wide {
+            (col + 1..line.len())
+                .find(|&i| !matches!(line[i].kind, CellKind::Continuation))
+                .unwrap_or(line.len())
+        } else {
+            (col + 1..line.len())
+                .find(|&i| line[i].width != 1 || look(&line[i]) != look(first))
+                .unwrap_or(line.len())
+        };
+        let (fg, bg, inverse) = look(first);
+        let (mut fg, mut bg) = (resolve(fg, palette.text), resolve(bg, palette.background));
+        if inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let at = Rect::new(x0 + col as f32 * cell, y, (end - col) as f32 * cell, LINE);
+        if first.bg != TermColor::Default || inverse {
+            ui.fill(at, bg)?;
+        }
+        let mut text = String::new();
+        for c in &line[col..end] {
+            push_text(c, &mut text);
+        }
+        if !text.trim().is_empty() {
+            ui.text(&text, at, font, fg, Align::Start)?;
+        }
+        col = end.max(col + 1);
+    }
+    Ok(())
+}
+
 /// draws the panel. true when it has the keyboard.
 pub fn show(
     ui: &mut Ui<'_, Id>,
@@ -238,92 +319,72 @@ pub fn show(
         }
         State::Running | State::Ended => {}
     }
-    shell.refresh();
+    let Some(term) = &shell.term else {
+        return Ok(false);
+    };
+    if !term.is_running() || term.is_closed() {
+        shell.state = State::Ended;
+    }
     let cell = ui.text_width("M", &font).max(1.0);
     let cols = ((rect.width - BAR - 2.0 * PAD) / cell).floor().max(10.0) as u16;
     let rows = ((rect.height - 2.0 * PAD) / LINE).floor().max(2.0) as u16;
     if shell.size != (cols, rows) {
         shell.size = (cols, rows);
-        if let Some(term) = &shell.term {
-            term.resize(cols, rows);
-        }
+        let _ = term.resize(cols, rows);
     }
     let ended = shell.state == State::Ended;
-    let Some(term) = &shell.term else {
-        return Ok(false);
-    };
     // only the lines in sight are copied out, never the whole scrollback
-    let total = term.cell_window(0, 0).lines;
-    let lines = total + usize::from(ended);
-    let height = lines as f32 * LINE + 2.0 * PAD;
+    let total = term.window(0, 0).lines;
+    let height = (total + usize::from(ended)) as f32 * LINE + 2.0 * PAD;
     if shell.follow {
         shell.scroll = (height - rect.height).max(0.0);
     }
-    let Shell { term, scroll, .. } = shell;
-    let Some(term) = term.as_ref() else {
-        return Ok(false);
-    };
     let mut focused = false;
-    ScrollArea::new(scroll, height).show(ui, Id::Terminal, rect, |ui, content, seen| {
-        let hit = Rect::new(seen.x, seen.y, (seen.width - BAR).max(0.0), seen.height);
-        focused = ui
-            .interact(Id::Terminal, 1, hit, Sense::Click, true)
-            .focused;
-        let first = ((seen.y - content.y - PAD) / LINE).floor().max(0.0) as usize;
-        let count = (seen.height / LINE).ceil() as usize + 1;
-        let x0 = content.x + PAD;
-        let window = term.cell_window(first, count);
-        for (i, line) in window.rows.iter().enumerate() {
-            let y = content.y + PAD + (first + i) as f32 * LINE;
-            let mut col = 0;
-            while col < line.len() {
-                // one run of cells with the same look
-                let look = &line[col];
-                let end = line[col..]
-                    .iter()
-                    .position(|c| c.fg != look.fg || c.bg != look.bg || c.inverse != look.inverse)
-                    .map_or(line.len(), |n| col + n);
-                let (mut fg, mut bg) = (
-                    resolve(look.fg, palette.text),
-                    resolve(look.bg, palette.background),
-                );
-                if look.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                let at = Rect::new(x0 + col as f32 * cell, y, (end - col) as f32 * cell, LINE);
-                if look.bg != TermColor::Default || look.inverse {
-                    ui.fill(at, bg)?;
-                }
-                let text: String = line[col..end].iter().map(|c| c.ch).collect();
-                if !text.trim().is_empty() {
-                    ui.text(&text, at, &font, fg, Align::Start)?;
-                }
-                col = end;
+    let mut app_keys = shell.app_keys;
+    ScrollArea::new(&mut shell.scroll, height).show(
+        ui,
+        Id::Terminal,
+        rect,
+        |ui, content, seen| {
+            let hit = Rect::new(seen.x, seen.y, (seen.width - BAR).max(0.0), seen.height);
+            focused = ui
+                .interact(Id::Terminal, 1, hit, Sense::Click, true)
+                .focused;
+            let first = ((seen.y - content.y - PAD) / LINE).floor().max(0.0) as usize;
+            let count = (seen.height / LINE).ceil() as usize + 1;
+            let x0 = content.x + PAD;
+            let window = term.window(first, count);
+            app_keys = window.application_cursor_keys;
+            for (i, line) in window.rows.iter().enumerate() {
+                let y = content.y + PAD + (first + i) as f32 * LINE;
+                draw_row(ui, line, x0, y, cell, &font)?;
             }
-        }
-        if ended {
-            let y = content.y + PAD + window.lines as f32 * LINE;
-            let row = Rect::new(x0, y, content.width, LINE);
-            let small = ui.theme.font(12.0);
-            ui.text(
-                texts.tr("the shell ended, press enter for a new one"),
-                row,
-                &small,
-                palette.dim,
-                Align::Start,
-            )?;
-        } else if focused {
-            let (line, col) = window.cursor;
-            let at = Rect::new(
-                x0 + col as f32 * cell,
-                content.y + PAD + line as f32 * LINE,
-                cell,
-                LINE,
-            );
-            ui.fill(at, palette.text.with_alpha(120))?;
-        }
-        Ok(())
-    })?;
+            if ended {
+                let y = content.y + PAD + window.lines as f32 * LINE;
+                let row = Rect::new(x0, y, content.width, LINE);
+                let small = ui.theme.font(12.0);
+                ui.text(
+                    texts.tr("the shell ended, press enter for a new one"),
+                    row,
+                    &small,
+                    palette.dim,
+                    Align::Start,
+                )?;
+            } else if focused && window.cursor_visible {
+                let (line, col) = window.cursor;
+                let col = col.min(usize::from(cols).saturating_sub(1));
+                let at = Rect::new(
+                    x0 + col as f32 * cell,
+                    content.y + PAD + line as f32 * LINE,
+                    cell,
+                    LINE,
+                );
+                ui.fill(at, palette.text.with_alpha(120))?;
+            }
+            Ok(())
+        },
+    )?;
+    shell.app_keys = app_keys;
     // scrolled back to the bottom: follow again
     shell.follow = shell.scroll + rect.height >= height - LINE;
     Ok(focused)
@@ -350,7 +411,7 @@ mod tests {
             shift: true,
             ..none
         };
-        let sent = |k, m| bytes(&key(k, m));
+        let sent = |k, m| bytes(&key(k, m), false);
         assert_eq!(sent(KeyCode::Enter, none).as_deref(), Some("\r"));
         assert_eq!(sent(KeyCode::Up, none).as_deref(), Some("\x1b[A"));
         assert_eq!(sent(KeyCode::C, ctrl).as_deref(), Some("\x03"));
@@ -362,7 +423,22 @@ mod tests {
         let typed = WindowEvent::TextInput {
             text: "ls\u{3}".into(),
         };
-        assert_eq!(bytes(&typed).as_deref(), Some("ls"));
+        assert_eq!(bytes(&typed, false).as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn app_cursor_keys_use_esc_o() {
+        let none = Modifiers::default();
+        let ctrl = Modifiers { ctrl: true, ..none };
+        assert_eq!(
+            bytes(&key(KeyCode::Up, none), true).as_deref(),
+            Some("\x1bOA")
+        );
+        assert_eq!(
+            bytes(&key(KeyCode::Up, ctrl), true).as_deref(),
+            Some("\x1b[1;5A"),
+            "modified arrows keep the CSI form"
+        );
     }
 
     #[test]

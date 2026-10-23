@@ -55,7 +55,7 @@ enum Done {
     Session(Option<String>),
     Saved(Result<(), String>),
     Wrote(DocumentId, String, SavePoint, Result<(), String>),
-    Shell(Result<ozone_term::Terminal, String>),
+    Shell(Result<vanta::Terminal, String>),
 }
 
 pub struct App {
@@ -192,13 +192,13 @@ impl App {
             }
             Some(Command::Paste) => {
                 if let Some(text) = aurea::clipboard::clipboard_text() {
-                    self.shell.write(&text);
+                    self.shell.paste(&text);
                 }
                 return true;
             }
             _ => {}
         }
-        let Some(bytes) = terminal::bytes(event) else {
+        let Some(bytes) = self.shell.bytes(event) else {
             return self.ui.handle(event);
         };
         if self.shell.state == terminal::State::Ended {
@@ -223,9 +223,7 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(
-                ozone_term::Terminal::spawn_in(Some(&root), wake).map_err(|e| e.to_string()),
-            )
+            Done::Shell(terminal::spawn(&root, wake))
         };
         if !self.jobs.run(job) {
             self.shell
