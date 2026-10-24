@@ -80,6 +80,8 @@ pub struct Parsed {
     pub doc: DocumentId,
     pub revision: Revision,
     pub spans: Spans,
+    /// foldable ranges, sorted by start.
+    pub folds: Vec<Range<usize>>,
 }
 
 pub struct Syntax {
@@ -152,6 +154,7 @@ impl Syntax {
 fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
     let revision = ask.text.revision();
     let mut spans = Spans::new();
+    let mut folds = Vec::new();
     if ask.text.len() <= MAX_COLOURED {
         let source = sylven::TextSnapshot::new(
             sylven::DocumentId(0),
@@ -172,12 +175,21 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
                 .filter(|(range, _)| !range.is_empty())
                 .collect();
             spans.sort_by_key(|(range, _)| range.start);
+            folds = result
+                .features
+                .folds
+                .iter()
+                .map(|f| f.start().to_usize()..f.end().to_usize())
+                .filter(|f| f.start < f.end && f.end <= ask.text.len())
+                .collect();
+            folds.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
         }
     }
     Parsed {
         doc: ask.doc,
         revision,
         spans,
+        folds,
     }
 }
 

@@ -3,6 +3,7 @@
 
 pub mod cursor;
 pub mod find;
+pub mod fold;
 pub mod input;
 pub mod lines;
 pub mod multi;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use aurea::render::{Color, Font, Point, Rect};
 use aurea::ui::{Align, Channel, Palette, ScrollArea, Sense, Ui};
 use aurea::{AureaResult, CursorIcon};
-use resolvase::TextSnapshot;
+use resolvase::{Encoding, TextSnapshot};
 
 use crate::app::Id;
 use crate::document::{Document, Documents, Load, View, ViewId};
@@ -63,7 +64,33 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
     let text = doc.buffer.snapshot();
     match action {
         Action::Move(motion, extend) => {
+            let from = text.line_of(v.sel.head).unwrap_or(0);
             v.sel = cursor::motion(&text, v.sel, motion, extend, &mut v.goal);
+            if !v.folded.is_empty() {
+                // up and down step over folded lines instead of opening them
+                let hidden = fold::hidden(&text, &v.folded);
+                let to = text.line_of(v.sel.head).unwrap_or(0);
+                if let Some((a, b)) = fold::is_hidden(to, &hidden) {
+                    let line = if to > from && b + 1 < text.line_count() {
+                        b + 1
+                    } else {
+                        a - 1
+                    };
+                    let column = v.goal.unwrap_or(0);
+                    let end = cursor::line_end(&text, line);
+                    let width = text.point(end, Encoding::Utf32).map_or(0, |p| p.column);
+                    let head = text
+                        .offset(
+                            resolvase::Point::new(line, column.min(width)),
+                            Encoding::Utf32,
+                        )
+                        .unwrap_or(end);
+                    v.sel.head = head;
+                    if !extend {
+                        v.sel.anchor = head;
+                    }
+                }
+            }
             for s in &mut v.extra {
                 // extra carets keep no goal column of their own
                 *s = cursor::motion(&text, *s, motion, extend, &mut None);
@@ -426,6 +453,73 @@ pub fn select_all(docs: &mut Documents, view: ViewId) {
     }
 }
 
+/// a fold command the app asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldOp {
+    Fold,
+    Unfold,
+    FoldAll,
+    UnfoldAll,
+}
+
+pub fn fold_op(docs: &mut Documents, view: ViewId, op: FoldOp) -> bool {
+    let Some((doc, v)) = docs.editable(view) else {
+        return false;
+    };
+    let text = doc.buffer.snapshot();
+    let line = text.line_of(v.sel.head).unwrap_or(0);
+    match op {
+        FoldOp::Fold => {
+            // the fold starting on the caret's line, else the smallest one
+            // around the caret
+            let target = fold::starting_on(&text, &doc.folds, line).or_else(|| {
+                doc.folds
+                    .iter()
+                    .filter(|f| f.start <= v.sel.head && v.sel.head <= f.end)
+                    .filter(|f| fold::hides(&text, f).is_some())
+                    .min_by_key(|f| f.len())
+                    .cloned()
+            });
+            let Some(target) = target else {
+                return false;
+            };
+            if !v.folded.contains(&target) {
+                v.folded.push(target.clone());
+            }
+            // the caret goes to the line left in sight
+            if fold::hides(&text, &target).is_some_and(|(a, b)| (a..=b).contains(&line)) {
+                v.sel = Selection::caret(cursor::line_end(
+                    &text,
+                    text.line_of(target.start).unwrap_or(0),
+                ));
+                v.extra.clear();
+            }
+        }
+        FoldOp::Unfold => {
+            let before = v.folded.len();
+            v.folded.retain(|f| {
+                let first = text.line_of(f.start).unwrap_or(0);
+                let last = text.line_of(f.end).unwrap_or(first);
+                !(first..=last).contains(&line)
+            });
+            if v.folded.len() == before {
+                return false;
+            }
+        }
+        FoldOp::FoldAll => {
+            v.folded = doc
+                .folds
+                .iter()
+                .filter(|f| fold::hides(&text, f).is_some())
+                .cloned()
+                .collect();
+        }
+        FoldOp::UnfoldAll => v.folded.clear(),
+    }
+    v.reveal = true;
+    true
+}
+
 /// a multi caret command the app asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaretOp {
@@ -776,9 +870,16 @@ pub fn show(
     let text = doc.buffer.text();
     let lines = text.line_count();
     let digits = lines.to_string().len().max(3);
-    let gutter = ui.text_width(&"0".repeat(digits), &font) + 22.0;
+    // numbers, then fold arrows, then the problem mark
+    let gutter = ui.text_width(&"0".repeat(digits), &font) + 34.0;
+    // a caret inside a fold (find, go to, undo) opens it
+    let here = text.line_of(view.sel.head).unwrap_or(0);
+    view.folded
+        .retain(|f| !fold::hides(text, f).is_some_and(|(a, b)| (a..=b).contains(&here)));
+    let hidden = fold::hidden(text, &view.folded);
+    let row_count = fold::rows(lines, &hidden).max(1);
     // the last line can scroll up to near the top
-    let height = lines as f32 * line_h + (rect.height - 3.0 * line_h).max(line_h);
+    let height = row_count as f32 * line_h + (rect.height - 3.0 * line_h).max(line_h);
     view.page = ((rect.height / line_h) as usize).saturating_sub(1).max(1);
     if let Some((at, encoding)) = view.goto.take() {
         // past the end or mid char: lands on the nearest place before it
@@ -794,7 +895,8 @@ pub fn show(
         } else {
             0.0
         };
-        let y = text.line_of(view.sel.head).unwrap_or(0) as f32 * line_h;
+        let line = text.line_of(view.sel.head).unwrap_or(0);
+        let y = fold::row_of(line, &hidden) as f32 * line_h;
         if y - margin < view.scroll {
             view.scroll = (y - margin).max(0.0);
         } else if y + line_h + margin > view.scroll + rect.height {
@@ -804,6 +906,7 @@ pub fn show(
     let mut sel = view.sel;
     let mut extras = view.extra.clone();
     let mut column = view.column;
+    let mut folded = view.folded.clone();
     let mut preedit = view.preedit.clone();
     let mut hscroll = view.hscroll;
     let seen_line = view.caret_line;
@@ -812,9 +915,15 @@ pub fn show(
         Id::Editor(id),
         rect,
         |ui, content, seen| {
-            let first = ((seen.y - content.y) / line_h).floor().max(0.0) as usize;
+            let first_row = ((seen.y - content.y) / line_h).floor().max(0.0) as usize;
             let count = (seen.height / line_h).ceil() as usize + 1;
-            let last = (first + count).min(lines);
+            // the lines in sight, top down, folded ones left out
+            let visible: Vec<usize> = (first_row..first_row + count)
+                .map(|r| fold::line_of_row(r, &hidden))
+                .take_while(|&l| l < lines)
+                .collect();
+            let row_y = |i: usize| content.y + (first_row + i) as f32 * line_h;
+            let line_y = |line: usize| content.y + fold::row_of(line, &hidden) as f32 * line_h;
             let text_x = content.x + gutter;
             let area = Rect::new(
                 text_x,
@@ -838,22 +947,43 @@ pub fn show(
             if input.hovered {
                 ui.set_cursor(CursorIcon::Text);
             }
-            let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
-                let line = ((at.y - content.y) / line_h)
+            let line_at_y = |y: f32| {
+                let row = ((y - content.y) / line_h)
                     .floor()
-                    .clamp(0.0, (lines - 1) as f32) as usize;
+                    .clamp(0.0, (row_count - 1) as f32) as usize;
+                fold::line_of_row(row, &hidden).min(lines - 1)
+            };
+            let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
+                let line = line_at_y(at.y);
                 lay(text, span(text, line)).offset_at(ui, &font, at.x - body_x)
             };
             let mut pull = 0.0;
-            let line_at_y = |y: f32| {
-                ((y - content.y) / line_h)
-                    .floor()
-                    .clamp(0.0, (lines - 1) as f32) as usize
-            };
+            // the fold arrow column: a press there folds or opens
+            let arrows = Rect::new(content.x + gutter - 24.0, seen.y, 14.0, seen.height);
+            let over_gutter = ui
+                .pointer()
+                .is_some_and(|p| p.x < text_x && seen.contains(p));
+            let mut toggled = false;
+            if let Some(press) = ui.press(Id::Editor(id), 1)
+                && arrows.contains(press.at)
+            {
+                let line = line_at_y(press.at.y);
+                if let Some(target) = fold::starting_on(text, &doc.folds, line) {
+                    if let Some(at) = folded
+                        .iter()
+                        .position(|f| text.line_of(f.start).ok() == Some(line))
+                    {
+                        folded.remove(at);
+                    } else {
+                        folded.push(target);
+                    }
+                    toggled = true;
+                }
+            }
             if !input.held {
                 column = None;
             }
-            if let Some(press) = ui.press(Id::Editor(id), 1) {
+            if let Some(press) = ui.press(Id::Editor(id), 1).filter(|_| !toggled) {
                 let at = hit_test(ui, press.at);
                 if look.alt && press.shift && press.clicks == 1 {
                     // alt, shift and a drag: a box, one selection a line
@@ -942,25 +1072,36 @@ pub fn show(
             let char_w = ui.text_width(" ", &font);
 
             // gutter: numbers, the caret's line brighter, a mark for problems
-            let mut marks: Vec<Option<Severity>> = vec![None; last.saturating_sub(first)];
+            let mut marks: Vec<Option<Severity>> = vec![None; visible.len()];
             for diag in &doc.diags {
                 if let Ok(l) = text.line_of(diag.range.start)
-                    && (first..last).contains(&l)
+                    && let Ok(i) = visible.binary_search(&l)
                 {
-                    let mark = &mut marks[l - first];
+                    let mark = &mut marks[i];
                     *mark = Some(mark.map_or(diag.severity, |m| m.min(diag.severity)));
                 }
             }
-            for line in first..last {
-                let y = content.y + line as f32 * line_h;
-                let number = Rect::new(content.x, y, gutter - 14.0, line_h);
+            let small = ui.theme.font(11.0);
+            for (i, &line) in visible.iter().enumerate() {
+                let y = row_y(i);
+                let number = Rect::new(content.x, y, gutter - 26.0, line_h);
                 let color = if line == caret_line {
                     palette.dim
                 } else {
                     palette.faint
                 };
                 ui.text(&(line + 1).to_string(), number, &font, color, Align::End)?;
-                if let Some(severity) = marks[line - first] {
+                // fold arrows show while the pointer is over the gutter, and
+                // always on a folded line
+                let closed = folded
+                    .iter()
+                    .any(|f| text.line_of(f.start).ok() == Some(line));
+                if (closed || over_gutter) && fold::starting_on(text, &doc.folds, line).is_some() {
+                    let at = Rect::new(arrows.x, y, arrows.width, line_h);
+                    let glyph = if closed { "▸" } else { "▾" };
+                    ui.text(glyph, at, &small, palette.dim, Align::Center)?;
+                }
+                if let Some(severity) = marks[i] {
                     let bar = Rect::new(content.x + gutter - 8.0, y + 3.0, 3.0, line_h - 6.0);
                     ui.round(bar, 1.5, severity_colour(&palette, severity))?;
                 }
@@ -995,12 +1136,12 @@ pub fn show(
             let mut widest: f32 = 0.0;
             ui.clipped(area, |ui| {
                 let mut carry = 0;
-                if let Some(back) = first.checked_sub(1) {
+                if let Some(back) = visible.first().and_then(|l| l.checked_sub(1)) {
                     let s = span(text, back);
                     carry = depth(&text.slice(s).unwrap_or_default()).unwrap_or(0);
                 }
-                for line in first..last {
-                    let y = content.y + line as f32 * line_h;
+                for (i, &line) in visible.iter().enumerate() {
+                    let y = row_y(i);
                     let body =
                         Rect::new(body_x, y, (area.x + area.width - body_x).max(0.0), line_h);
                     let span = span(text, line);
@@ -1081,11 +1222,21 @@ pub fn show(
                         palette.text,
                     )?;
                     squiggles(ui, &font, &laid, &doc.diags, span, body, line_h)?;
-                    widest = widest.max(ui.text_width(&laid.drawn, &font));
+                    let drawn_w = ui.text_width(&laid.drawn, &font);
+                    widest = widest.max(drawn_w);
+                    // a folded line ends in a pill standing for what it hides
+                    if folded
+                        .iter()
+                        .any(|f| text.line_of(f.start).ok() == Some(line))
+                    {
+                        let dots = Rect::new(body.x + drawn_w + 6.0, y + 3.0, 26.0, line_h - 6.0);
+                        ui.round(dots, 4.0, palette.raised)?;
+                        ui.text("⋯", dots, &font, palette.dim, Align::Center)?;
+                    }
                 }
 
                 // the caret glides to its place; a long jump just lands
-                let target_y = caret_line as f32 * line_h;
+                let target_y = fold::row_of(caret_line, &hidden) as f32 * line_h;
                 let jump = preedit.is_some()
                     || seen_line.is_none_or(|l: usize| l.abs_diff(caret_line) > 6);
                 let (cx, cy) = if jump {
@@ -1147,11 +1298,11 @@ pub fn show(
                         let Ok(line) = text.line_of(extra.head) else {
                             continue;
                         };
-                        if !(first..last).contains(&line) {
+                        if visible.binary_search(&line).is_err() {
                             continue;
                         }
                         let ex = body_x + lay(text, span(text, line)).x_of(ui, &font, extra.head);
-                        let ey = content.y + line as f32 * line_h;
+                        let ey = line_y(line);
                         let bar = Rect::new(ex.round() - 0.5, ey + 2.0, 2.0, line_h - 4.0);
                         ui.fill(bar, palette.accent.fade(0.85))?;
                     }
@@ -1176,6 +1327,7 @@ pub fn show(
     view.sel = sel;
     view.extra = extras;
     view.column = column;
+    view.folded = folded;
     multi::merge(view);
     view.preedit = preedit;
     Ok(shown)
@@ -1266,6 +1418,28 @@ mod tests {
         assert!(docs.view(v).unwrap().extra.is_empty());
         act(&mut docs, v, Action::Backspace);
         assert_eq!(text(&docs, v), "abc", "nothing to take at the start");
+    }
+
+    #[test]
+    fn down_steps_over_a_fold_and_fold_commands() {
+        let (mut docs, v) = open("fn a() {\n    x;\n    y;\n}\nz");
+        let doc = docs.view(v).unwrap().doc;
+        // what the parser would give for the body
+        docs.doc_mut_for_test(doc).folds = std::iter::once(7..24).collect();
+        caret(&mut docs, v, 2);
+        assert!(fold_op(&mut docs, v, FoldOp::Fold));
+        assert_eq!(docs.view(v).unwrap().folded.first(), Some(&(7..24)));
+        act(&mut docs, v, Action::Move(Motion::Down, false));
+        let text = docs.doc_of(v).unwrap().buffer.text().clone();
+        assert_eq!(
+            text.line_of(docs.view(v).unwrap().sel.head).unwrap(),
+            3,
+            "past the hidden body"
+        );
+        act(&mut docs, v, Action::Move(Motion::Up, false));
+        assert_eq!(text.line_of(docs.view(v).unwrap().sel.head).unwrap(), 0);
+        assert!(fold_op(&mut docs, v, FoldOp::Unfold));
+        assert!(docs.view(v).unwrap().folded.is_empty());
     }
 
     #[test]

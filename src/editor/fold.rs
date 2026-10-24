@@ -67,11 +67,18 @@ pub fn rows(lines: usize, hidden: &Hidden) -> usize {
 }
 
 pub fn is_hidden(line: usize, hidden: &Hidden) -> Option<(usize, usize)> {
-    hidden.iter().copied().find(|&(a, b)| a <= line && line <= b)
+    hidden
+        .iter()
+        .copied()
+        .find(|&(a, b)| a <= line && line <= b)
 }
 
 /// the parser's fold that starts on `line`, the widest one when several do.
-pub fn starting_on(text: &TextSnapshot, folds: &[Range<usize>], line: usize) -> Option<Range<usize>> {
+pub fn starting_on(
+    text: &TextSnapshot,
+    folds: &[Range<usize>],
+    line: usize,
+) -> Option<Range<usize>> {
     folds
         .iter()
         .filter(|f| text.line_of(f.start).ok() == Some(line) && hides(text, f).is_some())

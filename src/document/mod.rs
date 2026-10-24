@@ -38,6 +38,8 @@ pub struct Document {
     pub language: Option<&'static str>,
     /// syntax colours, moved along with edits between parses.
     pub spans: Spans,
+    /// foldable ranges from the parser, moved along with edits.
+    pub folds: Vec<Range<usize>>,
     /// newest revision sent for colouring.
     asked: Option<Revision>,
     /// language server diagnostics, moved along with edits.
@@ -103,6 +105,8 @@ pub struct View {
     pub extra: Vec<Selection>,
     /// a box selection being dragged: its first line and x in text space.
     pub column: Option<(usize, f32)>,
+    /// folded ranges in this view; the lines after each first one are hidden.
+    pub folded: Vec<Range<usize>>,
     /// column up and down aim for.
     pub goal: Option<usize>,
     /// ime text not committed yet, and the caret inside it.
@@ -144,6 +148,7 @@ impl Documents {
                 crlf: false,
                 language: syntax::language_for(path),
                 spans: Spans::new(),
+                folds: Vec::new(),
                 asked: None,
                 diags: Vec::new(),
                 recent: VecDeque::new(),
@@ -216,6 +221,7 @@ impl Documents {
                 sel: Selection::default(),
                 extra: Vec::new(),
                 column: None,
+                folded: Vec::new(),
                 goal: None,
                 preedit: None,
                 reveal: false,
@@ -285,6 +291,10 @@ impl Documents {
         };
         if let Some(d) = self.docs.get_mut(&doc) {
             syntax::follow(&mut d.spans, set);
+            for fold in &mut d.folds {
+                *fold = map_range(set, fold.clone());
+            }
+            d.folds.retain(|f| !f.is_empty());
             for diag in &mut d.diags {
                 diag.range = map_range(set, diag.range.clone());
             }
@@ -296,6 +306,10 @@ impl Documents {
         for (&id, v) in self.views.iter_mut().filter(|(_, v)| v.doc == doc) {
             // others stay put when text lands right at their caret
             let bias = if id == actor { Bias::Right } else { Bias::Left };
+            for fold in &mut v.folded {
+                *fold = map_range(set, fold.clone());
+            }
+            v.folded.retain(|f| !f.is_empty());
             v.sel.anchor = set.map(v.sel.anchor, bias);
             v.sel.head = set.map(v.sel.head, bias);
             for s in &mut v.extra {
@@ -345,6 +359,7 @@ impl Documents {
             && doc.buffer.revision() == parsed.revision
         {
             doc.spans = parsed.spans;
+            doc.folds = parsed.folds;
         }
     }
 
@@ -497,6 +512,11 @@ impl Documents {
                 v.goal = None;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn doc_mut_for_test(&mut self, id: DocumentId) -> &mut Document {
+        self.docs.get_mut(&id).expect("document")
     }
 
     pub fn view(&self, id: ViewId) -> Option<&View> {
@@ -788,6 +808,7 @@ mod tests {
             doc: a,
             revision: old,
             spans: vec![(0..2, sylven::HighlightKind::Keyword)],
+            folds: Vec::new(),
         });
         assert!(docs.doc(a).unwrap().spans.is_empty(), "stale parse dropped");
         let now = docs.wanting_colours()[0].2.revision();
@@ -795,6 +816,7 @@ mod tests {
             doc: a,
             revision: now,
             spans: vec![(1..3, sylven::HighlightKind::Keyword)],
+            folds: Vec::new(),
         });
         assert_eq!(docs.doc(a).unwrap().spans.len(), 1);
     }

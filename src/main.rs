@@ -28,7 +28,7 @@ use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
 use aurea::{AureaResult, Container, Window};
 
 use crate::app::{App, Command, Dialog};
-use crate::editor::{CaretOp, LineOp};
+use crate::editor::{CaretOp, FoldOp, LineOp};
 use crate::lang::Lang;
 use crate::workbench::panels::Panel;
 
@@ -271,6 +271,11 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut go, "Previous Tab", Command::PrevTab)?;
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
     add(&mut view, "Command Palette", Command::Commands)?;
+    view.add_separator()?;
+    add(&mut view, "Fold", Command::Fold(FoldOp::Fold))?;
+    add(&mut view, "Unfold", Command::Fold(FoldOp::Unfold))?;
+    add(&mut view, "Fold All", Command::Fold(FoldOp::FoldAll))?;
+    add(&mut view, "Unfold All", Command::Fold(FoldOp::UnfoldAll))?;
     view.add_separator()?;
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;

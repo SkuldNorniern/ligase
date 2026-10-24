@@ -18,7 +18,7 @@ use crate::completion::{self, Popup};
 use crate::document::{self, DocumentId, Documents, ViewId};
 use crate::editor::cursor::Selection;
 use crate::editor::find::{self, Bar, Mode};
-use crate::editor::{self, CaretOp, LineOp, input};
+use crate::editor::{self, CaretOp, FoldOp, LineOp, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
@@ -62,6 +62,7 @@ pub enum Command {
     SelectAll,
     Line(LineOp),
     Caret(CaretOp),
+    Fold(FoldOp),
     Find,
     Replace,
     FindNext,
@@ -116,6 +117,10 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Select All Matches", Command::Caret(CaretOp::SelectMatches)),
     ("Add Caret Above", Command::Caret(CaretOp::AddAbove)),
     ("Add Caret Below", Command::Caret(CaretOp::AddBelow)),
+    ("Fold", Command::Fold(FoldOp::Fold)),
+    ("Unfold", Command::Fold(FoldOp::Unfold)),
+    ("Fold All", Command::Fold(FoldOp::FoldAll)),
+    ("Unfold All", Command::Fold(FoldOp::UnfoldAll)),
     ("Find", Command::Find),
     ("Replace", Command::Replace),
     ("Find Next", Command::FindNext),
@@ -666,6 +671,12 @@ impl App {
                     self.ui.focus(Id::Editor(v), 1);
                     self.last_editor = Some(v);
                 }
+            }
+            Command::Fold(op) => {
+                if let Some(view) = focus.or(self.last_editor) {
+                    editor::fold_op(&mut self.docs, view, op);
+                }
+                return;
             }
             Command::Caret(op) => {
                 if let Some(view) = focus {
@@ -1859,6 +1870,14 @@ fn keymap() -> Keymap<Command> {
         )
         .bind(Chord::command(KeyCode::L), Command::Line(LineOp::Select))
         .bind(Chord::command(KeyCode::D), Command::Caret(CaretOp::AddNext))
+        .bind(
+            Chord::command(KeyCode::LeftBracket).shift(),
+            Command::Fold(FoldOp::Fold),
+        )
+        .bind(
+            Chord::command(KeyCode::RightBracket).shift(),
+            Command::Fold(FoldOp::Unfold),
+        )
         .bind(
             Chord::command(KeyCode::L).shift(),
             Command::Caret(CaretOp::SelectMatches),
