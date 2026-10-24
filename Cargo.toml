@@ -12,5 +12,5 @@ resolvase = { path = "../resolvase" }
 vanta = { path = "../vanta" }
 toml = "1"
 serde_json = "1"
-sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
-sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "dc450f21266da1c07d8e6899fadad4d13ceb7ff6" }
+sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "7c22ed94eb5fa60e3e325de06bc3a3a1fefd51e8" }
+sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "7c22ed94eb5fa60e3e325de06bc3a3a1fefd51e8" }
