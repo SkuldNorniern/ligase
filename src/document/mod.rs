@@ -101,6 +101,8 @@ pub struct View {
     pub sel: Selection,
     /// more carets, past the main one; empty most of the time.
     pub extra: Vec<Selection>,
+    /// a box selection being dragged: its first line and x in text space.
+    pub column: Option<(usize, f32)>,
     /// column up and down aim for.
     pub goal: Option<usize>,
     /// ime text not committed yet, and the caret inside it.
@@ -213,6 +215,7 @@ impl Documents {
                 caret_line: None,
                 sel: Selection::default(),
                 extra: Vec::new(),
+                column: None,
                 goal: None,
                 preedit: None,
                 reveal: false,

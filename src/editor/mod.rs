@@ -803,6 +803,7 @@ pub fn show(
     }
     let mut sel = view.sel;
     let mut extras = view.extra.clone();
+    let mut column = view.column;
     let mut preedit = view.preedit.clone();
     let mut hscroll = view.hscroll;
     let seen_line = view.caret_line;
@@ -844,9 +845,22 @@ pub fn show(
                 lay(text, span(text, line)).offset_at(ui, &font, at.x - body_x)
             };
             let mut pull = 0.0;
+            let line_at_y = |y: f32| {
+                ((y - content.y) / line_h)
+                    .floor()
+                    .clamp(0.0, (lines - 1) as f32) as usize
+            };
+            if !input.held {
+                column = None;
+            }
             if let Some(press) = ui.press(Id::Editor(id), 1) {
                 let at = hit_test(ui, press.at);
-                if look.ctrl && press.clicks == 1 && !press.shift {
+                if look.alt && press.shift && press.clicks == 1 {
+                    // alt, shift and a drag: a box, one selection a line
+                    column = Some((line_at_y(press.at.y), press.at.x - body_x));
+                    extras.clear();
+                    sel = Selection::caret(at);
+                } else if look.ctrl && press.clicks == 1 && !press.shift {
                     extras.clear();
                     sel = Selection::caret(at);
                     shown.definition = true;
@@ -874,7 +888,28 @@ pub fn show(
             } else if input.held
                 && let Some(at) = ui.pointer()
             {
-                sel.head = hit_test(ui, at);
+                if let Some((from_line, from_x)) = column {
+                    let to_line = line_at_y(at.y);
+                    let to_x = at.x - body_x;
+                    let mut boxed = Vec::new();
+                    for line in from_line.min(to_line)..=from_line.max(to_line) {
+                        let laid = lay(text, span(text, line));
+                        boxed.push(Selection {
+                            anchor: laid.offset_at(ui, &font, from_x),
+                            head: laid.offset_at(ui, &font, to_x),
+                        });
+                    }
+                    // the main one is where the pointer is
+                    let main = if to_line >= from_line {
+                        boxed.len() - 1
+                    } else {
+                        0
+                    };
+                    sel = boxed.remove(main);
+                    extras = boxed;
+                } else {
+                    sel.head = hit_test(ui, at);
+                }
                 // past an edge the view follows, faster the further out
                 let above = seen.y - at.y;
                 let below = at.y - (seen.y + seen.height);
@@ -1137,6 +1172,7 @@ pub fn show(
     view.caret_line = Some(text.line_of(sel.head).unwrap_or(0));
     view.sel = sel;
     view.extra = extras;
+    view.column = column;
     multi::merge(view);
     view.preedit = preedit;
     Ok(shown)
