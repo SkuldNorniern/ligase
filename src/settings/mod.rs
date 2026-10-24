@@ -62,6 +62,12 @@ pub struct Settings {
     /// brackets and quotes typed in pairs.
     pub auto_pairs: bool,
     pub terminal_size: f32,
+    /// spaces and tabs at line ends go when saving.
+    pub trim_trailing_whitespace: bool,
+    /// a saved file ends in a line break.
+    pub final_newline: bool,
+    /// files with edits are saved when the window loses focus.
+    pub save_on_focus_loss: bool,
 }
 
 impl Default for Settings {
@@ -83,6 +89,9 @@ impl Default for Settings {
             word_highlight: true,
             auto_pairs: true,
             terminal_size: 13.0,
+            trim_trailing_whitespace: false,
+            final_newline: false,
+            save_on_focus_loss: false,
         }
     }
 }
@@ -113,6 +122,9 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # word_highlight = true
 # auto_pairs = true
 # terminal_size = 13
+# trim_trailing_whitespace = false
+# final_newline = false
+# save_on_focus_loss = false
 "#;
 
 /// reads settings from `text`. unknown keys and bad values are skipped;
@@ -199,8 +211,15 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some(n) => out.terminal_size = n,
             None => return false,
         },
-        "caret_blink" | "smooth_caret" | "current_line" | "indent_guides" | "word_highlight"
-        | "auto_pairs" => {
+        "caret_blink"
+        | "smooth_caret"
+        | "current_line"
+        | "indent_guides"
+        | "word_highlight"
+        | "auto_pairs"
+        | "trim_trailing_whitespace"
+        | "final_newline"
+        | "save_on_focus_loss" => {
             let Some(on) = value.as_bool() else {
                 return false;
             };
@@ -210,6 +229,9 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
                 "current_line" => &mut out.current_line,
                 "indent_guides" => &mut out.indent_guides,
                 "word_highlight" => &mut out.word_highlight,
+                "trim_trailing_whitespace" => &mut out.trim_trailing_whitespace,
+                "final_newline" => &mut out.final_newline,
+                "save_on_focus_loss" => &mut out.save_on_focus_loss,
                 _ => &mut out.auto_pairs,
             };
             *slot = on;

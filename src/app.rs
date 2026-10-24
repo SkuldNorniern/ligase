@@ -87,6 +87,7 @@ pub enum Command {
     Commands,
     GotoSymbol,
     OpenSettings,
+    ReopenClosed,
     CloseTab,
     NextTab,
     PrevTab,
@@ -101,6 +102,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Save As", Command::SaveAs),
     ("Save All", Command::SaveAll),
     ("Close Tab", Command::CloseTab),
+    ("Reopen Closed Tab", Command::ReopenClosed),
     ("Next Tab", Command::NextTab),
     ("Previous Tab", Command::PrevTab),
     ("Undo", Command::Undo),
@@ -229,6 +231,8 @@ pub struct App {
     /// a dialog main should show after this frame.
     dialog: Option<Dialog>,
     settings: Settings,
+    /// files of tabs closed lately, newest last, for reopen.
+    closed: Vec<PathBuf>,
     /// the theme in force is dark.
     dark: bool,
     edit_opts: editor::EditOpts,
@@ -287,6 +291,7 @@ impl App {
             typed_at: Instant::now(),
             dialog: None,
             settings: Settings::default(),
+            closed: Vec::new(),
             dark: true,
             edit_opts: editor::EditOpts::default(),
             still: aurea::reduced_motion(),
@@ -347,6 +352,13 @@ impl App {
             // back from another program: files may have changed under us
             self.check_disk();
             self.still = aurea::reduced_motion();
+        }
+        if matches!(event, WindowEvent::Unfocused) && self.settings.save_on_focus_loss {
+            for view in self.docs.dirty_views() {
+                if self.docs.doc_of(view).is_some_and(|d| !d.untitled) {
+                    self.save(view);
+                }
+            }
         }
         if matches!(event, WindowEvent::ThemeChanged { .. })
             && self.settings.theme == ThemeChoice::System
@@ -649,6 +661,14 @@ impl App {
                 }
                 return;
             }
+            Command::ReopenClosed => {
+                if let Some(path) = self.closed.pop() {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                }
+                return;
+            }
             Command::OpenSettings => {
                 let Some(path) = settings::path() else {
                     self.status = self.texts.tr("no config folder for settings").to_owned();
@@ -936,7 +956,21 @@ impl App {
 
     /// a tab asked to close; unsaved work keeps it open.
     fn close_pane(&mut self, pane: PaneId) {
-        match self.bench.close(pane, &mut self.docs) {
+        let path = match self.bench.panels.get(pane) {
+            Some(Panel::Editor(view)) => self
+                .docs
+                .doc_of(view)
+                .filter(|d| !d.untitled)
+                .map(|d| d.path.clone()),
+            _ => None,
+        };
+        let result = self.bench.close(pane, &mut self.docs);
+        if result.is_ok()
+            && let Some(path) = path
+        {
+            self.remember_closed(path);
+        }
+        match result {
             Ok(()) => {
                 self.layout_dirty = true;
                 if self
@@ -948,6 +982,15 @@ impl App {
             }
             Err(Refused::Unsaved) => self.dialog = Some(Dialog::Unsaved(Some(pane))),
             Err(Refused::KeepsEditorArea) => {}
+        }
+    }
+
+    /// keeps a closed tab's file for reopen; the last 20, no repeats.
+    fn remember_closed(&mut self, path: PathBuf) {
+        self.closed.retain(|p| *p != path);
+        self.closed.push(path);
+        if self.closed.len() > 20 {
+            self.closed.remove(0);
         }
     }
 
@@ -1507,6 +1550,13 @@ impl App {
             self.dialog = Some(Dialog::SaveAs(view));
             return;
         }
+        let (trim, end) = (
+            self.settings.trim_trailing_whitespace,
+            self.settings.final_newline,
+        );
+        if trim || end {
+            editor::tidy_for_save(&mut self.docs, view, trim, end);
+        }
         let Some((doc, path, text, point)) = self.docs.save_job(view) else {
             return;
         };
@@ -2049,10 +2099,14 @@ impl App {
                 |_| String::new(),
                 |p| format!("Ln {}, Col {}", p.line + 1, p.column + 1),
             );
+        let indent = format!("{} {}", self.texts.tr("Spaces:"), self.settings.tab_size);
+        let eol = if doc.crlf { "CRLF" } else { "LF" };
+        let language = doc.language.unwrap_or("text");
+        let about = format!("{at}    {indent}    UTF-8    {eol}    {language}");
         if errors + warnings == 0 {
-            at
+            about
         } else {
-            format!("E {errors}  W {warnings}   {at}")
+            format!("E {errors}  W {warnings}    {about}")
         }
     }
 
@@ -2098,7 +2152,9 @@ fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> Au
     ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
     let font = ui.theme.font(12.0);
     let inner = rect.inset_xy(10.0, 0.0);
-    let (right, left) = inner.split_right(220.0, 8.0);
+    // the file's facts take what they need, the message the rest
+    let wanted = ui.text_width(place, &font) + 8.0;
+    let (right, left) = inner.split_right(wanted.min(inner.width * 0.6), 8.0);
     ui.text_clipped(message, left, &font, palette.dim, Align::Start)?;
     ui.text(place, right, &font, palette.dim, Align::End)?;
     Ok(())
@@ -2168,6 +2224,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::P).shift(), Command::Commands)
         .bind(Chord::command(KeyCode::O).shift(), Command::GotoSymbol)
         .bind(Chord::command(KeyCode::W), Command::CloseTab)
+        .bind(Chord::command(KeyCode::T).shift(), Command::ReopenClosed)
         .bind(Chord::key(KeyCode::Tab).ctrl(), Command::NextTab)
         .bind(Chord::key(KeyCode::Tab).ctrl().shift(), Command::PrevTab)
         .bind(Chord::command(KeyCode::F), Command::Find)

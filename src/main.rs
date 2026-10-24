@@ -226,6 +226,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut file, "Save As", Command::SaveAs)?;
     add(&mut file, "Save All", Command::SaveAll)?;
     add(&mut file, "Close Tab", Command::CloseTab)?;
+    add(&mut file, "Reopen Closed Tab", Command::ReopenClosed)?;
     let mut edit = bar.add_submenu(a.texts.tr("Edit"))?;
     add(&mut edit, "Undo", Command::Undo)?;
     add(&mut edit, "Redo", Command::Redo)?;

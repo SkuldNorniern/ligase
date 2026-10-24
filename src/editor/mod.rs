@@ -502,6 +502,60 @@ pub fn select_all(docs: &mut Documents, view: ViewId) {
     }
 }
 
+/// tidies a file before it is saved: trailing spaces off, a final line
+/// break on, as the settings say. one undo step; true when it changed.
+pub fn tidy_for_save(docs: &mut Documents, view: ViewId, trim: bool, final_newline: bool) -> bool {
+    let Some((doc, _)) = docs.editable(view) else {
+        return false;
+    };
+    let text = doc.buffer.snapshot();
+    let lb = doc.line_break();
+    let mut edits = Vec::new();
+    if trim {
+        for line in 0..text.line_count() {
+            let Ok(start) = text.line_start(line) else {
+                continue;
+            };
+            let end = cursor::line_end(&text, line);
+            let Ok(body) = text.slice(start..end) else {
+                continue;
+            };
+            let kept = body.trim_end_matches([' ', '\t']).len();
+            if kept < body.len() {
+                edits.push((start + kept..end, String::new()));
+            }
+        }
+    }
+    if final_newline && !text.is_empty() {
+        let ends = text
+            .slice(text.len().saturating_sub(1)..text.len())
+            .is_ok_and(|s| s == "\n");
+        if !ends {
+            edits.push((text.len()..text.len(), lb.to_owned()));
+        }
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    doc.buffer.break_join();
+    // the caret stays where it was, or as near as the text allows
+    let keep = docs.view(view).map(|v| (v.sel, v.extra.clone()));
+    let done = docs.edit(view, edits, false);
+    if let (true, Some((sel, extra))) = (done, keep)
+        && let Some((doc, v)) = docs.editable(view)
+    {
+        let len = doc.buffer.len();
+        let clamp = move |s: Selection| Selection {
+            anchor: s.anchor.min(len),
+            head: s.head.min(len),
+        };
+        v.extra = extra.into_iter().map(clamp).collect();
+        v.sel = clamp(sel);
+        multi::merge(v);
+    }
+    done
+}
+
 /// a fold command the app asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FoldOp {
@@ -1607,6 +1661,16 @@ mod tests {
             Selection::caret(0),
             "end is inside"
         );
+    }
+
+    #[test]
+    fn tidy_trims_and_ends_the_file() {
+        let (mut docs, v) = open("a  \nb\t\nc");
+        assert!(tidy_for_save(&mut docs, v, true, true));
+        assert_eq!(text(&docs, v), "a\nb\nc\n");
+        assert!(!tidy_for_save(&mut docs, v, true, true), "already tidy");
+        assert!(docs.undo(v));
+        assert_eq!(text(&docs, v), "a  \nb\t\nc", "one undo step");
     }
 
     #[test]

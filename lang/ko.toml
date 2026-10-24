@@ -68,6 +68,8 @@
 "Complete" = "자동 완성"
 "Fold" = "접기"
 "Settings" = "설정"
+"Reopen Closed Tab" = "닫은 탭 다시 열기"
+"Spaces:" = "공백:"
 "no config folder for settings" = "설정을 둘 폴더가 없어요"
 "settings skipped" = "설정에서 건너뜀"
 "settings applied" = "설정 적용됨"
