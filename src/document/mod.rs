@@ -40,6 +40,8 @@ pub struct Document {
     pub spans: Spans,
     /// foldable ranges from the parser, moved along with edits.
     pub folds: Vec<Range<usize>>,
+    /// named things from the parser, moved along with edits.
+    pub symbols: Vec<syntax::Symbol>,
     /// newest revision sent for colouring.
     asked: Option<Revision>,
     /// language server diagnostics, moved along with edits.
@@ -149,6 +151,7 @@ impl Documents {
                 language: syntax::language_for(path),
                 spans: Spans::new(),
                 folds: Vec::new(),
+                symbols: Vec::new(),
                 asked: None,
                 diags: Vec::new(),
                 recent: VecDeque::new(),
@@ -295,6 +298,9 @@ impl Documents {
                 *fold = map_range(set, fold.clone());
             }
             d.folds.retain(|f| !f.is_empty());
+            for symbol in &mut d.symbols {
+                symbol.at = set.map(symbol.at, Bias::Right);
+            }
             for diag in &mut d.diags {
                 diag.range = map_range(set, diag.range.clone());
             }
@@ -360,6 +366,7 @@ impl Documents {
         {
             doc.spans = parsed.spans;
             doc.folds = parsed.folds;
+            doc.symbols = parsed.symbols;
         }
     }
 
@@ -809,6 +816,7 @@ mod tests {
             revision: old,
             spans: vec![(0..2, sylven::HighlightKind::Keyword)],
             folds: Vec::new(),
+            symbols: Vec::new(),
         });
         assert!(docs.doc(a).unwrap().spans.is_empty(), "stale parse dropped");
         let now = docs.wanting_colours()[0].2.revision();
@@ -817,6 +825,7 @@ mod tests {
             revision: now,
             spans: vec![(1..3, sylven::HighlightKind::Keyword)],
             folds: Vec::new(),
+            symbols: Vec::new(),
         });
         assert_eq!(docs.doc(a).unwrap().spans.len(), 1);
     }

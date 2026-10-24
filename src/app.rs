@@ -84,6 +84,7 @@ pub enum Command {
     SaveAll,
     QuickOpen,
     Commands,
+    GotoSymbol,
     CloseTab,
     NextTab,
     PrevTab,
@@ -127,6 +128,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Find Previous", Command::FindPrev),
     ("Find in Files", Command::FindInFiles),
     ("Go to Line", Command::GotoLine),
+    ("Go to Symbol", Command::GotoSymbol),
     ("Go to Definition", Command::GotoDefinition),
     ("Show Hover", Command::ShowHover),
     ("Complete", Command::Complete),
@@ -632,6 +634,11 @@ impl App {
                 }
                 return;
             }
+            Command::GotoSymbol => {
+                self.palette.open(Kind::Symbols);
+                self.ui.focus(Id::PaletteField, 0);
+                return;
+            }
             Command::QuickOpen | Command::Commands => {
                 if command == Command::QuickOpen {
                     self.palette.open(Kind::Files);
@@ -962,7 +969,38 @@ impl App {
                     self.run(command);
                 }
             }
+            Kind::Symbols => {
+                let at = self.palette.symbol_at.get(item).copied();
+                if let (Some(view), Some(at)) = (editor, at)
+                    && let Some(v) = self.docs.view_mut(view)
+                {
+                    v.sel = editor::cursor::Selection::caret(at);
+                    v.extra.clear();
+                    v.reveal = true;
+                }
+            }
         }
+    }
+
+    /// the `@` list: symbols of the file in the last editor, in file order.
+    fn fill_symbols(&mut self) {
+        if self.palette.wanted().0 != Kind::Symbols {
+            return;
+        }
+        let symbols = self
+            .last_editor
+            .and_then(|v| self.docs.doc_of(v))
+            .map(|d| d.symbols.clone())
+            .unwrap_or_default();
+        let at = symbols.iter().map(|s| s.at).collect();
+        let items = symbols
+            .into_iter()
+            .map(|s| palette::Item {
+                text: s.name,
+                note: s.kind.to_owned(),
+            })
+            .collect();
+        self.palette.set_symbols(items, at);
     }
 
     /// opens the bar on `view`. find starts from the selection, when it is
@@ -1574,6 +1612,7 @@ impl App {
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
         self.refilter_completion();
+        self.fill_symbols();
         let mut picked_completion = None;
         let mut found = None;
         let mut blink = None;
@@ -1893,6 +1932,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
         .bind(Chord::command(KeyCode::P), Command::QuickOpen)
         .bind(Chord::command(KeyCode::P).shift(), Command::Commands)
+        .bind(Chord::command(KeyCode::O).shift(), Command::GotoSymbol)
         .bind(Chord::command(KeyCode::W), Command::CloseTab)
         .bind(Chord::key(KeyCode::Tab).ctrl(), Command::NextTab)
         .bind(Chord::key(KeyCode::Tab).ctrl().shift(), Command::PrevTab)

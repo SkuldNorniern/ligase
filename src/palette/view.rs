@@ -105,6 +105,7 @@ pub fn show(
     let (field, list) = inner.split_top(FIELD, PAD);
     let hint = match palette.kind {
         Some(Kind::Commands) => texts.tr("type a command"),
+        Some(Kind::Symbols) => texts.tr("a name in this file"),
         _ => texts.tr("file name, > for commands, : for a line"),
     };
     let typed = TextField::new(&mut palette.query)
@@ -175,7 +176,7 @@ pub fn show(
         let split = match wanted {
             // the folder part of a path is dim
             Kind::Files => item.text.rfind('/').map_or(0, |i| i + 1),
-            Kind::Commands => item.text.len(),
+            Kind::Commands | Kind::Symbols => item.text.len(),
         };
         let (plain, rest) = if wanted == Kind::Files {
             (colours.dim, colours.text)

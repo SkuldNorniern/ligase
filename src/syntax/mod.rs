@@ -17,6 +17,9 @@ use crate::document::DocumentId;
 pub const MAX_COLOURED: usize = 4 * 1024 * 1024;
 
 /// coloured spans of one document, sorted by start.
+/// symbols kept per file.
+const MAX_SYMBOLS: usize = 10_000;
+
 pub type Spans = Vec<(Range<usize>, HighlightKind)>;
 
 /// sylven language for a file, by its extension.
@@ -82,6 +85,17 @@ pub struct Parsed {
     pub spans: Spans,
     /// foldable ranges, sorted by start.
     pub folds: Vec<Range<usize>>,
+    pub symbols: Vec<Symbol>,
+}
+
+/// a named thing in a file, for go to symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    /// a short tag like `fn` or `struct`.
+    pub kind: &'static str,
+    /// where its name starts.
+    pub at: usize,
 }
 
 pub struct Syntax {
@@ -155,6 +169,7 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
     let revision = ask.text.revision();
     let mut spans = Spans::new();
     let mut folds = Vec::new();
+    let mut symbols = Vec::new();
     if ask.text.len() <= MAX_COLOURED {
         let source = sylven::TextSnapshot::new(
             sylven::DocumentId(0),
@@ -183,6 +198,18 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
                 .filter(|f| f.start < f.end && f.end <= ask.text.len())
                 .collect();
             folds.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
+            symbols = result
+                .features
+                .symbols
+                .iter()
+                .filter(|s| s.name_range.start().to_usize() <= ask.text.len())
+                .take(MAX_SYMBOLS)
+                .map(|s| Symbol {
+                    name: s.name.chars().take(200).collect(),
+                    kind: s.kind.label(),
+                    at: s.name_range.start().to_usize(),
+                })
+                .collect();
         }
     }
     Parsed {
@@ -190,6 +217,7 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
         revision,
         spans,
         folds,
+        symbols,
     }
 }
 

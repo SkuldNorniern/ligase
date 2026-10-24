@@ -14,6 +14,8 @@ const MAX_SHOWN: usize = 300;
 pub enum Kind {
     Files,
     Commands,
+    /// named things in the editor's file, `@` in front.
+    Symbols,
 }
 
 /// one row: what is shown, and a note on the right like a shortcut.
@@ -39,6 +41,9 @@ pub struct Palette {
     /// files are being listed on the worker.
     pub listing: bool,
     pub commands: Vec<Item>,
+    /// symbols of the file in the editor, and where each one starts.
+    pub symbols: Vec<Item>,
+    pub symbol_at: Vec<usize>,
     pub shown: Vec<Shown>,
     pub pick: usize,
     /// first row in sight.
@@ -61,10 +66,10 @@ impl Palette {
             self.opened = true;
         }
         self.kind = Some(kind);
-        self.query = if kind == Kind::Commands {
-            ">".to_owned()
-        } else {
-            String::new()
+        self.query = match kind {
+            Kind::Commands => ">".to_owned(),
+            Kind::Symbols => "@".to_owned(),
+            Kind::Files => String::new(),
         };
         self.pick = 0;
         self.top = 0;
@@ -82,11 +87,24 @@ impl Palette {
         self.generation += 1;
     }
 
-    /// the list asked for by the query: a `>` in front means commands.
+    /// new symbols for `@`; rows made from the old ones are made again.
+    pub fn set_symbols(&mut self, symbols: Vec<Item>, at: Vec<usize>) {
+        if self.symbols != symbols {
+            self.symbols = symbols;
+            self.symbol_at = at;
+            self.generation += 1;
+        }
+    }
+
+    /// the list asked for by the query: `>` in front means commands, `@`
+    /// the symbols of the open file.
     pub fn wanted(&self) -> (Kind, &str) {
-        match self.query.strip_prefix('>') {
-            Some(rest) => (Kind::Commands, rest.trim_start()),
-            None => (Kind::Files, self.query.trim()),
+        if let Some(rest) = self.query.strip_prefix('>') {
+            (Kind::Commands, rest.trim_start())
+        } else if let Some(rest) = self.query.strip_prefix('@') {
+            (Kind::Symbols, rest.trim_start())
+        } else {
+            (Kind::Files, self.query.trim())
         }
     }
 
@@ -94,6 +112,7 @@ impl Palette {
         match kind {
             Kind::Files => &self.files,
             Kind::Commands => &self.commands,
+            Kind::Symbols => &self.symbols,
         }
     }
 

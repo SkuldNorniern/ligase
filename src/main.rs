@@ -264,6 +264,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut edit, "Delete Line", Command::Line(LineOp::Delete))?;
     let mut go = bar.add_submenu(a.texts.tr("Go"))?;
     add(&mut go, "Go to Line", Command::GotoLine)?;
+    add(&mut go, "Go to Symbol", Command::GotoSymbol)?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
     add(&mut go, "Show Hover", Command::ShowHover)?;
     go.add_separator()?;
