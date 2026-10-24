@@ -73,6 +73,10 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    NewFile,
+    OpenFile,
+    SaveAs,
+    SaveAll,
     QuickOpen,
     Commands,
     CloseTab,
@@ -83,7 +87,11 @@ pub enum Command {
 /// every command by name, for the palette.
 const COMMANDS: &[(&str, Command)] = &[
     ("Quick Open", Command::QuickOpen),
+    ("New File", Command::NewFile),
+    ("Open File", Command::OpenFile),
     ("Save", Command::Save),
+    ("Save As", Command::SaveAs),
+    ("Save All", Command::SaveAll),
     ("Close Tab", Command::CloseTab),
     ("Next Tab", Command::NextTab),
     ("Previous Tab", Command::PrevTab),
@@ -120,15 +128,27 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Reset Layout", Command::ResetLayout),
 ];
 
+/// a native dialog to show once the frame is done; main shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialog {
+    Open,
+    SaveAs(ViewId),
+}
+
 /// what the worker hands back.
 enum Done {
     Listed(PathBuf, Result<Vec<(String, bool)>, String>),
     Loaded(DocumentId, Result<String, String>, Option<document::Stamp>),
     /// stamps of open files now, for the ones that changed.
     Disk(Vec<(DocumentId, Option<document::Stamp>)>),
-    Reloaded(DocumentId, Result<String, String>, Option<document::Stamp>),
+    Reloaded(
+        DocumentId,
+        Revision,
+        Result<String, String>,
+        Option<document::Stamp>,
+    ),
     /// the file changed on disk since it was read; the save did not write.
-    Conflict(DocumentId, String),
+    Conflict(DocumentId, String, Option<document::Stamp>),
     Session(Option<String>),
     Saved(Result<(), String>),
     Wrote(
@@ -172,6 +192,10 @@ pub struct App {
     typed_at: Instant,
     /// alt held, from the last event that said; alt and a click add a caret.
     alt_down: bool,
+    /// ctrl (cmd on mac) held, the same way; ctrl and a click go to definition.
+    ctrl_down: bool,
+    /// a dialog main should show after this frame.
+    dialog: Option<Dialog>,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -217,6 +241,8 @@ impl App {
             last_editor: None,
             typed_at: Instant::now(),
             alt_down: false,
+            ctrl_down: false,
+            dialog: None,
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -271,8 +297,18 @@ impl App {
         match event {
             WindowEvent::KeyInput { modifiers, .. }
             | WindowEvent::MouseButton { modifiers, .. }
-            | WindowEvent::MouseMove { modifiers, .. } => self.alt_down = modifiers.alt,
-            WindowEvent::Unfocused => self.alt_down = false,
+            | WindowEvent::MouseMove { modifiers, .. } => {
+                self.alt_down = modifiers.alt;
+                self.ctrl_down = if cfg!(target_os = "macos") {
+                    modifiers.meta
+                } else {
+                    modifiers.ctrl
+                };
+            }
+            WindowEvent::Unfocused => {
+                self.alt_down = false;
+                self.ctrl_down = false;
+            }
             _ => {}
         }
         if self.ui.popup_open() {
@@ -442,9 +478,35 @@ impl App {
         self.typed_at = Instant::now();
         match command {
             Command::Save => {
-                if let Some(view) = focus {
+                if let Some(view) = focus.or(self.last_editor) {
                     self.save(view);
                 }
+                return;
+            }
+            Command::SaveAs => {
+                if let Some(view) = focus.or(self.last_editor) {
+                    self.dialog = Some(Dialog::SaveAs(view));
+                }
+                return;
+            }
+            Command::SaveAll => {
+                let views = self.docs.dirty_views();
+                for view in views {
+                    if self.docs.doc_of(view).is_some_and(|d| !d.untitled) {
+                        self.save(view);
+                    }
+                }
+                return;
+            }
+            Command::NewFile => {
+                let doc = self.docs.new_untitled();
+                let view = self.docs.add_view(doc);
+                self.bench.show_editor(view);
+                self.ui.focus(Id::Editor(view), 1);
+                self.last_editor = Some(view);
+            }
+            Command::OpenFile => {
+                self.dialog = Some(Dialog::Open);
                 return;
             }
             Command::Undo | Command::Redo => {
@@ -936,7 +998,78 @@ impl App {
             .run(move || Done::Saved(workbench::write_session(&path, &text)))
     }
 
+    /// the dialog to show after this frame, once.
+    pub fn take_dialog(&mut self) -> Option<Dialog> {
+        self.dialog.take()
+    }
+
+    /// default name and folder for a save as dialog.
+    pub fn save_as_start(&self, view: ViewId) -> (String, PathBuf) {
+        let root = self.explorer.root().to_path_buf();
+        self.docs.doc_of(view).map_or_else(
+            || (String::new(), root.clone()),
+            |d| {
+                let folder = if d.untitled {
+                    root.clone()
+                } else {
+                    d.path
+                        .parent()
+                        .map_or_else(|| root.clone(), Path::to_path_buf)
+                };
+                (d.name(), folder)
+            },
+        )
+    }
+
+    pub fn root(&self) -> &Path {
+        self.explorer.root()
+    }
+
+    /// what the user picked in a dialog; empty when cancelled.
+    pub fn dialog_done(&mut self, dialog: Dialog, picked: Vec<PathBuf>) {
+        match dialog {
+            Dialog::Open => {
+                for path in picked {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                }
+            }
+            Dialog::SaveAs(view) => {
+                let Some(path) = picked.into_iter().next() else {
+                    return;
+                };
+                let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
+                    return;
+                };
+                let taken = self
+                    .docs
+                    .all_with_ids()
+                    .any(|(id, d)| id != doc && d.path == path);
+                if taken {
+                    self.status = self.texts.tr("that file is open in another tab").to_owned();
+                    return;
+                }
+                self.docs.set_path(doc, &path);
+                self.layout_dirty = true;
+                self.save_with(view, true);
+            }
+        }
+    }
+
     fn save(&mut self, view: ViewId) {
+        self.save_with(view, false);
+    }
+
+    /// saves `view`'s document. the worker checks the file is still what
+    /// was read or what the user was warned about; `force` skips that, for
+    /// a path just picked in save as (the dialog asked already).
+    fn save_with(&mut self, view: ViewId, force: bool) {
+        if self.docs.doc_of(view).is_some_and(|d| d.untitled) {
+            // no file yet: ask where first
+            self.dialog = Some(Dialog::SaveAs(view));
+            return;
+        }
         let Some((doc, path, text, point)) = self.docs.save_job(view) else {
             return;
         };
@@ -944,21 +1077,11 @@ impl App {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let Some(d) = self.docs.doc(doc) else { return };
-        let expected = d.disk;
-        let force = d.overwrite;
-        if d.conflict && !d.overwrite {
-            // the first save after an outside change only warns
-            self.status = format!(
-                "{name}: {}",
-                self.texts
-                    .tr("changed on disk, save again to write over it")
-            );
-            self.docs.arm_overwrite(doc);
-            return;
-        }
+        let expected = d.overwrite.unwrap_or(d.disk);
         let job = move || {
-            if !force && expected.is_some() && document::stamp(&path) != expected {
-                return Done::Conflict(doc, name);
+            let now = document::stamp(&path);
+            if !force && now != expected {
+                return Done::Conflict(doc, name, now);
             }
             let wrote = document::write_atomic(&path, &text).map(|()| document::stamp(&path));
             Done::Wrote(doc, name, point, wrote)
@@ -1006,9 +1129,12 @@ impl App {
                 continue;
             }
             if self.docs.changed_on_disk(id) {
+                let Some(revision) = self.docs.doc(id).map(|d| d.buffer.revision()) else {
+                    continue;
+                };
                 self.jobs.run(move || {
                     let disk = document::stamp(&path);
-                    Done::Reloaded(id, document::read_text(&path), disk)
+                    Done::Reloaded(id, revision, document::read_text(&path), disk)
                 });
             } else {
                 self.status = format!(
@@ -1107,18 +1233,25 @@ impl App {
                     self.docs.set_disk(doc, disk);
                 }
                 Done::Disk(stamps) => self.disk_checked(stamps),
-                Done::Reloaded(doc, Ok(text), disk) => {
+                Done::Reloaded(doc, revision, Ok(text), disk) => {
+                    let now = self.docs.doc(doc).map(|d| d.buffer.revision());
+                    if now != Some(revision) {
+                        // the text moved on while the file was read; a
+                        // later focus looks again
+                        continue;
+                    }
                     let name = self.docs.doc(doc).map(document::Document::name);
                     self.docs.reload(doc, &text, disk);
                     if let Some(name) = name {
                         self.status = format!("{} {name}", self.texts.tr("reloaded"));
                     }
                 }
-                Done::Reloaded(_, Err(why), _) => self.status = why,
-                Done::Conflict(doc, name) => {
-                    // this is the warning; the next save writes over it
+                Done::Reloaded(_, _, Err(why), _) => self.status = why,
+                Done::Conflict(doc, name, now) => {
+                    // this is the warning; the next save writes over what
+                    // is there now, if nothing else changes it first
                     self.docs.mark_conflict(doc);
-                    self.docs.arm_overwrite(doc);
+                    self.docs.arm_overwrite(doc, now);
                     self.status = format!(
                         "{name}: {}",
                         self.texts
@@ -1167,6 +1300,9 @@ impl App {
         let mut fresh: Vec<(DocumentId, PathBuf)> = Vec::new();
         let docs = &mut self.docs;
         let bench = Workbench::restore(&text, |path| {
+            if path.as_os_str().is_empty() {
+                return None;
+            }
             let (doc, new) = docs.open(path);
             let view = docs.add_view(doc);
             made.push(view);
@@ -1234,6 +1370,8 @@ impl App {
         let idle = self.typed_at.elapsed();
         let zoom = self.zoom;
         let alt = self.alt_down;
+        let ctrl = self.ctrl_down;
+        let mut definition = None;
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
         let mut bar_ask = None;
         let palette_ask;
@@ -1282,6 +1420,7 @@ impl App {
                             idle,
                             hover,
                             alt,
+                            ctrl,
                             found,
                             current,
                         };
@@ -1294,6 +1433,9 @@ impl App {
                         }
                         if shown.pressed {
                             pressed.push(view);
+                        }
+                        if shown.definition {
+                            definition = Some(view);
                         }
                     }
                     if let Some(v) = docs.view_mut(view) {
@@ -1339,6 +1481,11 @@ impl App {
         }
         if let Some(ask) = palette_ask {
             self.palette_ask(ask);
+        }
+        if let Some(view) = definition
+            && !self.lsp.definition(&self.docs, view)
+        {
+            self.status = self.texts.tr("no language server for this yet").to_owned();
         }
         self.shell_focus = shell_focus;
         match found {
@@ -1465,6 +1612,9 @@ fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> Au
 fn keymap() -> Keymap<Command> {
     let mut map = Keymap::new();
     map.bind(Chord::command(KeyCode::S), Command::Save)
+        .bind(Chord::command(KeyCode::S).shift(), Command::SaveAs)
+        .bind(Chord::command(KeyCode::N), Command::NewFile)
+        .bind(Chord::command(KeyCode::O), Command::OpenFile)
         .bind(Chord::command(KeyCode::Z), Command::Undo)
         .bind(Chord::command(KeyCode::Z).shift(), Command::Redo)
         .bind(Chord::command(KeyCode::Y), Command::Redo)

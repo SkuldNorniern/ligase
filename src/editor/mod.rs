@@ -464,6 +464,8 @@ pub struct Shown {
     pub pressed: bool,
     /// when the caret blinks next; none once it stays on.
     pub blink: Option<Duration>,
+    /// ctrl and a click: the app asks for the definition at the caret.
+    pub definition: bool,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -673,6 +675,8 @@ pub struct Look<'a> {
     pub hover: Option<&'a str>,
     /// alt is held: a click adds a caret.
     pub alt: bool,
+    /// ctrl (cmd on mac) is held: a click goes to the definition.
+    pub ctrl: bool,
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
@@ -842,7 +846,11 @@ pub fn show(
             let mut pull = 0.0;
             if let Some(press) = ui.press(Id::Editor(id), 1) {
                 let at = hit_test(ui, press.at);
-                if look.alt && press.clicks == 1 {
+                if look.ctrl && press.clicks == 1 && !press.shift {
+                    extras.clear();
+                    sel = Selection::caret(at);
+                    shown.definition = true;
+                } else if look.alt && press.clicks == 1 {
                     // alt and a click: one more caret
                     if extras.len() < multi::MAX_CARETS {
                         extras.push(sel);

@@ -48,8 +48,11 @@ pub struct Document {
     pub disk: Option<Stamp>,
     /// the file changed on disk while this had unsaved edits.
     pub conflict: bool,
-    /// the next save writes over the outside change anyway.
-    pub overwrite: bool,
+    /// the user was warned the file on disk is this now (none: gone); the
+    /// next save writes over it only while it still is.
+    pub overwrite: Option<Option<Stamp>>,
+    /// made with new file and never saved: `path` is only a name.
+    pub untitled: bool,
 }
 
 /// what a file on disk looked like, to notice outside changes.
@@ -144,10 +147,59 @@ impl Documents {
                 recent: VecDeque::new(),
                 disk: None,
                 conflict: false,
-                overwrite: false,
+                overwrite: None,
+                untitled: false,
             },
         );
         (id, true)
+    }
+
+    /// a new empty document with no file yet, named `Untitled-n`.
+    pub fn new_untitled(&mut self) -> DocumentId {
+        let n = (1..)
+            .find(|n| {
+                let name = format!("Untitled-{n}");
+                !self
+                    .docs
+                    .values()
+                    .any(|d| d.untitled && d.path == Path::new(&name))
+            })
+            .unwrap_or(1);
+        let (id, _) = self.open(Path::new(&format!("Untitled-{n}")));
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.untitled = true;
+            doc.load = Load::Ready;
+        }
+        id
+    }
+
+    /// gives the document its real file, from save as.
+    pub fn set_path(&mut self, id: DocumentId, path: &Path) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.path = path.to_path_buf();
+            doc.language = syntax::language_for(path);
+            doc.untitled = false;
+            doc.disk = None;
+            doc.conflict = false;
+            doc.overwrite = None;
+            doc.spans.clear();
+            doc.asked = None;
+        }
+    }
+
+    /// one view of each document with unsaved edits, for save all.
+    pub fn dirty_views(&self) -> Vec<ViewId> {
+        let mut seen: Vec<DocumentId> = Vec::new();
+        let mut out = Vec::new();
+        let mut views: Vec<(&ViewId, &View)> = self.views.iter().collect();
+        views.sort_by_key(|(id, _)| **id);
+        for (&id, v) in views {
+            if !seen.contains(&v.doc) && self.doc(v.doc).is_some_and(Document::is_dirty) {
+                seen.push(v.doc);
+                out.push(id);
+            }
+        }
+        out
     }
 
     pub fn add_view(&mut self, doc: DocumentId) -> ViewId {
@@ -329,21 +381,21 @@ impl Documents {
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.buffer.mark_saved_at(point);
             doc.conflict = false;
-            doc.overwrite = false;
+            doc.overwrite = None;
         }
     }
 
     pub fn mark_conflict(&mut self, id: DocumentId) {
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.conflict = true;
-            doc.overwrite = false;
         }
     }
 
-    /// the user saw the warning; the next save writes anyway.
-    pub fn arm_overwrite(&mut self, id: DocumentId) {
+    /// the user was warned the file is `seen` now; the next save writes
+    /// over that, and only that.
+    pub fn arm_overwrite(&mut self, id: DocumentId, seen: Option<Stamp>) {
         if let Some(doc) = self.docs.get_mut(&id) {
-            doc.overwrite = true;
+            doc.overwrite = Some(seen);
         }
     }
 
@@ -370,6 +422,8 @@ impl Documents {
         };
         if doc.is_dirty() {
             doc.conflict = true;
+            // a new change: an earlier warning no longer covers it
+            doc.overwrite = None;
             return false;
         }
         true
@@ -558,6 +612,23 @@ pub fn write_atomic(path: &Path, text: &TextSnapshot) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untitled_files_get_free_names_and_a_real_path_later() {
+        let mut docs = Documents::default();
+        let a = docs.new_untitled();
+        let b = docs.new_untitled();
+        assert_eq!(docs.doc(a).unwrap().name(), "Untitled-1");
+        assert_eq!(docs.doc(b).unwrap().name(), "Untitled-2");
+        assert_eq!(docs.doc(a).unwrap().load, Load::Ready);
+        let view = docs.add_view(a);
+        docs.edit(view, vec![(0..0, "fn x() {}".to_owned())], false);
+        assert_eq!(docs.dirty_views(), vec![view]);
+        docs.set_path(a, Path::new("d/x.rs"));
+        let d = docs.doc(a).unwrap();
+        assert!(!d.untitled);
+        assert_eq!(d.language, Some("rust"));
+    }
 
     #[test]
     fn reload_keeps_the_caret_place_and_can_be_undone() {

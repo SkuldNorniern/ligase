@@ -20,12 +20,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::{Rc, Weak};
 
+use aurea::dialog::FileDialog;
 use aurea::elements::{Orientation, Stack};
 use aurea::menu::{MenuItem, SubMenu};
 use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
 use aurea::{AureaResult, Container, Window};
 
-use crate::app::{App, Command};
+use crate::app::{App, Command, Dialog};
 use crate::editor::{CaretOp, LineOp};
 use crate::lang::Lang;
 use crate::workbench::panels::Panel;
@@ -77,6 +78,13 @@ fn run() -> AureaResult<()> {
                 }
             }
             let close = std::mem::take(&mut a.close_now);
+            let dialog = a.take_dialog().map(|d| match d {
+                Dialog::SaveAs(view) => (d, Some(a.save_as_start(view))),
+                Dialog::Open => (d, Some((String::new(), a.root().to_path_buf()))),
+            });
+            if let Some(dialog) = dialog {
+                show_dialog(&drawn, &shown_in_draw, id, dialog);
+            }
             (result, close, a.ui.wants_frame() || a.busy())
         };
         // the app is not borrowed past here; closing may send events back
@@ -120,6 +128,43 @@ fn run() -> AureaResult<()> {
     window.run()
 }
 
+/// shows a native file dialog once this frame is over, outside the app
+/// borrow: its modal loop can send events back to the window.
+fn show_dialog(
+    app: &Rc<RefCell<App>>,
+    window: &Rc<RefCell<Weak<Window>>>,
+    id: CanvasId,
+    (dialog, start): (Dialog, Option<(String, PathBuf)>),
+) {
+    let app = Rc::clone(app);
+    let window = Rc::clone(window);
+    aurea::after_frame(move || {
+        let Some(window) = window.borrow().upgrade() else {
+            return;
+        };
+        let (name, folder) = start.unwrap_or_default();
+        let picked = match dialog {
+            Dialog::Open => FileDialog::new()
+                .directory(&folder)
+                .multiple(true)
+                .open(&window)
+                .unwrap_or_default(),
+            Dialog::SaveAs(_) => FileDialog::new()
+                .directory(&folder)
+                .file_name(&name)
+                .save(&window)
+                .ok()
+                .flatten()
+                .into_iter()
+                .collect(),
+        };
+        if let Ok(mut a) = app.try_borrow_mut() {
+            a.dialog_done(dialog, picked);
+        }
+        request_canvas_redraw(id);
+    });
+}
+
 /// view menu items, ticked while their panel is in the dock.
 struct Ticks {
     items: Vec<(Panel, MenuItem)>,
@@ -158,9 +203,13 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
         }
     };
     let mut file = bar.add_submenu(a.texts.tr("File"))?;
+    add(&mut file, "New File", Command::NewFile)?;
+    add(&mut file, "Open File", Command::OpenFile)?;
     add(&mut file, "Quick Open", Command::QuickOpen)?;
     file.add_separator()?;
     add(&mut file, "Save", Command::Save)?;
+    add(&mut file, "Save As", Command::SaveAs)?;
+    add(&mut file, "Save All", Command::SaveAll)?;
     add(&mut file, "Close Tab", Command::CloseTab)?;
     let mut edit = bar.add_submenu(a.texts.tr("Edit"))?;
     add(&mut edit, "Undo", Command::Undo)?;

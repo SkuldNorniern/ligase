@@ -187,8 +187,10 @@ impl Workbench {
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
                     Panel::Editor(view) => {
+                        // a file never saved has no path to come back to
                         let path = docs
                             .doc_of(view)
+                            .filter(|d| !d.untitled)
                             .map(|d| d.path.display().to_string())
                             .unwrap_or_default();
                         editors.push(path);
