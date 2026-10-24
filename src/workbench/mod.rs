@@ -123,8 +123,7 @@ impl Workbench {
     /// shows the tab `by` places along from `pane` in its group, wrapping
     /// round. gives the tab now shown.
     pub fn cycle(&mut self, pane: PaneId, by: isize) -> Option<PaneId> {
-        let plan = self.dock.tree.plan()?;
-        let group = group_of(&plan, pane)?;
+        let group = self.dock.tree.group_of(&pane)?;
         let at = group.iter().position(|p| *p == pane)?;
         let len = isize::try_from(group.len()).ok()?;
         let next = group[usize::try_from((at as isize + by).rem_euclid(len)).ok()?];
@@ -299,16 +298,6 @@ impl Workbench {
 
 /// plan with slots swapped for panes. slots that map to none are dropped;
 /// a group left empty goes too and its split collapses.
-/// the tabs of the group holding `pane`, in order.
-fn group_of(plan: &DockPlan<PaneId>, pane: PaneId) -> Option<Vec<PaneId>> {
-    match plan {
-        DockPlan::Tabs { panels, .. } => panels.contains(&pane).then(|| panels.clone()),
-        DockPlan::Split { first, second, .. } => {
-            group_of(first, pane).or_else(|| group_of(second, pane))
-        }
-    }
-}
-
 fn map_plan(
     plan: DockPlan<usize>,
     f: &impl Fn(usize) -> Option<PaneId>,

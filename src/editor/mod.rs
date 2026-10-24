@@ -793,10 +793,6 @@ pub struct Look<'a> {
     pub idle: Duration,
     /// language server hover text, while the caret stays where it was asked.
     pub hover: Option<&'a str>,
-    /// alt is held: a click adds a caret.
-    pub alt: bool,
-    /// ctrl (cmd on mac) is held: a click goes to the definition.
-    pub ctrl: bool,
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
@@ -1032,16 +1028,23 @@ pub fn show(
             }
             if let Some(press) = ui.press(Id::Editor(id), 1).filter(|_| !toggled) {
                 let at = hit_test(ui, press.at);
-                if look.alt && press.shift && press.clicks == 1 {
+                let alt = press.modifiers.alt;
+                // ctrl, or command on mac, follows the name to its definition
+                let follow = if cfg!(target_os = "macos") {
+                    press.modifiers.meta
+                } else {
+                    press.modifiers.ctrl
+                };
+                if alt && press.shift && press.clicks == 1 {
                     // alt, shift and a drag: a box, one selection a line
                     column = Some((line_at_y(press.at.y), press.at.x - body_x));
                     extras.clear();
                     sel = Selection::caret(at);
-                } else if look.ctrl && press.clicks == 1 && !press.shift {
+                } else if follow && press.clicks == 1 && !press.shift {
                     extras.clear();
                     sel = Selection::caret(at);
                     shown.definition = true;
-                } else if look.alt && press.clicks == 1 {
+                } else if alt && press.clicks == 1 {
                     // alt and a click: one more caret
                     if extras.len() < multi::MAX_CARETS {
                         extras.push(sel);
@@ -1493,14 +1496,26 @@ mod tests {
         docs.doc_mut_for_test(doc).folds = std::iter::once(fold).collect();
         caret(&mut docs, v, 7);
         assert!(fold_op(&mut docs, v, FoldOp::FoldAll));
-        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(3), "caret came up");
+        assert_eq!(
+            docs.view(v).unwrap().sel,
+            Selection::caret(3),
+            "caret came up"
+        );
         act(&mut docs, v, Action::Move(Motion::Down, false));
-        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(3), "nowhere to go");
+        assert_eq!(
+            docs.view(v).unwrap().sel,
+            Selection::caret(3),
+            "nowhere to go"
+        );
         act(&mut docs, v, Action::Move(Motion::Right, false));
         assert_eq!(docs.view(v).unwrap().sel, Selection::caret(3));
         caret(&mut docs, v, 0);
         act(&mut docs, v, Action::Move(Motion::DocEnd, false));
-        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(0), "end is inside");
+        assert_eq!(
+            docs.view(v).unwrap().sel,
+            Selection::caret(0),
+            "end is inside"
+        );
     }
 
     #[test]

@@ -209,10 +209,6 @@ pub struct App {
     last_editor: Option<ViewId>,
     /// last key or click in an editor; the caret blinks from there.
     typed_at: Instant,
-    /// alt held, from the last event that said; alt and a click add a caret.
-    alt_down: bool,
-    /// ctrl (cmd on mac) held, the same way; ctrl and a click go to definition.
-    ctrl_down: bool,
     /// a dialog main should show after this frame.
     dialog: Option<Dialog>,
     /// the terminal panel had the keyboard last frame.
@@ -262,8 +258,6 @@ impl App {
             complete_for: None,
             last_editor: None,
             typed_at: Instant::now(),
-            alt_down: false,
-            ctrl_down: false,
             dialog: None,
             shell_focus: false,
             canvas: None,
@@ -316,23 +310,6 @@ impl App {
             // back from another program: files may have changed under us
             self.check_disk();
         }
-        match event {
-            WindowEvent::KeyInput { modifiers, .. }
-            | WindowEvent::MouseButton { modifiers, .. }
-            | WindowEvent::MouseMove { modifiers, .. } => {
-                self.alt_down = modifiers.alt;
-                self.ctrl_down = if cfg!(target_os = "macos") {
-                    modifiers.meta
-                } else {
-                    modifiers.ctrl
-                };
-            }
-            WindowEvent::Unfocused => {
-                self.alt_down = false;
-                self.ctrl_down = false;
-            }
-            _ => {}
-        }
         if self.ui.popup_open() {
             return self.ui.handle(event);
         }
@@ -355,25 +332,15 @@ impl App {
             }
         }
         if let WindowEvent::MouseWheel {
-            delta_x,
-            delta_y,
-            modifiers,
+            delta_y, modifiers, ..
         } = event
+            && modifiers.ctrl
+            && !self.shell_focus
+            && *delta_y != 0.0
         {
-            if modifiers.ctrl && !self.shell_focus && *delta_y != 0.0 {
-                // ctrl and the wheel zoom the editor
-                self.zoom_by(if *delta_y > 0.0 { 1.0 } else { -1.0 });
-                return true;
-            }
-            if modifiers.shift && *delta_x == 0.0 {
-                // shift and the wheel go sideways
-                let sideways = WindowEvent::MouseWheel {
-                    delta_x: *delta_y,
-                    delta_y: 0.0,
-                    modifiers: *modifiers,
-                };
-                return self.ui.handle(&sideways);
-            }
+            // ctrl and the wheel zoom the editor
+            self.zoom_by(if *delta_y > 0.0 { 1.0 } else { -1.0 });
+            return true;
         }
         if self.shell_focus {
             return self.shell_event(event);
@@ -1618,8 +1585,6 @@ impl App {
         let mut blink = None;
         let idle = self.typed_at.elapsed();
         let zoom = self.zoom;
-        let alt = self.alt_down;
-        let ctrl = self.ctrl_down;
         let mut definition = None;
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
         let mut bar_ask = None;
@@ -1668,8 +1633,6 @@ impl App {
                             size: zoom,
                             idle,
                             hover,
-                            alt,
-                            ctrl,
                             found,
                             current,
                         };
