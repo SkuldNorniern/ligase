@@ -654,32 +654,16 @@ mod tests {
         let mut docs = Documents::default();
         let (doc, _) = docs.open(Path::new("r.txt"));
         let view = docs.add_view(doc);
-        docs.loaded(
-            doc,
-            Ok("ab
-cd"
-            .to_owned()),
-        );
+        docs.loaded(doc, Ok("ab\ncd".to_owned()));
         docs.view_mut(view).unwrap().sel = Selection::caret(4);
         assert!(docs.changed_on_disk(doc));
-        docs.reload(
-            doc, "new
-wxyz", None,
-        );
+        docs.reload(doc, "new\nwxyz", None);
         let d = docs.doc(doc).unwrap();
-        assert_eq!(
-            d.buffer.text().to_string(),
-            "new
-wxyz"
-        );
+        assert_eq!(d.buffer.text().to_string(), "new\nwxyz");
         assert!(!d.is_dirty());
         assert_eq!(docs.view(view).unwrap().sel, Selection::caret(5));
         assert!(docs.undo(view));
-        assert_eq!(
-            docs.doc(doc).unwrap().buffer.text().to_string(),
-            "ab
-cd"
-        );
+        assert_eq!(docs.doc(doc).unwrap().buffer.text().to_string(), "ab\ncd");
         assert!(docs.doc(doc).unwrap().is_dirty());
     }
 

@@ -624,20 +624,8 @@ mod tests {
         assert!(lsp.hover(&docs, view));
         // completion after "x." on a u32 lists its methods
         let end = docs.doc(doc).unwrap().buffer.len() - 2;
-        docs.edit(
-            view,
-            vec![(
-                end..end,
-                "
-    x."
-                .to_owned(),
-            )],
-            false,
-        );
-        let caret = end
-            + "
-    x."
-            .len();
+        docs.edit(view, vec![(end..end, "\n    x.".to_owned())], false);
+        let caret = end + "\n    x.".len();
         docs.view_mut(view).unwrap().sel = crate::editor::cursor::Selection::caret(caret);
         lsp.sync(&docs);
         let start = Instant::now();
