@@ -116,11 +116,22 @@ fn each(
     let mut out = Vec::with_capacity(sels.len());
     let mut delta = 0isize;
     let mut join = true;
+    // end of the last edit taken; a caret whose edit reaches back over it
+    // (two carets in one indent, say) is left out, not allowed to clash
+    let mut reach = 0;
     for (i, &sel) in sels.iter().enumerate() {
-        let Some((change, joins)) = plan(i, sel) else {
+        let planned = plan(i, sel).filter(|(change, _)| {
+            change.edits.iter().all(|(range, _)| {
+                range.start >= reach || (range.is_empty() && range.start == reach)
+            })
+        });
+        let Some((change, joins)) = planned else {
             out.push(multi::shifted(sel, delta));
             continue;
         };
+        if let Some(end) = change.edits.iter().map(|(r, _)| r.end).max() {
+            reach = reach.max(end);
+        }
         join &= joins;
         out.push(multi::shifted(change.sel, delta));
         for (range, new) in change.edits {
@@ -131,8 +142,17 @@ fn each(
     if edits.is_empty() && out == sels {
         return false;
     }
+    // extra carets are set below; mapping each through the edit first
+    // would cost carets x edits for nothing
+    let extra = docs.view_mut(view).map(|v| std::mem::take(&mut v.extra));
     let done = edits.is_empty() || docs.edit(view, edits, join);
-    if done && let Some(v) = docs.view_mut(view) {
+    if !done {
+        if let (Some(v), Some(extra)) = (docs.view_mut(view), extra) {
+            v.extra = extra;
+        }
+        return false;
+    }
+    if let Some(v) = docs.view_mut(view) {
         multi::set_all(v, out, primary);
         v.goal = None;
         v.reveal = true;
@@ -303,6 +323,7 @@ pub fn line_op(docs: &mut Documents, view: ViewId, op: LineOp) -> bool {
                 anchor: from,
                 head: to,
             };
+            v.extra.clear();
             v.reveal = true;
             return true;
         }
@@ -758,6 +779,7 @@ pub fn show(
     if let Some((at, encoding)) = view.goto.take() {
         // past the end or mid char: lands on the nearest place before it
         view.sel = Selection::caret(crate::lsp::offset_near(text, at, encoding));
+        view.extra.clear();
         view.reveal = true;
     }
     let reveal = std::mem::take(&mut view.reveal);
@@ -1171,6 +1193,22 @@ mod tests {
         assert_eq!(text(&docs, v), "a1\nb2");
         paste(&mut docs, v, "x");
         assert_eq!(text(&docs, v), "a1x\nb2x");
+    }
+
+    #[test]
+    fn carets_whose_edits_clash_leave_one_out() {
+        let (mut docs, v) = open("    x");
+        carets(&mut docs, v, &[2, 3]);
+        assert!(act(&mut docs, v, Action::Backspace));
+        assert_eq!(text(&docs, v), "  x");
+        let (mut docs, v) = open("  a");
+        carets(&mut docs, v, &[1, 3]);
+        assert!(act(&mut docs, v, Action::Outdent));
+        assert_eq!(text(&docs, v), "a");
+        let (mut docs, v) = open("()");
+        carets(&mut docs, v, &[1, 2]);
+        assert!(act(&mut docs, v, Action::Backspace));
+        assert_eq!(text(&docs, v), "");
     }
 
     #[test]

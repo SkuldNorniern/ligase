@@ -461,6 +461,9 @@ impl App {
                 if command == Command::Cut {
                     match line {
                         Some(range) => {
+                            if let Some(v) = self.docs.view_mut(view) {
+                                v.extra.clear();
+                            }
                             self.docs.edit(view, vec![(range, String::new())], false);
                         }
                         None => {
@@ -806,6 +809,7 @@ impl App {
                 anchor: hit.start,
                 head: hit.end,
             };
+            v.extra.clear();
             v.reveal = true;
             v.goal = None;
         }

@@ -78,27 +78,57 @@ pub fn merge(view: &mut View) {
     view.extra = out.into_iter().map(|(s, _)| s).collect();
 }
 
+/// bytes read at a time when looking for the next copy.
+const WINDOW: usize = 64 * 1024;
+
+/// first place `needle` starts in `start..end`, reading the text a window
+/// at a time instead of copying all of it.
+fn find_in(text: &TextSnapshot, needle: &str, start: usize, end: usize) -> Option<usize> {
+    let mut at = start;
+    while at < end {
+        // windows overlap by the needle, so no match falls between two
+        let mut to = (at + WINDOW + needle.len()).min(text.len());
+        while !text.is_char_boundary(to) {
+            to += 1;
+        }
+        let chunk = text.slice(at..to).ok()?;
+        if let Some(i) = chunk.find(needle)
+            && at + i < end
+        {
+            return Some(at + i);
+        }
+        let mut next = at + WINDOW;
+        while next < text.len() && !text.is_char_boundary(next) {
+            next += 1;
+        }
+        at = next;
+    }
+    None
+}
+
 /// next place `needle` sits after `from`, wrapping round, skipping places
-/// already taken. bounded: looks through the text once.
+/// already taken.
 fn next_match(
     text: &TextSnapshot,
     needle: &str,
     from: usize,
     taken: &[Selection],
 ) -> Option<std::ops::Range<usize>> {
-    let all = text.slice(0..text.len()).ok()?;
-    let found = |at: usize| {
-        all[at..]
-            .match_indices(needle)
-            .map(move |(i, _)| at + i..at + i + needle.len())
-    };
-    let mut from = from.min(all.len());
-    while !all.is_char_boundary(from) {
+    let mut from = from.min(text.len());
+    while !text.is_char_boundary(from) {
         from += 1;
     }
-    found(from)
-        .chain(found(0).take_while(move |r| r.start < from))
-        .find(|r| !taken.iter().any(|s| s.range() == *r))
+    for (start, end) in [(from, text.len()), (0, from)] {
+        let mut at = start;
+        while let Some(i) = find_in(text, needle, at, end) {
+            let hit = i..i + needle.len();
+            if !taken.iter().any(|s| s.range() == hit) {
+                return Some(hit);
+            }
+            at = i + needle.len().max(1);
+        }
+    }
+    None
 }
 
 /// ctrl+d: a caret with nothing selected takes its word; after that each
@@ -243,6 +273,34 @@ mod tests {
         assert_eq!(v.sel, sel(10, 12));
         assert!(!add_next(&t, &mut v), "all taken");
         assert_eq!(v.extra.len(), 2);
+    }
+
+    #[test]
+    fn next_copy_found_across_windows() {
+        let mut big = "가".repeat(WINDOW / 3 - 1);
+        big.push_str("xneedle");
+        big.push_str(&"b".repeat(WINDOW));
+        big.push_str("needle");
+        let t = snap(&big);
+        let first = big.find("needle").unwrap();
+        let last = big.rfind("needle").unwrap();
+        assert_eq!(next_match(&t, "needle", 0, &[]), Some(first..first + 6));
+        let taken = [Selection {
+            anchor: first,
+            head: first + 6,
+        }];
+        assert_eq!(
+            next_match(&t, "needle", first, &taken),
+            Some(last..last + 6)
+        );
+        let both = [
+            taken[0],
+            Selection {
+                anchor: last,
+                head: last + 6,
+            },
+        ];
+        assert_eq!(next_match(&t, "needle", last, &both), None);
     }
 
     #[test]
