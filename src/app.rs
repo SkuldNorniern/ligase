@@ -25,6 +25,7 @@ use crate::lang::{Lang, Texts};
 use crate::lsp::{self, Lsp};
 use crate::palette::{self, Kind, Palette};
 use crate::search::{self, Finder};
+use crate::settings::{self, Settings, ThemeChoice};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
@@ -85,6 +86,7 @@ pub enum Command {
     QuickOpen,
     Commands,
     GotoSymbol,
+    OpenSettings,
     CloseTab,
     NextTab,
     PrevTab,
@@ -138,6 +140,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Zoom Out", Command::ZoomOut),
     ("Reset Zoom", Command::ZoomReset),
     ("Reset Layout", Command::ResetLayout),
+    ("Settings", Command::OpenSettings),
 ];
 
 /// a native dialog to show once the frame is done; main shows it.
@@ -183,6 +186,10 @@ enum Done {
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
+    /// the settings file's text, when there is one.
+    Settings(Option<String>),
+    /// the settings file to open, made with every key shown when missing.
+    SettingsFile(Result<PathBuf, String>),
 }
 
 pub struct App {
@@ -221,6 +228,12 @@ pub struct App {
     typed_at: Instant,
     /// a dialog main should show after this frame.
     dialog: Option<Dialog>,
+    settings: Settings,
+    /// the theme in force is dark.
+    dark: bool,
+    edit_opts: editor::EditOpts,
+    /// the system asked for less motion; read when the window gets focus.
+    still: bool,
     /// "save" was the answer to closing: close once every file is written.
     close_after_save: bool,
     /// the same for one tab.
@@ -273,6 +286,10 @@ impl App {
             last_editor: None,
             typed_at: Instant::now(),
             dialog: None,
+            settings: Settings::default(),
+            dark: true,
+            edit_opts: editor::EditOpts::default(),
+            still: aurea::reduced_motion(),
             close_after_save: false,
             close_pane_after_save: None,
             shell_focus: false,
@@ -287,6 +304,10 @@ impl App {
             close_now: false,
         };
         app.scan_pending();
+        if let Some(path) = settings::path() {
+            app.jobs
+                .run(move || Done::Settings(std::fs::read_to_string(path).ok()));
+        }
         match app.session.clone() {
             Some(path) => {
                 app.jobs
@@ -325,6 +346,12 @@ impl App {
         if matches!(event, WindowEvent::Focused) {
             // back from another program: files may have changed under us
             self.check_disk();
+            self.still = aurea::reduced_motion();
+        }
+        if matches!(event, WindowEvent::ThemeChanged { .. })
+            && self.settings.theme == ThemeChoice::System
+        {
+            self.apply_settings(self.settings.clone(), Vec::new());
         }
         if self.ui.popup_open() {
             return self.ui.handle(event);
@@ -410,7 +437,7 @@ impl App {
                 _ => None,
             };
             let moved = matches!(action, input::Action::Move(..) | input::Action::Collapse);
-            editor::act(&mut self.docs, view, action);
+            editor::act_with(&mut self.docs, view, action, &self.edit_opts);
             self.hover = None;
             if moved {
                 self.completion = None;
@@ -574,7 +601,12 @@ impl App {
                             self.docs.edit(view, vec![(range, String::new())], false);
                         }
                         None => {
-                            editor::act(&mut self.docs, view, input::Action::Delete);
+                            editor::act_with(
+                                &mut self.docs,
+                                view,
+                                input::Action::Delete,
+                                &self.edit_opts,
+                            );
                         }
                     }
                 }
@@ -615,6 +647,15 @@ impl App {
                 } else if let Some(view) = focus.or(self.last_editor) {
                     self.open_bar(view, Mode::Find);
                 }
+                return;
+            }
+            Command::OpenSettings => {
+                let Some(path) = settings::path() else {
+                    self.status = self.texts.tr("no config folder for settings").to_owned();
+                    return;
+                };
+                self.jobs
+                    .run(move || Done::SettingsFile(settings_file(&path)));
                 return;
             }
             Command::GotoSymbol => {
@@ -1083,6 +1124,53 @@ impl App {
                     v.reveal = true;
                 }
             }
+        }
+    }
+
+    /// puts settings in force: theme, fonts, editing, language.
+    fn apply_settings(&mut self, settings: Settings, problems: Vec<String>) {
+        let dark = match settings.theme {
+            ThemeChoice::Dark => true,
+            ThemeChoice::Light => false,
+            ThemeChoice::System => aurea::prefers_dark().unwrap_or(true),
+        };
+        let family = std::mem::take(&mut self.theme.font_family);
+        self.theme = if dark { Theme::dark() } else { Theme::light() };
+        self.dark = dark;
+        self.theme.font_family = family;
+        if settings.editor_size != self.settings.editor_size || self.zoom == editor::SIZE {
+            self.zoom = settings.editor_size;
+        }
+        self.edit_opts = editor::EditOpts {
+            unit: " ".repeat(settings.tab_size),
+            auto_pairs: settings.auto_pairs,
+        };
+        if settings.language != self.settings.language {
+            let lang = Lang::detect(settings.language.as_deref());
+            lang.font_family().clone_into(&mut self.theme.font_family);
+            self.texts = Texts::new(lang);
+        }
+        self.settings = settings;
+        if !problems.is_empty() {
+            self.status = format!(
+                "{}: {}",
+                self.texts.tr("settings skipped"),
+                problems.join(", ")
+            );
+        }
+    }
+
+    /// the settings file was saved: read it from the buffer, no disk.
+    fn settings_saved(&mut self, doc: DocumentId) {
+        let Some(d) = self.docs.doc(doc) else { return };
+        if settings::path().as_deref() != Some(d.path.as_path()) {
+            return;
+        }
+        let (settings, problems) = settings::parse(&d.buffer.text().to_string());
+        let clean = problems.is_empty();
+        self.apply_settings(settings, problems);
+        if clean {
+            self.status = self.texts.tr("settings applied").to_owned();
         }
     }
 
@@ -1624,6 +1712,7 @@ impl App {
                         self.docs.saved(doc, point);
                         self.docs.set_disk(doc, disk);
                         self.status = format!("{} {name}", self.texts.tr("saved"));
+                        self.settings_saved(doc);
                         self.after_save(doc, true);
                     }
                     Err(why) => {
@@ -1634,6 +1723,20 @@ impl App {
                 Done::Shell(result) => self.shell.started(result),
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
                 Done::Files(files) => self.palette.set_files(files),
+                Done::Settings(text) => {
+                    if let Some(text) = text {
+                        let (settings, problems) = settings::parse(&text);
+                        self.apply_settings(settings, problems);
+                    }
+                }
+                Done::SettingsFile(Ok(path)) => {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                }
+                Done::SettingsFile(Err(why)) => {
+                    self.status = format!("{}: {why}", self.texts.tr("can't open the settings"));
+                }
                 Done::Server(language, result) => {
                     if let Some(why) = self.lsp.started(language, result) {
                         // a missing server is fine; the editor works without it
@@ -1736,6 +1839,10 @@ impl App {
         let zoom = self.zoom;
         let mut definition = None;
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
+        let settings = &self.settings;
+        let dark = self.dark;
+        let still = self.still;
+        let terminal_size = self.settings.terminal_size;
         let mut bar_ask = None;
         let palette_ask;
         let note = self.found_note();
@@ -1779,6 +1886,9 @@ impl App {
                         };
                         let current = bar.current.and_then(|i| found.get(i)).cloned();
                         let look = editor::Look {
+                            settings,
+                            dark,
+                            still,
                             size: zoom,
                             idle,
                             hover,
@@ -1809,7 +1919,7 @@ impl App {
                     Ok(())
                 }
                 Some(Panel::Terminal) => {
-                    shell_focus = terminal::show(ui, shell, rect, texts)?;
+                    shell_focus = terminal::show(ui, shell, rect, texts, terminal_size)?;
                     Ok(())
                 }
                 Some(Panel::Welcome) | None => {
@@ -1962,6 +2072,18 @@ impl App {
             .map(|d| d.message.lines().next().unwrap_or_default().to_owned())
             .unwrap_or_default()
     }
+}
+
+/// the settings file, made with every key shown (commented out) when it
+/// isn't there yet. runs on the worker.
+fn settings_file(path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, settings::STARTER).map_err(|e| e.to_string())?;
+    }
+    Ok(path.to_path_buf())
 }
 
 fn hint(ui: &mut Ui<'_, Id>, rect: Rect, text: &str) -> AureaResult<()> {

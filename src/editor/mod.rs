@@ -21,6 +21,7 @@ use crate::app::Id;
 use crate::document::{Document, Documents, Load, View, ViewId};
 use crate::lang::Texts;
 use crate::lsp::{Diag, Severity};
+use crate::settings::{CaretStyle, LineNumbers, Whitespace};
 use crate::syntax::{self, Spans};
 use cursor::Selection;
 use input::Action;
@@ -56,8 +57,32 @@ const MONO: &str = if cfg!(windows) {
     "DejaVu Sans Mono"
 };
 
-/// does `action` on `view`, at every caret. true when something changed.
+/// how typing behaves, from the settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditOpts {
+    /// one level of indent.
+    pub unit: String,
+    /// brackets and quotes typed in pairs.
+    pub auto_pairs: bool,
+}
+
+impl Default for EditOpts {
+    fn default() -> Self {
+        Self {
+            unit: TAB.to_owned(),
+            auto_pairs: true,
+        }
+    }
+}
+
+/// does `action` on `view` with the default options.
+#[cfg(test)]
 pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
+    act_with(docs, view, action, &EditOpts::default())
+}
+
+/// does `action` on `view`, at every caret. true when something changed.
+pub fn act_with(docs: &mut Documents, view: ViewId, action: Action, opts: &EditOpts) -> bool {
     let Some((doc, v)) = docs.editable(view) else {
         return false;
     };
@@ -143,6 +168,7 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
         text: &text,
         lb: doc.line_break(),
         language: doc.language,
+        opts,
     };
     each(docs, view, |_, sel| place.change(sel, &action))
 }
@@ -212,6 +238,7 @@ struct Place<'t> {
     text: &'t TextSnapshot,
     lb: &'static str,
     language: Option<&'static str>,
+    opts: &'t EditOpts,
 }
 
 impl Place<'_> {
@@ -220,20 +247,22 @@ impl Place<'_> {
     fn change(&self, sel: Selection, action: &Action) -> Option<(Change, bool)> {
         let text = self.text;
         let lb = self.lb;
+        let unit = self.opts.unit.as_str();
+        let pairs_on = self.opts.auto_pairs;
         let plain = |range: Range<usize>, new: String| Change {
             sel: Selection::caret(range.start + new.len()),
             edits: vec![(range, new)],
         };
         Some(match action {
-            Action::Insert(typed) => match pairs::typed(text, sel, typed) {
+            Action::Insert(typed) => match pairs::typed(text, sel, typed).filter(|_| pairs_on) {
                 Some(change) => (change, true),
                 None => (plain(sel.range(), typed.clone()), true),
             },
             Action::Indent if lines::block(text, sel).0 != lines::block(text, sel).1 => {
-                (lines::indent_lines(text, sel, TAB), false)
+                (lines::indent_lines(text, sel, unit), false)
             }
-            Action::Indent => (plain(sel.range(), TAB.to_owned()), true),
-            Action::Outdent => (lines::outdent_lines(text, sel, TAB), false),
+            Action::Indent => (plain(sel.range(), unit.to_owned()), true),
+            Action::Outdent => (lines::outdent_lines(text, sel, unit), false),
             Action::Newline => {
                 let start = sel.range().start;
                 let indent = cursor::indent_before(text, start);
@@ -247,14 +276,14 @@ impl Place<'_> {
                         .is_some_and(|c| Some(c) == close)
                 {
                     // between a pair: the caret gets its own line, deeper
-                    let first = format!("{lb}{indent}{TAB}");
+                    let first = format!("{lb}{indent}{unit}");
                     let change = Change {
                         sel: Selection::caret(start + first.len()),
                         edits: vec![(sel.range(), format!("{first}{lb}{indent}"))],
                     };
                     return Some((change, false));
                 }
-                let deeper = if opens { TAB } else { "" };
+                let deeper = if opens { unit } else { "" };
                 (plain(sel.range(), format!("{lb}{indent}{deeper}")), false)
             }
             Action::OpenLine(above) => {
@@ -291,7 +320,7 @@ impl Place<'_> {
                 )
             }
             Action::Backspace if sel.is_empty() => {
-                if let Some(change) = pairs::backspace(text, sel.head) {
+                if let Some(change) = pairs::backspace(text, sel.head).filter(|_| pairs_on) {
                     return Some((change, true));
                 }
                 // in the indent, back to the last tab stop
@@ -299,8 +328,8 @@ impl Place<'_> {
                 let start = text.line_start(line).unwrap_or(0);
                 let before = text.slice(start..sel.head).unwrap_or_default();
                 if !before.is_empty() && before.bytes().all(|b| b == b' ') {
-                    let take = match before.len() % TAB.len() {
-                        0 => TAB.len(),
+                    let take = match before.len() % unit.len().max(1) {
+                        0 => unit.len().max(1),
                         n => n,
                     };
                     return Some((plain(sel.head - take..sel.head, String::new()), true));
@@ -604,7 +633,7 @@ fn paint_line(
     spans: &Spans,
     line: Range<usize>,
     body: Rect,
-    plain: Color,
+    (plain, dark): (Color, bool),
 ) -> AureaResult<()> {
     let run = |ui: &mut Ui<'_, Id>, from: usize, to: usize, color: Color| {
         let (a, b) = (laid.drawn_at(from), laid.drawn_at(to));
@@ -630,7 +659,7 @@ fn paint_line(
             continue;
         }
         run(ui, at, from, plain)?;
-        run(ui, from, to, syntax::colour(*kind))?;
+        run(ui, from, to, syntax::colour_on(*kind, dark))?;
         at = to;
     }
     run(ui, at, line.end, plain)
@@ -722,7 +751,7 @@ fn span(text: &TextSnapshot, line: usize) -> Range<usize> {
     text.line_start(line).unwrap_or(0)..cursor::line_end(text, line)
 }
 
-fn lay(text: &TextSnapshot, range: Range<usize>) -> Laid {
+fn lay(text: &TextSnapshot, range: Range<usize>, tab: &str) -> Laid {
     let mut end = range.end.min(range.start + MAX_DRAWN);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -740,7 +769,7 @@ fn lay(text: &TextSnapshot, range: Range<usize>) -> Laid {
     {
         laid.marks.push((at, laid.drawn.len()));
         match c {
-            '\t' => laid.drawn.push_str(TAB),
+            '\t' => laid.drawn.push_str(tab),
             c => laid.drawn.push(c),
         }
         at += c.len_utf8();
@@ -796,11 +825,16 @@ pub struct Look<'a> {
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
+    pub settings: &'a crate::settings::Settings,
+    /// the theme is dark; picks the syntax colours.
+    pub dark: bool,
+    /// the system asked for less motion: the caret lands, no glide.
+    pub still: bool,
 }
 
-/// line height for a font size.
-pub fn line_height(size: f32) -> f32 {
-    (size * 1.45).round()
+/// line height for a font size and a multiple of it.
+pub fn line_height(size: f32, factor: f32) -> f32 {
+    (size * factor).round()
 }
 
 /// caret on or off after `idle`, and how long until that flips. a caret
@@ -852,13 +886,14 @@ fn hits(line: &str, at: usize, needle: &str, whole: bool) -> Vec<Range<usize>> {
 }
 
 /// indent depth of a line in steps of `TAB`, or none for a blank line.
-fn depth(line: &str) -> Option<usize> {
+fn depth(line: &str, tab: usize) -> Option<usize> {
+    let tab = tab.max(1);
     let mut cols = 0;
     for c in line.chars() {
         match c {
             ' ' => cols += 1,
-            '\t' => cols += TAB.len(),
-            _ => return Some(cols / TAB.len()),
+            '\t' => cols += tab,
+            _ => return Some(cols / tab),
         }
     }
     None
@@ -874,8 +909,11 @@ pub fn show(
     look: &Look<'_>,
 ) -> AureaResult<Shown> {
     let mut shown = Shown::default();
-    let font = Font::new(MONO, look.size);
-    let line_h = line_height(look.size);
+    let settings = look.settings;
+    let font = Font::new(settings.editor_font.as_deref().unwrap_or(MONO), look.size);
+    let line_h = line_height(look.size, settings.line_height);
+    let tab = " ".repeat(settings.tab_size.max(1));
+    let tab = tab.as_str();
     let palette = ui.theme.palette;
     match &doc.load {
         Load::Loading => {
@@ -993,7 +1031,7 @@ pub fn show(
             };
             let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
                 let line = line_at_y(at.y);
-                lay(text, span(text, line)).offset_at(ui, &font, at.x - body_x)
+                lay(text, span(text, line), tab).offset_at(ui, &font, at.x - body_x)
             };
             let mut pull = 0.0;
             // the fold arrow column: a press there folds or opens
@@ -1076,7 +1114,7 @@ pub fn show(
                     let to_x = at.x - body_x;
                     let mut boxed = Vec::new();
                     for line in from_line.min(to_line)..=from_line.max(to_line) {
-                        let laid = lay(text, span(text, line));
+                        let laid = lay(text, span(text, line), tab);
                         boxed.push(Selection {
                             anchor: laid.offset_at(ui, &font, from_x),
                             head: laid.offset_at(ui, &font, to_x),
@@ -1140,7 +1178,15 @@ pub fn show(
                 } else {
                     palette.faint
                 };
-                ui.text(&(line + 1).to_string(), number, &font, color, Align::End)?;
+                let shown_number = match settings.line_numbers {
+                    LineNumbers::On => Some(line + 1),
+                    LineNumbers::Relative if line == caret_line => Some(line + 1),
+                    LineNumbers::Relative => Some(line.abs_diff(caret_line)),
+                    LineNumbers::Off => None,
+                };
+                if let Some(n) = shown_number {
+                    ui.text(&n.to_string(), number, &font, color, Align::End)?;
+                }
                 // fold arrows show while the pointer is over the gutter, and
                 // always on a folded line
                 let closed = closed_lines.binary_search(&line).is_ok();
@@ -1156,12 +1202,13 @@ pub fn show(
             }
 
             let focused = shown.focused;
-            let lit = needle(text, sel);
+            let lit = needle(text, sel).filter(|_| settings.word_highlight);
+            let extra_ranges: Vec<Range<usize>> = extras.iter().map(|s| s.range()).collect();
             let brackets = (focused && sel.is_empty())
                 .then(|| pairs::matching(text, sel.head))
                 .flatten();
             // the caret's place in text space, lines from the top
-            let caret_laid = lay(text, span(text, caret_line));
+            let caret_laid = lay(text, span(text, caret_line), tab);
             let mut target_x = caret_laid.x_of(ui, &font, sel.head);
             let mut preedit_w = 0.0;
             if let Some((composing, at)) = &preedit {
@@ -1186,7 +1233,7 @@ pub fn show(
                 let mut carry = 0;
                 if let Some(back) = visible.first().and_then(|l| l.checked_sub(1)) {
                     let s = span(text, back);
-                    carry = depth(&text.slice(s).unwrap_or_default()).unwrap_or(0);
+                    carry = depth(&text.slice(s).unwrap_or_default(), tab.len()).unwrap_or(0);
                 }
                 for (i, &line) in visible.iter().enumerate() {
                     let y = row_y(i);
@@ -1194,16 +1241,17 @@ pub fn show(
                         Rect::new(body_x, y, (area.x + area.width - body_x).max(0.0), line_h);
                     let span = span(text, line);
                     let raw = text.slice(span.clone()).unwrap_or_default();
-                    let laid = lay(text, span.clone());
-                    if focused && sel.is_empty() && line == caret_line {
+                    let laid = lay(text, span.clone(), tab);
+                    if settings.current_line && focused && sel.is_empty() && line == caret_line {
                         let row = Rect::new(area.x, y, area.width, line_h);
                         ui.fill(row, palette.raised.fade(0.45))?;
                     }
                     // indent guides; a blank line keeps the ones above it
-                    let levels = depth(&raw).unwrap_or(carry);
+                    let levels = depth(&raw, tab.len()).unwrap_or(carry);
                     carry = levels;
-                    for level in 1..levels {
-                        let x = (body_x + (level * TAB.len()) as f32 * char_w).round() + 0.5;
+                    let guides = if settings.indent_guides { levels } else { 0 };
+                    for level in 1..guides {
+                        let x = (body_x + (level * tab.len()) as f32 * char_w).round() + 0.5;
                         ui.fill(Rect::new(x, y, 1.0, line_h), palette.border.fade(0.55))?;
                     }
                     if let Some((needle, whole)) = &lit {
@@ -1267,11 +1315,32 @@ pub fn show(
                         &doc.spans,
                         span.clone(),
                         body,
-                        palette.text,
+                        (palette.text, look.dark),
                     )?;
-                    squiggles(ui, &font, &laid, &doc.diags, span, body, line_h)?;
+                    squiggles(ui, &font, &laid, &doc.diags, span.clone(), body, line_h)?;
                     let drawn_w = ui.text_width(&laid.drawn, &font);
                     widest = widest.max(drawn_w);
+                    // spaces as dots and tabs as arrows, everywhere or in
+                    // the selection only
+                    if settings.whitespace != Whitespace::None {
+                        let picked = |at: usize| {
+                            std::iter::once(&range)
+                                .chain(extra_ranges.iter())
+                                .any(|r| r.start <= at && at < r.end)
+                        };
+                        for (i, c) in raw.char_indices() {
+                            let at = span.start + i;
+                            if !matches!(c, ' ' | '\t')
+                                || (settings.whitespace == Whitespace::Selection && !picked(at))
+                            {
+                                continue;
+                            }
+                            let x0 = laid.x_of(ui, &font, at);
+                            let mark = if c == ' ' { "·" } else { "→" };
+                            let cell = Rect::new(body.x + x0, y, char_w, line_h);
+                            ui.text(mark, cell, &font, palette.faint.fade(0.8), Align::Start)?;
+                        }
+                    }
                     // a folded line ends in a pill standing for what it hides
                     if closed_lines.binary_search(&line).is_ok() {
                         let dots = Rect::new(body.x + drawn_w + 6.0, y + 3.0, 26.0, line_h - 6.0);
@@ -1283,6 +1352,8 @@ pub fn show(
                 // the caret glides to its place; a long jump just lands
                 let target_y = fold::row_of(caret_line, &hidden) as f32 * line_h;
                 let jump = preedit.is_some()
+                    || look.still
+                    || !settings.smooth_caret
                     || seen_line.is_none_or(|l: usize| l.abs_diff(caret_line) > 6);
                 let (cx, cy) = if jump {
                     ui.set_animated(
@@ -1329,13 +1400,32 @@ pub fn show(
                     ui.text(composing, box_, &font, palette.text, Align::Start)?;
                     ui.fill(Rect::new(x, y + line_h - 2.0, preedit_w, 1.0), palette.text)?;
                 }
-                let (on, next) = blink(look.idle);
+                let (on, next) = if settings.caret_blink {
+                    blink(look.idle)
+                } else {
+                    (true, None)
+                };
                 shown.blink = next;
                 let x = body_x + cx;
                 let drawn_y = content.y + cy;
                 if on || moving || preedit.is_some() {
-                    let bar = Rect::new(x.round() - 0.5, drawn_y + 2.0, 2.0, line_h - 4.0);
-                    ui.fill(bar, palette.accent)?;
+                    let bar = match settings.caret {
+                        CaretStyle::Bar => {
+                            Rect::new(x.round() - 0.5, drawn_y + 2.0, 2.0, line_h - 4.0)
+                        }
+                        CaretStyle::Block => {
+                            Rect::new(x.round(), drawn_y + 1.0, char_w, line_h - 2.0)
+                        }
+                        CaretStyle::Underline => {
+                            Rect::new(x.round(), drawn_y + line_h - 3.0, char_w, 2.0)
+                        }
+                    };
+                    let colour = if settings.caret == CaretStyle::Block {
+                        palette.accent.fade(0.55)
+                    } else {
+                        palette.accent
+                    };
+                    ui.fill(bar, colour)?;
                 }
                 // the other carets blink with the main one, no glide
                 if on || moving {
@@ -1346,7 +1436,8 @@ pub fn show(
                         if visible.binary_search(&line).is_err() {
                             continue;
                         }
-                        let ex = body_x + lay(text, span(text, line)).x_of(ui, &font, extra.head);
+                        let ex =
+                            body_x + lay(text, span(text, line), tab).x_of(ui, &font, extra.head);
                         let ey = line_y(line);
                         let bar = Rect::new(ex.round() - 0.5, ey + 2.0, 2.0, line_h - 4.0);
                         ui.fill(bar, palette.accent.fade(0.85))?;
@@ -1540,9 +1631,9 @@ mod tests {
 
     #[test]
     fn indent_depth_counts_tabs_and_blank_lines() {
-        assert_eq!(depth("        x"), Some(2));
-        assert_eq!(depth("\t  x"), Some(1));
-        assert_eq!(depth("   "), None);
+        assert_eq!(depth("        x", 4), Some(2));
+        assert_eq!(depth("\t  x", 4), Some(1));
+        assert_eq!(depth("   ", 4), None);
     }
 
     fn text(docs: &Documents, view: ViewId) -> String {
@@ -1573,7 +1664,7 @@ mod tests {
         let (docs, v) = open("ab\r\ncd");
         let text = docs.doc_of(v).unwrap().buffer.text();
         assert_eq!(span(text, 0), 0..2);
-        let laid = lay(text, span(text, 0));
+        let laid = lay(text, span(text, 0), TAB);
         assert_eq!(laid.drawn, "ab");
         assert_eq!(laid.marks.last(), Some(&(2, 2)));
     }

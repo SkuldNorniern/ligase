@@ -12,8 +12,6 @@ use vanta::{Cell, CellKind, Color as TermColor, SpawnConfig, Terminal};
 use crate::app::Id;
 use crate::lang::Texts;
 
-const SIZE: f32 = 13.0;
-const LINE: f32 = 18.0;
 const BAR: f32 = 14.0;
 const PAD: f32 = 6.0;
 
@@ -257,9 +255,8 @@ fn push_text(cell: &Cell, out: &mut String) {
 fn draw_row(
     ui: &mut Ui<'_, Id>,
     line: &[Cell],
-    x0: f32,
-    y: f32,
-    cell: f32,
+    (x0, y): (f32, f32),
+    (cell, line_h): (f32, f32),
     font: &Font,
 ) -> AureaResult<()> {
     let palette = ui.theme.palette;
@@ -281,7 +278,7 @@ fn draw_row(
         if inverse {
             std::mem::swap(&mut fg, &mut bg);
         }
-        let at = Rect::new(x0 + col as f32 * cell, y, (end - col) as f32 * cell, LINE);
+        let at = Rect::new(x0 + col as f32 * cell, y, (end - col) as f32 * cell, line_h);
         if first.bg != TermColor::Default || inverse {
             ui.fill(at, bg)?;
         }
@@ -303,9 +300,11 @@ pub fn show(
     shell: &mut Shell,
     rect: Rect,
     texts: &Texts,
+    size: f32,
 ) -> AureaResult<bool> {
     let palette = ui.theme.palette;
-    let font = Font::new(MONO, SIZE);
+    let font = Font::new(MONO, size);
+    let line_h = (size * 1.38).round();
     let hint = |ui: &mut Ui<'_, Id>, text: &str| {
         let small = ui.theme.font(13.0);
         ui.text(text, rect, &small, palette.dim, Align::Center)
@@ -329,7 +328,7 @@ pub fn show(
     }
     let cell = ui.text_width("M", &font).max(1.0);
     let cols = ((rect.width - BAR - 2.0 * PAD) / cell).floor().max(10.0) as u16;
-    let rows = ((rect.height - 2.0 * PAD) / LINE).floor().max(2.0) as u16;
+    let rows = ((rect.height - 2.0 * PAD) / line_h).floor().max(2.0) as u16;
     if shell.size != (cols, rows) {
         shell.size = (cols, rows);
         let _ = term.resize(cols, rows);
@@ -338,14 +337,14 @@ pub fn show(
     // only the lines in sight are copied out, never the whole scrollback
     let head = term.window(0, 0);
     let total = head.lines;
-    let height = (total + usize::from(ended)) as f32 * LINE + 2.0 * PAD;
+    let height = (total + usize::from(ended)) as f32 * line_h + 2.0 * PAD;
     // scrolled back while old lines fall off the top: every line moved up
     // that much, so the view moves with them, at once, not eased
     let gone = head.dropped.saturating_sub(shell.dropped);
     shell.dropped = head.dropped;
     let shifted = !shell.follow && gone > 0;
     if shifted {
-        shell.scroll = (shell.scroll - gone as f32 * LINE).max(0.0);
+        shell.scroll = (shell.scroll - gone as f32 * line_h).max(0.0);
     }
     if shell.follow {
         shell.scroll = (height - rect.height).max(0.0);
@@ -361,18 +360,18 @@ pub fn show(
             focused = ui
                 .interact(Id::Terminal, 1, hit, Sense::Click, true)
                 .focused;
-            let first = ((seen.y - content.y - PAD) / LINE).floor().max(0.0) as usize;
-            let count = (seen.height / LINE).ceil() as usize + 1;
+            let first = ((seen.y - content.y - PAD) / line_h).floor().max(0.0) as usize;
+            let count = (seen.height / line_h).ceil() as usize + 1;
             let x0 = content.x + PAD;
             let window = term.window(first, count);
             app_keys = window.application_cursor_keys;
             for (i, line) in window.rows.iter().enumerate() {
-                let y = content.y + PAD + (first + i) as f32 * LINE;
-                draw_row(ui, line, x0, y, cell, &font)?;
+                let y = content.y + PAD + (first + i) as f32 * line_h;
+                draw_row(ui, line, (x0, y), (cell, line_h), &font)?;
             }
             if ended {
-                let y = content.y + PAD + window.lines as f32 * LINE;
-                let row = Rect::new(x0, y, content.width, LINE);
+                let y = content.y + PAD + window.lines as f32 * line_h;
+                let row = Rect::new(x0, y, content.width, line_h);
                 let small = ui.theme.font(12.0);
                 ui.text(
                     texts.tr("the shell ended, press enter for a new one"),
@@ -386,9 +385,9 @@ pub fn show(
                 let col = col.min(usize::from(cols).saturating_sub(1));
                 let at = Rect::new(
                     x0 + col as f32 * cell,
-                    content.y + PAD + line as f32 * LINE,
+                    content.y + PAD + line as f32 * line_h,
                     cell,
-                    LINE,
+                    line_h,
                 );
                 ui.fill(at, palette.text.with_alpha(120))?;
             }
@@ -396,7 +395,7 @@ pub fn show(
         })?;
     shell.app_keys = app_keys;
     // scrolled back to the bottom: follow again
-    shell.follow = shell.scroll + rect.height >= height - LINE;
+    shell.follow = shell.scroll + rect.height >= height - line_h;
     Ok(focused)
 }
 

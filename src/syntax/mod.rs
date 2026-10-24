@@ -45,6 +45,26 @@ pub fn language_for(path: &Path) -> Option<&'static str> {
 }
 
 /// colour for a kind, on a dark background.
+/// colour for a kind on a light or dark background.
+pub fn colour_on(kind: HighlightKind, dark: bool) -> Color {
+    if dark {
+        return colour(kind);
+    }
+    match kind {
+        HighlightKind::Keyword | HighlightKind::KeywordControl => Color::rgb(0x8a, 0x2b, 0xc8),
+        HighlightKind::Type => Color::rgb(0x1a, 0x7f, 0x6e),
+        HighlightKind::String => Color::rgb(0x3b, 0x7d, 0x1e),
+        HighlightKind::Comment => Color::rgb(0x7a, 0x82, 0x8c),
+        HighlightKind::Number => Color::rgb(0xb0, 0x5a, 0x10),
+        HighlightKind::Operator | HighlightKind::Punctuation => Color::rgb(0x55, 0x5d, 0x66),
+        HighlightKind::Function => Color::rgb(0x1f, 0x5f, 0xc0),
+        HighlightKind::Variable => Color::rgb(0x24, 0x29, 0x2f),
+        HighlightKind::Attribute | HighlightKind::Macro => Color::rgb(0x95, 0x6a, 0x00),
+        HighlightKind::Lifetime => Color::rgb(0xb3, 0x38, 0x38),
+        HighlightKind::SectionHeader => Color::rgb(0x1f, 0x5f, 0xc0),
+    }
+}
+
 pub fn colour(kind: HighlightKind) -> Color {
     match kind {
         HighlightKind::Keyword | HighlightKind::KeywordControl => Color::rgb(0xc6, 0x8a, 0xf0),

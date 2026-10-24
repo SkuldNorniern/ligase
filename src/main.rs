@@ -12,6 +12,7 @@ mod lang;
 mod lsp;
 mod palette;
 mod search;
+mod settings;
 mod syntax;
 mod terminal;
 mod workbench;
@@ -285,6 +286,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut go, "Previous Tab", Command::PrevTab)?;
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
     add(&mut view, "Command Palette", Command::Commands)?;
+    add(&mut view, "Settings", Command::OpenSettings)?;
     view.add_separator()?;
     add(&mut view, "Fold", Command::Fold(FoldOp::Fold))?;
     add(&mut view, "Unfold", Command::Fold(FoldOp::Unfold))?;
