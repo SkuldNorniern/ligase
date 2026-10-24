@@ -5,6 +5,7 @@ pub mod cursor;
 pub mod find;
 pub mod input;
 pub mod lines;
+pub mod multi;
 pub mod pairs;
 
 use std::ops::Range;
@@ -54,16 +55,20 @@ const MONO: &str = if cfg!(windows) {
     "DejaVu Sans Mono"
 };
 
-/// does `action` on `view`. true when something changed.
+/// does `action` on `view`, at every caret. true when something changed.
 pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
     let Some((doc, v)) = docs.editable(view) else {
         return false;
     };
     let text = doc.buffer.snapshot();
-    let sel = v.sel;
-    let (edit, join) = match action {
+    match action {
         Action::Move(motion, extend) => {
-            v.sel = cursor::motion(&text, sel, motion, extend, &mut v.goal);
+            v.sel = cursor::motion(&text, v.sel, motion, extend, &mut v.goal);
+            for s in &mut v.extra {
+                // extra carets keep no goal column of their own
+                *s = cursor::motion(&text, *s, motion, extend, &mut None);
+            }
+            multi::merge(v);
             v.reveal = true;
             v.preedit = None;
             // typing after a move is a new undo step
@@ -71,7 +76,11 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
             return true;
         }
         Action::Collapse => {
-            v.sel = Selection::caret(sel.head);
+            if v.extra.is_empty() {
+                v.sel = Selection::caret(v.sel.head);
+            } else {
+                v.extra.clear();
+            }
             v.preedit = None;
             return true;
         }
@@ -80,104 +89,168 @@ pub fn act(docs: &mut Documents, view: ViewId, action: Action) -> bool {
             v.reveal = true;
             return true;
         }
-        Action::Insert(typed) => {
-            v.preedit = None;
-            if let Some(change) = pairs::typed(&text, sel, &typed) {
-                return apply(docs, view, change, true);
-            }
-            ((sel.range(), typed), true)
-        }
-        Action::Indent if lines::block(&text, sel).0 != lines::block(&text, sel).1 => {
-            let change = lines::indent_lines(&text, sel, TAB);
-            return apply(docs, view, change, false);
-        }
-        Action::Indent => ((sel.range(), TAB.to_owned()), true),
-        Action::Outdent => {
-            let change = lines::outdent_lines(&text, sel, TAB);
-            return apply(docs, view, change, false);
-        }
-        Action::Newline => {
-            let start = sel.range().start;
-            let lb = doc.line_break();
-            let indent = cursor::indent_before(&text, start);
-            let open = pairs::char_before(&text, start);
-            let close = pairs::char_after(&text, sel.range().end);
-            let opens = matches!(open, Some('(' | '[' | '{'))
-                || (open == Some(':') && doc.language == Some("python"));
-            if opens
-                && open
-                    .and_then(pairs::closer)
-                    .is_some_and(|c| Some(c) == close)
-            {
-                // between a pair: the caret gets its own line, deeper
-                let first = format!("{lb}{indent}{TAB}");
-                let change = Change {
-                    sel: Selection::caret(start + first.len()),
-                    edits: vec![(sel.range(), format!("{first}{lb}{indent}"))],
-                };
-                return apply(docs, view, change, false);
-            }
-            let deeper = if opens { TAB } else { "" };
-            ((sel.range(), format!("{lb}{indent}{deeper}")), false)
-        }
-        Action::OpenLine(above) => {
-            let line = text.line_of(sel.head).unwrap_or(0);
-            let lb = doc.line_break();
-            let indent = cursor::indent_before(&text, cursor::line_end(&text, line));
-            let change = if above {
-                let at = text.line_start(line).unwrap_or(0);
-                Change {
-                    sel: Selection::caret(at + indent.len()),
-                    edits: vec![(at..at, format!("{indent}{lb}"))],
-                }
-            } else {
-                let at = cursor::line_end(&text, line);
-                Change {
-                    sel: Selection::caret(at + lb.len() + indent.len()),
-                    edits: vec![(at..at, format!("{lb}{indent}"))],
-                }
-            };
-            return apply(docs, view, change, false);
-        }
-        Action::DeleteWord(forward) if sel.is_empty() => {
-            let motion = if forward {
-                cursor::Motion::WordRight
-            } else {
-                cursor::Motion::WordLeft
-            };
-            let to = cursor::motion(&text, sel, motion, false, &mut None).head;
-            ((to.min(sel.head)..to.max(sel.head), String::new()), false)
-        }
-        Action::DeleteWord(_) => ((sel.range(), String::new()), false),
-        Action::Backspace if sel.is_empty() => {
-            if let Some(change) = pairs::backspace(&text, sel.head) {
-                return apply(docs, view, change, true);
-            }
-            // in the indent, back to the last tab stop
-            let line = text.line_of(sel.head).unwrap_or(0);
-            let start = text.line_start(line).unwrap_or(0);
-            let before = text.slice(start..sel.head).unwrap_or_default();
-            if !before.is_empty() && before.bytes().all(|b| b == b' ') {
-                let take = match before.len() % TAB.len() {
-                    0 => TAB.len(),
-                    n => n,
-                };
-                return docs.edit(view, vec![(sel.head - take..sel.head, String::new())], true);
-            }
-            let Some(prev) = text.prev_grapheme(sel.head).ok().flatten() else {
-                return false;
-            };
-            ((prev..sel.head, String::new()), true)
-        }
-        Action::Delete if sel.is_empty() => {
-            let Some(next) = text.next_grapheme(sel.head).ok().flatten() else {
-                return false;
-            };
-            ((sel.head..next, String::new()), true)
-        }
-        Action::Backspace | Action::Delete => ((sel.range(), String::new()), false),
+        Action::Insert(_) => v.preedit = None,
+        _ => {}
+    }
+    let place = Place {
+        text: &text,
+        lb: doc.line_break(),
+        language: doc.language,
     };
-    docs.edit(view, vec![edit], join)
+    each(docs, view, |_, sel| place.change(sel, &action))
+}
+
+/// works out an edit for every caret against one snapshot and makes them
+/// as one transaction. each caret's new place moves by what the edits
+/// before it added or took. true when something changed.
+fn each(
+    docs: &mut Documents,
+    view: ViewId,
+    mut plan: impl FnMut(usize, Selection) -> Option<(Change, bool)>,
+) -> bool {
+    let Some(v) = docs.view(view) else {
+        return false;
+    };
+    let (sels, primary) = multi::all(v);
+    let mut edits = Vec::new();
+    let mut out = Vec::with_capacity(sels.len());
+    let mut delta = 0isize;
+    let mut join = true;
+    for (i, &sel) in sels.iter().enumerate() {
+        let Some((change, joins)) = plan(i, sel) else {
+            out.push(multi::shifted(sel, delta));
+            continue;
+        };
+        join &= joins;
+        out.push(multi::shifted(change.sel, delta));
+        for (range, new) in change.edits {
+            delta += new.len() as isize - range.len() as isize;
+            edits.push((range, new));
+        }
+    }
+    if edits.is_empty() && out == sels {
+        return false;
+    }
+    let done = edits.is_empty() || docs.edit(view, edits, join);
+    if done && let Some(v) = docs.view_mut(view) {
+        multi::set_all(v, out, primary);
+        v.goal = None;
+        v.reveal = true;
+    }
+    done
+}
+
+/// what one caret's edit needs to know about its document.
+struct Place<'t> {
+    text: &'t TextSnapshot,
+    lb: &'static str,
+    language: Option<&'static str>,
+}
+
+impl Place<'_> {
+    /// the edit `action` makes at `sel` alone, and whether it joins the
+    /// typing run. none when it does nothing there.
+    fn change(&self, sel: Selection, action: &Action) -> Option<(Change, bool)> {
+        let text = self.text;
+        let lb = self.lb;
+        let plain = |range: Range<usize>, new: String| Change {
+            sel: Selection::caret(range.start + new.len()),
+            edits: vec![(range, new)],
+        };
+        Some(match action {
+            Action::Insert(typed) => match pairs::typed(text, sel, typed) {
+                Some(change) => (change, true),
+                None => (plain(sel.range(), typed.clone()), true),
+            },
+            Action::Indent if lines::block(text, sel).0 != lines::block(text, sel).1 => {
+                (lines::indent_lines(text, sel, TAB), false)
+            }
+            Action::Indent => (plain(sel.range(), TAB.to_owned()), true),
+            Action::Outdent => (lines::outdent_lines(text, sel, TAB), false),
+            Action::Newline => {
+                let start = sel.range().start;
+                let indent = cursor::indent_before(text, start);
+                let open = pairs::char_before(text, start);
+                let close = pairs::char_after(text, sel.range().end);
+                let opens = matches!(open, Some('(' | '[' | '{'))
+                    || (open == Some(':') && self.language == Some("python"));
+                if opens
+                    && open
+                        .and_then(pairs::closer)
+                        .is_some_and(|c| Some(c) == close)
+                {
+                    // between a pair: the caret gets its own line, deeper
+                    let first = format!("{lb}{indent}{TAB}");
+                    let change = Change {
+                        sel: Selection::caret(start + first.len()),
+                        edits: vec![(sel.range(), format!("{first}{lb}{indent}"))],
+                    };
+                    return Some((change, false));
+                }
+                let deeper = if opens { TAB } else { "" };
+                (plain(sel.range(), format!("{lb}{indent}{deeper}")), false)
+            }
+            Action::OpenLine(above) => {
+                let line = text.line_of(sel.head).unwrap_or(0);
+                let indent = cursor::indent_before(text, cursor::line_end(text, line));
+                let change = if *above {
+                    let at = text.line_start(line).unwrap_or(0);
+                    Change {
+                        sel: Selection::caret(at + indent.len()),
+                        edits: vec![(at..at, format!("{indent}{lb}"))],
+                    }
+                } else {
+                    let at = cursor::line_end(text, line);
+                    Change {
+                        sel: Selection::caret(at + lb.len() + indent.len()),
+                        edits: vec![(at..at, format!("{lb}{indent}"))],
+                    }
+                };
+                (change, false)
+            }
+            Action::DeleteWord(forward) if sel.is_empty() => {
+                let motion = if *forward {
+                    cursor::Motion::WordRight
+                } else {
+                    cursor::Motion::WordLeft
+                };
+                let to = cursor::motion(text, sel, motion, false, &mut None).head;
+                if to == sel.head {
+                    return None;
+                }
+                (
+                    plain(to.min(sel.head)..to.max(sel.head), String::new()),
+                    false,
+                )
+            }
+            Action::Backspace if sel.is_empty() => {
+                if let Some(change) = pairs::backspace(text, sel.head) {
+                    return Some((change, true));
+                }
+                // in the indent, back to the last tab stop
+                let line = text.line_of(sel.head).unwrap_or(0);
+                let start = text.line_start(line).unwrap_or(0);
+                let before = text.slice(start..sel.head).unwrap_or_default();
+                if !before.is_empty() && before.bytes().all(|b| b == b' ') {
+                    let take = match before.len() % TAB.len() {
+                        0 => TAB.len(),
+                        n => n,
+                    };
+                    return Some((plain(sel.head - take..sel.head, String::new()), true));
+                }
+                let prev = text.prev_grapheme(sel.head).ok().flatten()?;
+                (plain(prev..sel.head, String::new()), true)
+            }
+            Action::Delete if sel.is_empty() => {
+                let next = text.next_grapheme(sel.head).ok().flatten()?;
+                (plain(sel.head..next, String::new()), true)
+            }
+            Action::Backspace | Action::Delete | Action::DeleteWord(_) => {
+                (plain(sel.range(), String::new()), false)
+            }
+            Action::Move(..) | Action::Collapse | Action::Preedit(..) => return None,
+        })
+    }
 }
 
 /// makes `change` and puts its selection on the view.
@@ -185,6 +258,7 @@ pub fn apply(docs: &mut Documents, view: ViewId, change: Change, join: bool) -> 
     let done = change.edits.is_empty() || docs.edit(view, change.edits, join);
     if done && let Some(v) = docs.view_mut(view) {
         v.sel = change.sel;
+        v.extra.clear();
         v.goal = None;
         v.reveal = true;
     }
@@ -277,14 +351,21 @@ pub fn paste_line(docs: &mut Documents, view: ViewId, line: &str) -> bool {
     )
 }
 
-/// the selected text of `view`.
+/// the selected text of `view`; with more carets, each selection on its
+/// own line.
 pub fn selected(docs: &Documents, view: ViewId) -> Option<String> {
     let v = docs.view(view)?;
     let doc = docs.doc(v.doc)?;
-    let range = v.sel.range();
-    (!range.is_empty())
-        .then(|| doc.buffer.text().slice(range).ok())
-        .flatten()
+    let (sels, _) = multi::all(v);
+    if sels.iter().all(|s| s.is_empty()) {
+        return None;
+    }
+    let text = doc.buffer.text();
+    let parts: Vec<String> = sels
+        .iter()
+        .map(|s| text.slice(s.range()).unwrap_or_default())
+        .collect();
+    Some(parts.join(doc.line_break()))
 }
 
 /// pastes `text` over the selection, line breaks made to match the file.
@@ -298,8 +379,20 @@ pub fn paste(docs: &mut Documents, view: ViewId, text: &str) -> bool {
     } else {
         plain
     };
-    let range = v.sel.range();
-    docs.edit(view, vec![(range, fitted)], false)
+    let carets = v.extra.len() + 1;
+    // as many lines as carets: one line each, like vs code
+    let lines: Vec<&str> = fitted.split(doc.line_break()).collect();
+    let spread = carets > 1 && lines.len() == carets;
+    each(docs, view, |i, sel| {
+        let new = if spread { lines[i] } else { fitted.as_str() };
+        Some((
+            Change {
+                sel: Selection::caret(sel.range().start + new.len()),
+                edits: vec![(sel.range(), new.to_owned())],
+            },
+            false,
+        ))
+    })
 }
 
 pub fn select_all(docs: &mut Documents, view: ViewId) {
@@ -308,7 +401,35 @@ pub fn select_all(docs: &mut Documents, view: ViewId) {
             anchor: 0,
             head: doc.buffer.len(),
         };
+        v.extra.clear();
     }
+}
+
+/// a multi caret command the app asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretOp {
+    AddNext,
+    SelectMatches,
+    AddAbove,
+    AddBelow,
+}
+
+pub fn caret_op(docs: &mut Documents, view: ViewId, op: CaretOp) -> bool {
+    let Some((doc, v)) = docs.editable(view) else {
+        return false;
+    };
+    let text = doc.buffer.snapshot();
+    let done = match op {
+        CaretOp::AddNext => multi::add_next(&text, v),
+        CaretOp::SelectMatches => multi::select_all_matches(&text, v),
+        CaretOp::AddAbove => multi::add_vertical(&text, v, true),
+        CaretOp::AddBelow => multi::add_vertical(&text, v, false),
+    };
+    if done {
+        v.reveal = true;
+        doc.buffer.break_join();
+    }
+    done
 }
 
 /// what a frame of the view tells the app.
@@ -529,6 +650,8 @@ pub struct Look<'a> {
     pub idle: Duration,
     /// language server hover text, while the caret stays where it was asked.
     pub hover: Option<&'a str>,
+    /// alt is held: a click adds a caret.
+    pub alt: bool,
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
@@ -653,6 +776,7 @@ pub fn show(
         }
     }
     let mut sel = view.sel;
+    let mut extras = view.extra.clone();
     let mut preedit = view.preedit.clone();
     let mut hscroll = view.hscroll;
     let seen_line = view.caret_line;
@@ -696,15 +820,24 @@ pub fn show(
             let mut pull = 0.0;
             if let Some(press) = ui.press(Id::Editor(id), 1) {
                 let at = hit_test(ui, press.at);
-                sel = match press.clicks {
-                    2 => cursor::word_at(text, at),
-                    n if n >= 3 => cursor::line_at(text, at),
-                    _ if press.shift => Selection {
-                        anchor: sel.anchor,
-                        head: at,
-                    },
-                    _ => Selection::caret(at),
-                };
+                if look.alt && press.clicks == 1 {
+                    // alt and a click: one more caret
+                    if extras.len() < multi::MAX_CARETS {
+                        extras.push(sel);
+                    }
+                    sel = Selection::caret(at);
+                } else {
+                    extras.clear();
+                    sel = match press.clicks {
+                        2 => cursor::word_at(text, at),
+                        n if n >= 3 => cursor::line_at(text, at),
+                        _ if press.shift => Selection {
+                            anchor: sel.anchor,
+                            head: at,
+                        },
+                        _ => Selection::caret(at),
+                    };
+                }
                 // a click ends composing and the typing run
                 preedit = None;
                 shown.pressed = true;
@@ -841,16 +974,23 @@ pub fn show(
                         }
                     }
                     // selection behind the text, one extra space when it runs past the line end
-                    let from = range.start.max(span.start);
-                    let to = range.end.min(span.end);
-                    if from < to || (range.start <= span.end && range.end > span.end) {
-                        let x0 = laid.x_of(ui, &font, from);
-                        let mut x1 = laid.x_of(ui, &font, to);
-                        if range.end > span.end {
-                            x1 += char_w;
+                    let picks =
+                        std::iter::once(range.clone()).chain(extras.iter().map(|s| s.range()));
+                    for range in picks {
+                        if range.start > span.end || range.end < span.start {
+                            continue;
                         }
-                        let picked = Rect::new(body.x + x0, y, x1 - x0, line_h);
-                        ui.round(picked, 3.0, palette.selection)?;
+                        let from = range.start.max(span.start);
+                        let to = range.end.min(span.end);
+                        if from < to || (range.start <= span.end && range.end > span.end) {
+                            let x0 = laid.x_of(ui, &font, from);
+                            let mut x1 = laid.x_of(ui, &font, to);
+                            if range.end > span.end {
+                                x1 += char_w;
+                            }
+                            let picked = Rect::new(body.x + x0, y, x1 - x0, line_h);
+                            ui.round(picked, 3.0, palette.selection)?;
+                        }
                     }
                     if let Some((a, b)) = brackets {
                         for at in [a, b] {
@@ -933,6 +1073,21 @@ pub fn show(
                     let bar = Rect::new(x.round() - 0.5, drawn_y + 2.0, 2.0, line_h - 4.0);
                     ui.fill(bar, palette.accent)?;
                 }
+                // the other carets blink with the main one, no glide
+                if on || moving {
+                    for extra in &extras {
+                        let Ok(line) = text.line_of(extra.head) else {
+                            continue;
+                        };
+                        if !(first..last).contains(&line) {
+                            continue;
+                        }
+                        let ex = body_x + lay(text, span(text, line)).x_of(ui, &font, extra.head);
+                        let ey = content.y + line as f32 * line_h;
+                        let bar = Rect::new(ex.round() - 0.5, ey + 2.0, 2.0, line_h - 4.0);
+                        ui.fill(bar, palette.accent.fade(0.85))?;
+                    }
+                }
                 shown.caret = Some(Rect::new(body_x + target_x, y, 2.0, line_h));
                 Ok(())
             })?;
@@ -951,6 +1106,8 @@ pub fn show(
     view.hscroll = hscroll;
     view.caret_line = Some(text.line_of(sel.head).unwrap_or(0));
     view.sel = sel;
+    view.extra = extras;
+    multi::merge(view);
     view.preedit = preedit;
     Ok(shown)
 }
@@ -976,6 +1133,54 @@ mod tests {
         let view = docs.add_view(doc);
         docs.loaded(doc, Ok(text.to_owned()));
         (docs, view)
+    }
+
+    fn carets(docs: &mut Documents, view: ViewId, at: &[usize]) {
+        let v = docs.view_mut(view).unwrap();
+        v.sel = Selection::caret(at[0]);
+        v.extra = at[1..].iter().map(|&a| Selection::caret(a)).collect();
+    }
+
+    fn heads(docs: &Documents, view: ViewId) -> Vec<usize> {
+        let (sels, _) = multi::all(docs.view(view).unwrap());
+        sels.iter().map(|s| s.head).collect()
+    }
+
+    #[test]
+    fn typing_and_backspace_at_every_caret() {
+        let (mut docs, v) = open("ab\nab\nab");
+        carets(&mut docs, v, &[2, 5, 8]);
+        act(&mut docs, v, Action::Insert("가".into()));
+        assert_eq!(text(&docs, v), "ab가\nab가\nab가");
+        assert_eq!(heads(&docs, v), vec![5, 11, 17]);
+        act(&mut docs, v, Action::Insert("(".into()));
+        assert_eq!(text(&docs, v), "ab가()\nab가()\nab가()");
+        act(&mut docs, v, Action::Backspace);
+        act(&mut docs, v, Action::Backspace);
+        assert_eq!(text(&docs, v), "ab\nab\nab");
+        assert_eq!(heads(&docs, v), vec![2, 5, 8]);
+        assert!(docs.undo(v));
+        assert_eq!(text(&docs, v), "ab\nab\nab", "the typing run is one step");
+    }
+
+    #[test]
+    fn paste_spreads_lines_over_carets() {
+        let (mut docs, v) = open("a\nb");
+        carets(&mut docs, v, &[1, 3]);
+        paste(&mut docs, v, "1\n2");
+        assert_eq!(text(&docs, v), "a1\nb2");
+        paste(&mut docs, v, "x");
+        assert_eq!(text(&docs, v), "a1x\nb2x");
+    }
+
+    #[test]
+    fn carets_meeting_become_one() {
+        let (mut docs, v) = open("abc");
+        carets(&mut docs, v, &[1, 2]);
+        act(&mut docs, v, Action::Move(Motion::DocStart, false));
+        assert!(docs.view(v).unwrap().extra.is_empty());
+        act(&mut docs, v, Action::Backspace);
+        assert_eq!(text(&docs, v), "abc", "nothing to take at the start");
     }
 
     #[test]

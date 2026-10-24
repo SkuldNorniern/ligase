@@ -26,7 +26,7 @@ use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
 use aurea::{AureaResult, Container, Window};
 
 use crate::app::{App, Command};
-use crate::editor::LineOp;
+use crate::editor::{CaretOp, LineOp};
 use crate::lang::Lang;
 use crate::workbench::panels::Panel;
 
@@ -172,6 +172,26 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     edit.add_separator()?;
     add(&mut edit, "Select All", Command::SelectAll)?;
     add(&mut edit, "Select Line", Command::Line(LineOp::Select))?;
+    add(
+        &mut edit,
+        "Add Next Match",
+        Command::Caret(CaretOp::AddNext),
+    )?;
+    add(
+        &mut edit,
+        "Select All Matches",
+        Command::Caret(CaretOp::SelectMatches),
+    )?;
+    add(
+        &mut edit,
+        "Add Caret Above",
+        Command::Caret(CaretOp::AddAbove),
+    )?;
+    add(
+        &mut edit,
+        "Add Caret Below",
+        Command::Caret(CaretOp::AddBelow),
+    )?;
     edit.add_separator()?;
     add(&mut edit, "Find", Command::Find)?;
     add(&mut edit, "Replace", Command::Replace)?;

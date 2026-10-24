@@ -17,7 +17,7 @@ use resolvase::{Encoding, Point, Revision, SavePoint};
 use crate::document::{self, DocumentId, Documents, ViewId};
 use crate::editor::cursor::Selection;
 use crate::editor::find::{self, Bar, Mode};
-use crate::editor::{self, LineOp, input};
+use crate::editor::{self, CaretOp, LineOp, input};
 use crate::explorer::{self, Click, Explorer};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
@@ -58,6 +58,7 @@ pub enum Command {
     Paste,
     SelectAll,
     Line(LineOp),
+    Caret(CaretOp),
     Find,
     Replace,
     FindNext,
@@ -99,6 +100,10 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Copy Line Up", Command::Line(LineOp::Copy(true))),
     ("Copy Line Down", Command::Line(LineOp::Copy(false))),
     ("Delete Line", Command::Line(LineOp::Delete)),
+    ("Add Next Match", Command::Caret(CaretOp::AddNext)),
+    ("Select All Matches", Command::Caret(CaretOp::SelectMatches)),
+    ("Add Caret Above", Command::Caret(CaretOp::AddAbove)),
+    ("Add Caret Below", Command::Caret(CaretOp::AddBelow)),
     ("Find", Command::Find),
     ("Replace", Command::Replace),
     ("Find Next", Command::FindNext),
@@ -155,6 +160,8 @@ pub struct App {
     last_editor: Option<ViewId>,
     /// last key or click in an editor; the caret blinks from there.
     typed_at: Instant,
+    /// alt held, from the last event that said; alt and a click add a caret.
+    alt_down: bool,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -199,6 +206,7 @@ impl App {
             palette: Palette::default(),
             last_editor: None,
             typed_at: Instant::now(),
+            alt_down: false,
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -245,6 +253,13 @@ impl App {
         if matches!(event, WindowEvent::CloseRequested) {
             self.request_close();
             return true;
+        }
+        match event {
+            WindowEvent::KeyInput { modifiers, .. }
+            | WindowEvent::MouseButton { modifiers, .. }
+            | WindowEvent::MouseMove { modifiers, .. } => self.alt_down = modifiers.alt,
+            WindowEvent::Unfocused => self.alt_down = false,
+            _ => {}
         }
         if self.ui.popup_open() {
             return self.ui.handle(event);
@@ -318,7 +333,8 @@ impl App {
         if let Some(view) = self.focus
             && !self.ui.text_focused()
             && let Some(v) = self.docs.view(view)
-            && let Some(action) = input::action(event, v.page, !v.sel.is_empty())
+            && let Some(action) =
+                input::action(event, v.page, !v.sel.is_empty() || !v.extra.is_empty())
         {
             editor::act(&mut self.docs, view, action);
             self.hover = None;
@@ -530,6 +546,12 @@ impl App {
                     self.ui.focus(Id::Editor(v), 1);
                     self.last_editor = Some(v);
                 }
+            }
+            Command::Caret(op) => {
+                if let Some(view) = focus {
+                    editor::caret_op(&mut self.docs, view, op);
+                }
+                return;
             }
             Command::Line(op) => {
                 if let Some(view) = focus {
@@ -1101,6 +1123,7 @@ impl App {
         let mut blink = None;
         let idle = self.typed_at.elapsed();
         let zoom = self.zoom;
+        let alt = self.alt_down;
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
         let mut bar_ask = None;
         let palette_ask;
@@ -1148,6 +1171,7 @@ impl App {
                             size: zoom,
                             idle,
                             hover,
+                            alt,
                             found,
                             current,
                         };
@@ -1363,6 +1387,19 @@ fn keymap() -> Keymap<Command> {
             Command::Line(LineOp::Comment),
         )
         .bind(Chord::command(KeyCode::L), Command::Line(LineOp::Select))
+        .bind(Chord::command(KeyCode::D), Command::Caret(CaretOp::AddNext))
+        .bind(
+            Chord::command(KeyCode::L).shift(),
+            Command::Caret(CaretOp::SelectMatches),
+        )
+        .bind(
+            Chord::key(KeyCode::Up).ctrl().alt(),
+            Command::Caret(CaretOp::AddAbove),
+        )
+        .bind(
+            Chord::key(KeyCode::Down).ctrl().alt(),
+            Command::Caret(CaretOp::AddBelow),
+        )
         .bind(Chord::command(KeyCode::F).shift(), Command::FindInFiles)
         .bind(Chord::command(KeyCode::P), Command::QuickOpen)
         .bind(Chord::command(KeyCode::P).shift(), Command::Commands)

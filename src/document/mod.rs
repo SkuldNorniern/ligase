@@ -73,6 +73,8 @@ pub struct View {
     /// the caret's line last frame; the caret glides from there.
     pub caret_line: Option<usize>,
     pub sel: Selection,
+    /// more carets, past the main one; empty most of the time.
+    pub extra: Vec<Selection>,
     /// column up and down aim for.
     pub goal: Option<usize>,
     /// ime text not committed yet, and the caret inside it.
@@ -132,6 +134,7 @@ impl Documents {
                 hscroll: 0.0,
                 caret_line: None,
                 sel: Selection::default(),
+                extra: Vec::new(),
                 goal: None,
                 preedit: None,
                 reveal: false,
@@ -214,6 +217,10 @@ impl Documents {
             let bias = if id == actor { Bias::Right } else { Bias::Left };
             v.sel.anchor = set.map(v.sel.anchor, bias);
             v.sel.head = set.map(v.sel.head, bias);
+            for s in &mut v.extra {
+                s.anchor = set.map(s.anchor, bias);
+                s.head = set.map(s.head, bias);
+            }
             if id == actor {
                 v.sel.anchor = v.sel.head;
                 v.goal = None;
