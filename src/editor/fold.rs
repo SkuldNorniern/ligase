@@ -73,6 +73,14 @@ pub fn is_hidden(line: usize, hidden: &Hidden) -> Option<(usize, usize)> {
         .find(|&(a, b)| a <= line && line <= b)
 }
 
+/// where the caret goes when folding hides its line: the end of the line
+/// the fold is shown on. none when its line stays in sight.
+pub fn caret_out(text: &TextSnapshot, folded: &[Range<usize>], head: usize) -> Option<usize> {
+    let line = text.line_of(head).ok()?;
+    let (a, _) = is_hidden(line, &hidden(text, folded))?;
+    Some(super::cursor::line_end(text, a - 1))
+}
+
 /// the parser's fold that starts on `line`, the widest one when several do.
 pub fn starting_on(
     text: &TextSnapshot,
