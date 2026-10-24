@@ -123,10 +123,20 @@ const COMMANDS: &[(&str, Command)] = &[
 /// what the worker hands back.
 enum Done {
     Listed(PathBuf, Result<Vec<(String, bool)>, String>),
-    Loaded(DocumentId, Result<String, String>),
+    Loaded(DocumentId, Result<String, String>, Option<document::Stamp>),
+    /// stamps of open files now, for the ones that changed.
+    Disk(Vec<(DocumentId, Option<document::Stamp>)>),
+    Reloaded(DocumentId, Result<String, String>, Option<document::Stamp>),
+    /// the file changed on disk since it was read; the save did not write.
+    Conflict(DocumentId, String),
     Session(Option<String>),
     Saved(Result<(), String>),
-    Wrote(DocumentId, String, SavePoint, Result<(), String>),
+    Wrote(
+        DocumentId,
+        String,
+        SavePoint,
+        Result<Option<document::Stamp>, String>,
+    ),
     Shell(Result<vanta::Terminal, String>),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
@@ -253,6 +263,10 @@ impl App {
         if matches!(event, WindowEvent::CloseRequested) {
             self.request_close();
             return true;
+        }
+        if matches!(event, WindowEvent::Focused) {
+            // back from another program: files may have changed under us
+            self.check_disk();
         }
         match event {
             WindowEvent::KeyInput { modifiers, .. }
@@ -929,12 +943,80 @@ impl App {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let job = move || Done::Wrote(doc, name, point, document::write_atomic(&path, &text));
+        let Some(d) = self.docs.doc(doc) else { return };
+        let expected = d.disk;
+        let force = d.overwrite;
+        if d.conflict && !d.overwrite {
+            // the first save after an outside change only warns
+            self.status = format!(
+                "{name}: {}",
+                self.texts
+                    .tr("changed on disk, save again to write over it")
+            );
+            self.docs.arm_overwrite(doc);
+            return;
+        }
+        let job = move || {
+            if !force && expected.is_some() && document::stamp(&path) != expected {
+                return Done::Conflict(doc, name);
+            }
+            let wrote = document::write_atomic(&path, &text).map(|()| document::stamp(&path));
+            Done::Wrote(doc, name, point, wrote)
+        };
         if !self.jobs.run(job) {
             self.status = format!(
                 "{}: the file worker is not running",
                 self.texts.tr("can't save")
             );
+        }
+    }
+
+    /// stats every open file on the worker to see what changed outside.
+    fn check_disk(&mut self) {
+        let files = self.docs.on_disk();
+        if files.is_empty() {
+            return;
+        }
+        self.jobs.run(move || {
+            let changed = files
+                .into_iter()
+                .filter_map(|(id, path, was)| {
+                    let now = document::stamp(&path);
+                    (was.is_some() && now != was).then_some((id, now))
+                })
+                .collect();
+            Done::Disk(changed)
+        });
+    }
+
+    fn disk_checked(&mut self, changed: Vec<(DocumentId, Option<document::Stamp>)>) {
+        for (id, now) in changed {
+            let Some(path) = self.docs.doc(id).map(|d| d.path.clone()) else {
+                continue;
+            };
+            let name = self
+                .docs
+                .doc(id)
+                .map(document::Document::name)
+                .unwrap_or_default();
+            if now.is_none() {
+                // gone: keep the text, a save puts the file back
+                self.docs.mark_conflict(id);
+                self.status = format!("{name}: {}", self.texts.tr("deleted on disk"));
+                continue;
+            }
+            if self.docs.changed_on_disk(id) {
+                self.jobs.run(move || {
+                    let disk = document::stamp(&path);
+                    Done::Reloaded(id, document::read_text(&path), disk)
+                });
+            } else {
+                self.status = format!(
+                    "{name}: {}",
+                    self.texts
+                        .tr("changed on disk, save again to write over it")
+                );
+            }
         }
     }
 
@@ -972,10 +1054,10 @@ impl App {
 
     fn load(&mut self, doc: DocumentId, path: &Path) {
         let path = path.to_path_buf();
-        if !self
-            .jobs
-            .run(move || Done::Loaded(doc, document::read_text(&path)))
-        {
+        if !self.jobs.run(move || {
+            let disk = document::stamp(&path);
+            Done::Loaded(doc, document::read_text(&path), disk)
+        }) {
             self.docs
                 .loaded(doc, Err("the file worker is not running".to_owned()));
         }
@@ -1020,11 +1102,34 @@ impl App {
                     self.status = format!("{}: {why}", path.display());
                     self.explorer.listed(&path, Vec::new());
                 }
-                Done::Loaded(doc, result) => self.docs.loaded(doc, result),
+                Done::Loaded(doc, result, disk) => {
+                    self.docs.loaded(doc, result);
+                    self.docs.set_disk(doc, disk);
+                }
+                Done::Disk(stamps) => self.disk_checked(stamps),
+                Done::Reloaded(doc, Ok(text), disk) => {
+                    let name = self.docs.doc(doc).map(document::Document::name);
+                    self.docs.reload(doc, &text, disk);
+                    if let Some(name) = name {
+                        self.status = format!("{} {name}", self.texts.tr("reloaded"));
+                    }
+                }
+                Done::Reloaded(_, Err(why), _) => self.status = why,
+                Done::Conflict(doc, name) => {
+                    // this is the warning; the next save writes over it
+                    self.docs.mark_conflict(doc);
+                    self.docs.arm_overwrite(doc);
+                    self.status = format!(
+                        "{name}: {}",
+                        self.texts
+                            .tr("changed on disk, save again to write over it")
+                    );
+                }
                 Done::Session(text) => self.restore(text),
                 Done::Wrote(doc, name, point, result) => match result {
-                    Ok(()) => {
+                    Ok(disk) => {
                         self.docs.saved(doc, point);
+                        self.docs.set_disk(doc, disk);
                         self.status = format!("{} {name}", self.texts.tr("saved"));
                     }
                     Err(why) => {
@@ -1096,10 +1201,11 @@ impl App {
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
                     Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
-                        if d.is_dirty() {
-                            format!("{} *", d.name())
-                        } else {
-                            d.name()
+                        // ! when the file also changed on disk
+                        match (d.is_dirty(), d.conflict) {
+                            (_, true) => format!("{} !", d.name()),
+                            (true, false) => format!("{} *", d.name()),
+                            (false, false) => d.name(),
                         }
                     }),
                 };

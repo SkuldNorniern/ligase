@@ -4,6 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use resolvase::{Bias, ChangeSet, Encoding, Point, Revision, SavePoint, TextBuffer, TextSnapshot};
 
@@ -43,6 +44,28 @@ pub struct Document {
     pub diags: Vec<Diag>,
     /// the last few edits, to move late results onto the text now.
     recent: VecDeque<ChangeSet>,
+    /// the file on disk as last read or written; none before that.
+    pub disk: Option<Stamp>,
+    /// the file changed on disk while this had unsaved edits.
+    pub conflict: bool,
+    /// the next save writes over the outside change anyway.
+    pub overwrite: bool,
+}
+
+/// what a file on disk looked like, to notice outside changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+/// the stamp of `path` now, or none when it is gone. runs on the worker.
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
 }
 
 impl Document {
@@ -119,6 +142,9 @@ impl Documents {
                 asked: None,
                 diags: Vec::new(),
                 recent: VecDeque::new(),
+                disk: None,
+                conflict: false,
+                overwrite: false,
             },
         );
         (id, true)
@@ -302,6 +328,101 @@ impl Documents {
     pub fn saved(&mut self, id: DocumentId, point: SavePoint) {
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.buffer.mark_saved_at(point);
+            doc.conflict = false;
+            doc.overwrite = false;
+        }
+    }
+
+    pub fn mark_conflict(&mut self, id: DocumentId) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.conflict = true;
+            doc.overwrite = false;
+        }
+    }
+
+    /// the user saw the warning; the next save writes anyway.
+    pub fn arm_overwrite(&mut self, id: DocumentId) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.overwrite = true;
+        }
+    }
+
+    pub fn set_disk(&mut self, id: DocumentId, disk: Option<Stamp>) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.disk = disk;
+        }
+    }
+
+    /// open documents with a file, for the disk check.
+    pub fn on_disk(&self) -> Vec<(DocumentId, PathBuf, Option<Stamp>)> {
+        self.docs
+            .iter()
+            .filter(|(_, d)| d.load == Load::Ready)
+            .map(|(&id, d)| (id, d.path.clone(), d.disk))
+            .collect()
+    }
+
+    /// the file changed on disk. true when the document should reload,
+    /// false when it has edits of its own and is marked in conflict.
+    pub fn changed_on_disk(&mut self, id: DocumentId) -> bool {
+        let Some(doc) = self.docs.get_mut(&id) else {
+            return false;
+        };
+        if doc.is_dirty() {
+            doc.conflict = true;
+            return false;
+        }
+        true
+    }
+
+    /// puts the text read back from disk in, as one undoable edit. carets
+    /// keep their line and column.
+    pub fn reload(&mut self, id: DocumentId, text: &str, disk: Option<Stamp>) {
+        let Some(doc) = self.docs.get_mut(&id) else {
+            return;
+        };
+        if doc.is_dirty() {
+            // typed into while the read was out: don't throw that away
+            doc.conflict = true;
+            return;
+        }
+        let old = doc.buffer.snapshot();
+        let place = |at: usize| old.point(at, Encoding::Utf32).ok();
+        let carets: Vec<(ViewId, Option<Point>, Option<Point>)> = self
+            .views
+            .iter()
+            .filter(|(_, v)| v.doc == id)
+            .map(|(&vid, v)| (vid, place(v.sel.anchor), place(v.sel.head)))
+            .collect();
+        let doc = self.docs.get_mut(&id).expect("checked above");
+        let len = doc.buffer.len();
+        let Ok(set) = doc.buffer.transaction().replace(0..len, text).commit() else {
+            return;
+        };
+        doc.buffer.break_join();
+        let point = doc.buffer.save_point();
+        doc.buffer.mark_saved_at(point);
+        doc.crlf = text.contains("\r\n");
+        doc.disk = disk;
+        doc.conflict = false;
+        doc.spans.clear();
+        doc.diags.clear();
+        doc.recent.push_back(set);
+        if doc.recent.len() > RECENT {
+            doc.recent.pop_front();
+        }
+        let new = doc.buffer.snapshot();
+        let back =
+            |p: Option<Point>| p.map_or(0, |p| crate::lsp::offset_near(&new, p, Encoding::Utf32));
+        for (vid, anchor, head) in carets {
+            if let Some(v) = self.views.get_mut(&vid) {
+                v.sel = Selection {
+                    anchor: back(anchor),
+                    head: back(head),
+                };
+                v.extra.clear();
+                v.goal = None;
+            }
         }
     }
 
@@ -437,6 +558,53 @@ pub fn write_atomic(path: &Path, text: &TextSnapshot) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_keeps_the_caret_place_and_can_be_undone() {
+        let mut docs = Documents::default();
+        let (doc, _) = docs.open(Path::new("r.txt"));
+        let view = docs.add_view(doc);
+        docs.loaded(
+            doc,
+            Ok("ab
+cd"
+            .to_owned()),
+        );
+        docs.view_mut(view).unwrap().sel = Selection::caret(4);
+        assert!(docs.changed_on_disk(doc));
+        docs.reload(
+            doc, "new
+wxyz", None,
+        );
+        let d = docs.doc(doc).unwrap();
+        assert_eq!(
+            d.buffer.text().to_string(),
+            "new
+wxyz"
+        );
+        assert!(!d.is_dirty());
+        assert_eq!(docs.view(view).unwrap().sel, Selection::caret(5));
+        assert!(docs.undo(view));
+        assert_eq!(
+            docs.doc(doc).unwrap().buffer.text().to_string(),
+            "ab
+cd"
+        );
+        assert!(docs.doc(doc).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn dirty_document_is_not_reloaded() {
+        let mut docs = Documents::default();
+        let (doc, _) = docs.open(Path::new("r.txt"));
+        let view = docs.add_view(doc);
+        docs.loaded(doc, Ok("ab".to_owned()));
+        docs.edit(view, vec![(0..0, "x".to_owned())], false);
+        assert!(!docs.changed_on_disk(doc));
+        assert!(docs.doc(doc).unwrap().conflict);
+        docs.reload(doc, "other", None);
+        assert_eq!(docs.doc(doc).unwrap().buffer.text().to_string(), "xab");
+    }
 
     #[test]
     fn one_document_per_path_many_views() {
