@@ -158,7 +158,12 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
             sylven::RevisionId(revision.get()),
             ask.text.to_string(),
         );
-        if let Some(result) = engine.parse(LanguageId(ask.language), &source) {
+        // a parser bug on some odd file must not end colouring for every
+        // file: that one file just stays plain
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.parse(LanguageId(ask.language), &source)
+        }));
+        if let Ok(Some(result)) = parsed {
             spans = result
                 .features
                 .highlights
