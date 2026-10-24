@@ -3,6 +3,7 @@
 //! now; every position a server sends is checked and clamped, and read
 //! against the text of the version it was made for.
 
+pub mod complete;
 pub mod rpc;
 pub mod server;
 pub mod uri;
@@ -56,6 +57,8 @@ pub enum Event {
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
     Hover(ViewId, usize, String),
+    /// completions for a view.
+    Completion(ViewId, Vec<complete::Item>),
     Status(String),
 }
 
@@ -77,6 +80,7 @@ struct Synced {
 enum Pending {
     Definition,
     Hover(ViewId, usize),
+    Complete(ViewId, Revision, crate::document::DocumentId),
 }
 
 #[derive(Default)]
@@ -84,6 +88,8 @@ pub struct Lsp {
     servers: HashMap<&'static str, Slot>,
     synced: HashMap<crate::document::DocumentId, Synced>,
     pending: HashMap<(&'static str, i64), Pending>,
+    /// chars that ask for completion, per language, from the server.
+    triggers: HashMap<&'static str, Vec<String>>,
 }
 
 impl Lsp {
@@ -204,6 +210,29 @@ impl Lsp {
         self.ask(docs, view, "textDocument/definition", Pending::Definition)
     }
 
+    /// asks for completions at the caret of `view`.
+    pub fn complete(&mut self, docs: &Documents, view: ViewId) -> bool {
+        let Some(v) = docs.view(view) else {
+            return false;
+        };
+        let Some(doc) = docs.doc(v.doc) else {
+            return false;
+        };
+        let kind = Pending::Complete(view, doc.buffer.revision(), v.doc);
+        self.ask(docs, view, "textDocument/completion", kind)
+    }
+
+    /// does typing `typed` in a file of `language` ask for completion.
+    pub fn triggers(&self, language: Option<&str>, typed: &str) -> bool {
+        let Some(language) = language else {
+            return false;
+        };
+        self.triggers
+            .iter()
+            .find(|(l, _)| **l == language)
+            .is_some_and(|(_, t)| t.iter().any(|t| typed.ends_with(t.as_str())))
+    }
+
     pub fn hover(&mut self, docs: &Documents, view: ViewId) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
         self.ask(docs, view, "textDocument/hover", Pending::Hover(view, at))
@@ -297,10 +326,23 @@ impl Lsp {
             (None, Some(id)) => {
                 let Some(id) = id.as_i64() else { return };
                 if id == server::INIT {
-                    *encoding = match msg["result"]["capabilities"]["positionEncoding"].as_str() {
+                    let caps = &msg["result"]["capabilities"];
+                    *encoding = match caps["positionEncoding"].as_str() {
                         Some("utf-8") => Encoding::Utf8,
                         _ => Encoding::Utf16,
                     };
+                    let triggers = caps["completionProvider"]["triggerCharacters"]
+                        .as_array()
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .filter(|t| !t.is_empty() && t.len() <= 4)
+                                .take(16)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.triggers.insert(language, triggers);
                     server.initialized();
                     return;
                 }
@@ -315,6 +357,18 @@ impl Lsp {
                         let text = hover_text(&msg["result"]["contents"]);
                         if !text.trim().is_empty() {
                             events.push(Event::Hover(view, at, text));
+                        }
+                    }
+                    Some(Pending::Complete(view, revision, doc)) => {
+                        // positions are in the text the request was made in
+                        let text = self
+                            .synced
+                            .get(&doc)
+                            .and_then(|s| s.sent.iter().find(|(_, t)| t.revision() == revision))
+                            .map(|(_, t)| t.clone());
+                        if let Some(text) = text {
+                            let items = complete::items(&msg["result"], &text, encoding);
+                            events.push(Event::Completion(view, items));
                         }
                     }
                     None => {}
@@ -535,6 +589,32 @@ mod tests {
             "an error squiggle on the string: {diags:?}"
         );
         assert!(lsp.hover(&docs, view));
+        // completion after "x." on a u32 lists its methods
+        let end = docs.doc(doc).unwrap().buffer.len() - 2;
+        docs.edit(view, vec![(end..end, "
+    x.".to_owned())], false);
+        let caret = end + "
+    x.".len();
+        docs.view_mut(view).unwrap().sel = crate::editor::cursor::Selection::caret(caret);
+        lsp.sync(&docs);
+        let start = Instant::now();
+        let mut items = Vec::new();
+        // early replies hold only postfix snippets, until std is indexed
+        let has_pow = |items: &[complete::Item]| items.iter().any(|i| i.label.contains("pow"));
+        while start.elapsed() < Duration::from_secs(90) && !has_pow(&items) {
+            lsp.complete(&docs, view);
+            std::thread::sleep(Duration::from_millis(300));
+            for event in lsp.poll() {
+                if let Event::Completion(_, got) = event {
+                    items = got;
+                }
+            }
+        }
+        assert!(
+            has_pow(&items),
+            "u32 methods: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
         drop(lsp);
         let _ = std::fs::remove_dir_all(&dir);
     }

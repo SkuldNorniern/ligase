@@ -171,6 +171,10 @@ fn init_params(root: &Path) -> Value {
                 "publishDiagnostics": { "versionSupport": true },
                 "hover": { "contentFormat": ["plaintext", "markdown"] },
                 "definition": { "linkSupport": true },
+                "completion": {
+                    "completionItem": { "snippetSupport": true, "insertReplaceSupport": true },
+                    "contextSupport": true,
+                },
             },
             "workspace": { "configuration": true, "workspaceFolders": true },
         },

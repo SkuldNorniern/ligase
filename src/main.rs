@@ -3,6 +3,7 @@
 //! `ligase [folder]` opens the folder, or the current one.
 
 mod app;
+mod completion;
 mod document;
 mod editor;
 mod explorer;

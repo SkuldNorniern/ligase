@@ -14,6 +14,7 @@ use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 
 use resolvase::{Encoding, Point, Revision, SavePoint};
 
+use crate::completion::{self, Popup};
 use crate::document::{self, DocumentId, Documents, ViewId};
 use crate::editor::cursor::Selection;
 use crate::editor::find::{self, Bar, Mode};
@@ -46,6 +47,8 @@ pub enum Id {
     Palette,
     PaletteField,
     PaletteRow(u16),
+    Completion,
+    CompletionRow(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +69,7 @@ pub enum Command {
     GotoLine,
     GotoDefinition,
     ShowHover,
+    Complete,
     FindInFiles,
     ToggleExplorer,
     ToggleTerminal,
@@ -120,6 +124,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Go to Line", Command::GotoLine),
     ("Go to Definition", Command::GotoDefinition),
     ("Show Hover", Command::ShowHover),
+    ("Complete", Command::Complete),
     ("Explorer", Command::ToggleExplorer),
     ("Terminal", Command::ToggleTerminal),
     ("Zoom In", Command::ZoomIn),
@@ -186,6 +191,10 @@ pub struct App {
     bar: Bar,
     /// quick open and commands.
     palette: Palette,
+    /// language server completions under the caret.
+    completion: Option<Popup>,
+    /// ask for completions once the server has the text as it is now.
+    want_complete: Option<ViewId>,
     /// the editor that had the keyboard last, even while a field has it.
     last_editor: Option<ViewId>,
     /// last key or click in an editor; the caret blinks from there.
@@ -238,6 +247,8 @@ impl App {
             zoom: editor::SIZE,
             bar: Bar::default(),
             palette: Palette::default(),
+            completion: None,
+            want_complete: None,
             last_editor: None,
             typed_at: Instant::now(),
             alt_down: false,
@@ -356,6 +367,19 @@ impl App {
         if self.shell_focus {
             return self.shell_event(event);
         }
+        if self.completion.is_some()
+            && !self.ui.text_focused()
+            && let WindowEvent::KeyInput {
+                key,
+                pressed: true,
+                modifiers,
+            } = event
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && self.completion_key(*key)
+        {
+            return true;
+        }
         if let Some(&command) = self.keymap.resolve(event, self.ui.text_focused()) {
             self.run(command);
             return true;
@@ -386,8 +410,19 @@ impl App {
             && let Some(action) =
                 input::action(event, v.page, !v.sel.is_empty() || !v.extra.is_empty())
         {
+            let typed = match &action {
+                input::Action::Insert(t) => Some(t.clone()),
+                _ => None,
+            };
+            let moved = matches!(action, input::Action::Move(..) | input::Action::Collapse);
             editor::act(&mut self.docs, view, action);
             self.hover = None;
+            if moved {
+                self.completion = None;
+            }
+            if let Some(typed) = typed {
+                self.typed_for_completion(view, &typed);
+            }
             self.typed_at = Instant::now();
             return true;
         }
@@ -646,6 +681,12 @@ impl App {
                 }
                 return;
             }
+            Command::Complete => {
+                if let Some(view) = focus {
+                    self.want_complete = Some(view);
+                }
+                return;
+            }
             Command::ShowHover => {
                 if let Some(view) = focus
                     && !self.lsp.hover(&self.docs, view)
@@ -692,6 +733,118 @@ impl App {
             }
         }
         self.layout_dirty = true;
+    }
+
+    /// keys while completions are up: they move the pick, take it or close.
+    /// true when the key was used.
+    fn completion_key(&mut self, key: KeyCode) -> bool {
+        let rows = completion::view::ROWS;
+        let Some(popup) = &mut self.completion else {
+            return false;
+        };
+        match key {
+            KeyCode::Up => popup.step(-1, rows),
+            KeyCode::Down => popup.step(1, rows),
+            KeyCode::PageUp => popup.step(-(rows as isize), rows),
+            KeyCode::PageDown => popup.step(rows as isize, rows),
+            KeyCode::Enter | KeyCode::Tab => {
+                let pick = popup.pick;
+                self.accept_completion(pick);
+            }
+            KeyCode::Escape => self.completion = None,
+            _ => return false,
+        }
+        true
+    }
+
+    /// after typing: a word char or a trigger char asks for completions.
+    fn typed_for_completion(&mut self, view: ViewId, typed: &str) {
+        let word = typed.chars().all(completion::is_word);
+        if word && self.completion.as_ref().is_some_and(|p| p.view == view) {
+            // already up: typing a word just narrows it
+            return;
+        }
+        // anything else ends this list; a trigger char starts the next
+        self.completion = None;
+        let language = self.docs.doc_of(view).and_then(|d| d.language);
+        if word || self.lsp.triggers(language, typed) {
+            self.want_complete = Some(view);
+        }
+    }
+
+    /// puts the picked completion in, over the word typed so far.
+    fn accept_completion(&mut self, index: usize) {
+        let Some(popup) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = popup.shown.get(index).map(|s| popup.items[s.item].clone()) else {
+            return;
+        };
+        let Some(head) = self.docs.view(popup.view).map(|v| v.sel.head) else {
+            return;
+        };
+        let from = item.start.unwrap_or(popup.start).min(popup.start).min(head);
+        let change = editor::lines::Change {
+            sel: editor::cursor::Selection::caret(from + item.caret),
+            edits: vec![(from..head, item.insert)],
+        };
+        if let Some((doc, _)) = self.docs.editable(popup.view) {
+            doc.buffer.break_join();
+        }
+        editor::apply(&mut self.docs, popup.view, change, false);
+        self.typed_at = Instant::now();
+    }
+
+    /// new completions from the server; shown when the caret is still on
+    /// the word they were asked for.
+    fn completed(&mut self, view: ViewId, items: Vec<crate::lsp::complete::Item>) {
+        if items.is_empty() || self.focus.or(self.last_editor) != Some(view) {
+            return;
+        }
+        let Some(v) = self.docs.view(view) else {
+            return;
+        };
+        let Some(doc) = self.docs.doc(v.doc) else {
+            return;
+        };
+        if !v.sel.is_empty() {
+            return;
+        }
+        let start = completion::word_start(doc.buffer.text(), v.sel.head);
+        let mut popup = Popup::new(view, items, start);
+        // keep the light on the same row when a new list replaces an old one
+        if let Some(old) = &self.completion
+            && old.view == view
+        {
+            popup.opened = false;
+        }
+        self.completion = Some(popup);
+    }
+
+    /// narrows the popup to the word typed so far, or closes it once the
+    /// caret has left that word.
+    fn refilter_completion(&mut self) {
+        let Some(popup) = &mut self.completion else {
+            return;
+        };
+        let typed = (|| {
+            let v = self.docs.view(popup.view)?;
+            let doc = self.docs.doc(v.doc)?;
+            if !v.sel.is_empty() || v.sel.head < popup.start {
+                return None;
+            }
+            let typed = doc.buffer.text().slice(popup.start..v.sel.head).ok()?;
+            typed.chars().all(completion::is_word).then_some(typed)
+        })();
+        match typed {
+            Some(typed) => {
+                popup.filter(&typed);
+                if popup.shown.is_empty() {
+                    self.completion = None;
+                }
+            }
+            None => self.completion = None,
+        }
     }
 
     /// lists the workspace files on the worker for quick open. the old
@@ -1202,6 +1355,7 @@ impl App {
                         v.goto = Some((at, encoding));
                     }
                 }
+                lsp::Event::Completion(view, items) => self.completed(view, items),
                 lsp::Event::Hover(view, at, text) => {
                     if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
                         self.hover = Some((view, at, text));
@@ -1215,6 +1369,9 @@ impl App {
             self.start_server(language);
         }
         self.lsp.sync(&self.docs);
+        if let Some(view) = self.want_complete.take() {
+            self.lsp.complete(&self.docs, view);
+        }
         while let Some(parsed) = self.syntax.take() {
             self.docs.coloured(parsed);
         }
@@ -1365,6 +1522,8 @@ impl App {
         let mut ime = None;
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
+        self.refilter_completion();
+        let mut picked_completion = None;
         let mut found = None;
         let mut blink = None;
         let idle = self.typed_at.elapsed();
@@ -1468,6 +1627,12 @@ impl App {
                 // its editor is not in sight; the bar goes with it
                 bar_ask = Some(find::Ask::Close);
             }
+            if let Some(popup) = &mut self.completion
+                && focus == Some(popup.view)
+                && let Some(caret) = ime
+            {
+                picked_completion = completion::view::show(&mut ui, popup, caret, main)?;
+            }
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
             status_bar(&mut ui, status, &message, &place)?;
         }
@@ -1481,6 +1646,12 @@ impl App {
         }
         if let Some(ask) = palette_ask {
             self.palette_ask(ask);
+        }
+        if let Some(index) = picked_completion {
+            self.accept_completion(index);
+        } else if !pressed.is_empty() || focus.is_none() {
+            // a click elsewhere, or the editor lost the keyboard
+            self.completion = None;
         }
         if let Some(view) = definition
             && !self.lsp.definition(&self.docs, view)
@@ -1673,6 +1844,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::G), Command::GotoLine)
         .bind(Chord::key(KeyCode::F12), Command::GotoDefinition)
         .bind(Chord::command(KeyCode::I), Command::ShowHover)
+        .bind(Chord::key(KeyCode::Space).ctrl(), Command::Complete)
         .bind(Chord::command(KeyCode::Equals), Command::ZoomIn)
         .bind(Chord::command(KeyCode::Minus), Command::ZoomOut)
         .bind(Chord::command(KeyCode::Key0), Command::ZoomReset)
