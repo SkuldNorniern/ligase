@@ -360,6 +360,22 @@ impl Documents {
     /// diagnostics made for the text at `revision`, moved onto the text
     /// now through the recent edits. too old to move: dropped, the server
     /// sends fresh ones anyway.
+    /// where `at`, an offset in the text of `revision`, is in the text now.
+    /// none when that revision is too old to map.
+    pub fn map_offset(&self, id: DocumentId, revision: Revision, at: usize) -> Option<usize> {
+        let doc = self.docs.get(&id)?;
+        if revision == doc.buffer.revision() {
+            return Some(at);
+        }
+        let from = doc.recent.iter().position(|set| set.before == revision)?;
+        Some(
+            doc.recent
+                .iter()
+                .skip(from)
+                .fold(at, |at, set| set.map(at, Bias::Left)),
+        )
+    }
+
     pub fn set_diags(&mut self, id: DocumentId, revision: Revision, mut diags: Vec<Diag>) {
         let Some(doc) = self.docs.get_mut(&id) else {
             return;

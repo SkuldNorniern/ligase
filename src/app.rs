@@ -195,6 +195,9 @@ pub struct App {
     completion: Option<Popup>,
     /// ask for completions once the server has the text as it is now.
     want_complete: Option<ViewId>,
+    /// the view completions were last asked for; replies for anything else
+    /// (or after escape) are dropped.
+    complete_for: Option<ViewId>,
     /// the editor that had the keyboard last, even while a field has it.
     last_editor: Option<ViewId>,
     /// last key or click in an editor; the caret blinks from there.
@@ -249,6 +252,7 @@ impl App {
             palette: Palette::default(),
             completion: None,
             want_complete: None,
+            complete_for: None,
             last_editor: None,
             typed_at: Instant::now(),
             alt_down: false,
@@ -376,6 +380,7 @@ impl App {
             } = event
             && !modifiers.ctrl
             && !modifiers.alt
+            && !modifiers.shift
             && self.completion_key(*key)
         {
             return true;
@@ -419,6 +424,7 @@ impl App {
             self.hover = None;
             if moved {
                 self.completion = None;
+                self.complete_for = None;
             }
             if let Some(typed) = typed {
                 self.typed_for_completion(view, &typed);
@@ -751,7 +757,11 @@ impl App {
                 let pick = popup.pick;
                 self.accept_completion(pick);
             }
-            KeyCode::Escape => self.completion = None,
+            KeyCode::Escape => {
+                self.completion = None;
+                // a reply still on its way must not bring it back
+                self.complete_for = None;
+            }
             _ => return false,
         }
         true
@@ -797,9 +807,35 @@ impl App {
 
     /// new completions from the server; shown when the caret is still on
     /// the word they were asked for.
-    fn completed(&mut self, view: ViewId, items: Vec<crate::lsp::complete::Item>) {
-        if items.is_empty() || self.focus.or(self.last_editor) != Some(view) {
+    fn completed(
+        &mut self,
+        view: ViewId,
+        revision: Revision,
+        mut items: Vec<crate::lsp::complete::Item>,
+    ) {
+        if items.is_empty()
+            || self.complete_for != Some(view)
+            || self.focus.or(self.last_editor) != Some(view)
+        {
             return;
+        }
+        let Some(v) = self.docs.view(view) else {
+            return;
+        };
+        let doc_id = v.doc;
+        // one word is completed; with more carets there is no one place
+        if !v.sel.is_empty() || !v.extra.is_empty() {
+            return;
+        }
+        // starts are offsets in the text the request was for; move them
+        // over whatever was typed since, or drop the reply when too old
+        for item in &mut items {
+            if let Some(start) = item.start {
+                let Some(now) = self.docs.map_offset(doc_id, revision, start) else {
+                    return;
+                };
+                item.start = Some(now);
+            }
         }
         let Some(v) = self.docs.view(view) else {
             return;
@@ -807,9 +843,6 @@ impl App {
         let Some(doc) = self.docs.doc(v.doc) else {
             return;
         };
-        if !v.sel.is_empty() {
-            return;
-        }
         let start = completion::word_start(doc.buffer.text(), v.sel.head);
         let mut popup = Popup::new(view, items, start);
         // keep the light on the same row when a new list replaces an old one
@@ -1355,7 +1388,9 @@ impl App {
                         v.goto = Some((at, encoding));
                     }
                 }
-                lsp::Event::Completion(view, items) => self.completed(view, items),
+                lsp::Event::Completion(view, revision, items) => {
+                    self.completed(view, revision, items);
+                }
                 lsp::Event::Hover(view, at, text) => {
                     if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
                         self.hover = Some((view, at, text));
@@ -1369,8 +1404,13 @@ impl App {
             self.start_server(language);
         }
         self.lsp.sync(&self.docs);
-        if let Some(view) = self.want_complete.take() {
-            self.lsp.complete(&self.docs, view);
+        if let Some(view) = self.lsp.take_again() {
+            self.want_complete.get_or_insert(view);
+        }
+        if let Some(view) = self.want_complete.take()
+            && self.lsp.complete(&self.docs, view)
+        {
+            self.complete_for = Some(view);
         }
         while let Some(parsed) = self.syntax.take() {
             self.docs.coloured(parsed);

@@ -889,7 +889,10 @@ pub fn show(
                 && let Some(at) = ui.pointer()
             {
                 if let Some((from_line, from_x)) = column {
-                    let to_line = line_at_y(at.y);
+                    // a box never spans more than this many lines
+                    const MAX_BOX: usize = 2000;
+                    let to_line = line_at_y(at.y)
+                        .clamp(from_line.saturating_sub(MAX_BOX), from_line + MAX_BOX);
                     let to_x = at.x - body_x;
                     let mut boxed = Vec::new();
                     for line in from_line.min(to_line)..=from_line.max(to_line) {

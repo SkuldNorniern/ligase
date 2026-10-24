@@ -11,6 +11,7 @@ pub mod uri;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use resolvase::{Encoding, Point, Revision, TextSnapshot};
 use serde_json::{Value, json};
@@ -22,6 +23,8 @@ use server::Server;
 const MAX_SYNCED: usize = 8 * 1024 * 1024;
 /// old versions kept so late diagnostics land on the right text.
 const KEEP_VERSIONS: usize = 8;
+/// a completion request not answered by then no longer holds up the next.
+const COMPLETE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// the server for a sylven language: command, args, lsp language id.
 pub fn server_for(language: &str) -> Option<(&'static str, &'static [&'static str], &'static str)> {
@@ -57,8 +60,8 @@ pub enum Event {
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
     Hover(ViewId, usize, String),
-    /// completions for a view.
-    Completion(ViewId, Vec<complete::Item>),
+    /// completions for a view, positions in the text of `revision`.
+    Completion(ViewId, Revision, Vec<complete::Item>),
     Status(String),
 }
 
@@ -90,6 +93,10 @@ pub struct Lsp {
     pending: HashMap<(&'static str, i64), Pending>,
     /// chars that ask for completion, per language, from the server.
     triggers: HashMap<&'static str, Vec<String>>,
+    /// the completion request out now and when it went; one at a time.
+    completing: Option<((&'static str, i64), Instant)>,
+    /// asked again while one was out: ask once that one is back.
+    again: Option<ViewId>,
 }
 
 impl Lsp {
@@ -208,6 +215,7 @@ impl Lsp {
     /// asks where the thing at the caret of `view` is defined.
     pub fn definition(&mut self, docs: &Documents, view: ViewId) -> bool {
         self.ask(docs, view, "textDocument/definition", Pending::Definition)
+            .is_some()
     }
 
     /// asks for completions at the caret of `view`.
@@ -218,8 +226,32 @@ impl Lsp {
         let Some(doc) = docs.doc(v.doc) else {
             return false;
         };
+        // one out at a time: a fast typist asks once per reply, not per key;
+        // a server that never answers is given up on after a while
+        if let Some((_, sent)) = self.completing
+            && sent.elapsed() < COMPLETE_TIMEOUT
+        {
+            self.again = Some(view);
+            return true;
+        }
+        if let Some((key, _)) = self.completing.take() {
+            self.pending.remove(&key);
+        }
         let kind = Pending::Complete(view, doc.buffer.revision(), v.doc);
-        self.ask(docs, view, "textDocument/completion", kind)
+        let Some(key) = self.ask(docs, view, "textDocument/completion", kind) else {
+            return false;
+        };
+        self.completing = Some((key, Instant::now()));
+        true
+    }
+
+    /// a view that asked for completion while a request was out, once that
+    /// request is back.
+    pub fn take_again(&mut self) -> Option<ViewId> {
+        if self.completing.is_some() {
+            return None;
+        }
+        self.again.take()
     }
 
     /// does typing `typed` in a file of `language` ask for completion.
@@ -236,28 +268,28 @@ impl Lsp {
     pub fn hover(&mut self, docs: &Documents, view: ViewId) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
         self.ask(docs, view, "textDocument/hover", Pending::Hover(view, at))
+            .is_some()
     }
 
-    fn ask(&mut self, docs: &Documents, view: ViewId, method: &str, kind: Pending) -> bool {
-        let Some(v) = docs.view(view) else {
-            return false;
-        };
-        let Some(synced) = self.synced.get(&v.doc) else {
-            return false;
-        };
-        let Some(doc) = docs.doc(v.doc) else {
-            return false;
-        };
+    /// sends `method` for the caret of `view`; gives the request's key.
+    fn ask(
+        &mut self,
+        docs: &Documents,
+        view: ViewId,
+        method: &str,
+        kind: Pending,
+    ) -> Option<(&'static str, i64)> {
+        let v = docs.view(view)?;
+        let synced = self.synced.get(&v.doc)?;
+        let doc = docs.doc(v.doc)?;
         // the server only knows what was synced; ask only when that is now
         if synced.revision != doc.buffer.revision() {
-            return false;
+            return None;
         }
         let Some(Slot::Running(server, encoding)) = self.servers.get_mut(synced.language) else {
-            return false;
+            return None;
         };
-        let Ok(at) = doc.buffer.text().point(v.sel.head, *encoding) else {
-            return false;
-        };
+        let at = doc.buffer.text().point(v.sel.head, *encoding).ok()?;
         let id = server.request(
             method,
             json!({
@@ -266,7 +298,7 @@ impl Lsp {
             }),
         );
         self.pending.insert((synced.language, id), kind);
-        true
+        Some((synced.language, id))
     }
 
     /// reads what the servers sent.
@@ -360,6 +392,7 @@ impl Lsp {
                         }
                     }
                     Some(Pending::Complete(view, revision, doc)) => {
+                        self.completing = None;
                         // positions are in the text the request was made in
                         let text = self
                             .synced
@@ -368,7 +401,7 @@ impl Lsp {
                             .map(|(_, t)| t.clone());
                         if let Some(text) = text {
                             let items = complete::items(&msg["result"], &text, encoding);
-                            events.push(Event::Completion(view, items));
+                            events.push(Event::Completion(view, revision, items));
                         }
                     }
                     None => {}
@@ -591,10 +624,20 @@ mod tests {
         assert!(lsp.hover(&docs, view));
         // completion after "x." on a u32 lists its methods
         let end = docs.doc(doc).unwrap().buffer.len() - 2;
-        docs.edit(view, vec![(end..end, "
-    x.".to_owned())], false);
-        let caret = end + "
-    x.".len();
+        docs.edit(
+            view,
+            vec![(
+                end..end,
+                "
+    x."
+                .to_owned(),
+            )],
+            false,
+        );
+        let caret = end
+            + "
+    x."
+            .len();
         docs.view_mut(view).unwrap().sel = crate::editor::cursor::Selection::caret(caret);
         lsp.sync(&docs);
         let start = Instant::now();
@@ -605,7 +648,7 @@ mod tests {
             lsp.complete(&docs, view);
             std::thread::sleep(Duration::from_millis(300));
             for event in lsp.poll() {
-                if let Event::Completion(_, got) = event {
+                if let Event::Completion(_, _, got) = event {
                     items = got;
                 }
             }
