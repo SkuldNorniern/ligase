@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use aurea::render::{Color, Font, Rect};
-use aurea::ui::{Align, ScrollArea, Sense, Ui};
+use aurea::ui::{Align, ScrollArea, ScrollStyle, Sense, Ui};
 use aurea::{AureaResult, KeyCode, Modifiers, WindowEvent};
 use vanta::vt::Attrs;
 use vanta::{Cell, CellKind, Color as TermColor, SpawnConfig, Terminal};
@@ -68,6 +68,8 @@ pub struct Shell {
     follow: bool,
     /// the shell asked for `ESC O` arrows (DECCKM), seen last frame.
     app_keys: bool,
+    /// lines dropped off the top of scrollback, as of last frame.
+    dropped: u64,
 }
 
 /// starts a shell in `root`. runs on the worker; `wake` runs on vanta's
@@ -334,18 +336,27 @@ pub fn show(
     }
     let ended = shell.state == State::Ended;
     // only the lines in sight are copied out, never the whole scrollback
-    let total = term.window(0, 0).lines;
+    let head = term.window(0, 0);
+    let total = head.lines;
     let height = (total + usize::from(ended)) as f32 * LINE + 2.0 * PAD;
+    // scrolled back while old lines fall off the top: every line moved up
+    // that much, so the view moves with them, at once, not eased
+    let gone = head.dropped.saturating_sub(shell.dropped);
+    shell.dropped = head.dropped;
+    let shifted = !shell.follow && gone > 0;
+    if shifted {
+        shell.scroll = (shell.scroll - gone as f32 * LINE).max(0.0);
+    }
     if shell.follow {
         shell.scroll = (height - rect.height).max(0.0);
     }
+    let mut style = ScrollStyle::new(ui.theme);
+    style.smooth = !shifted;
     let mut focused = false;
     let mut app_keys = shell.app_keys;
-    ScrollArea::new(&mut shell.scroll, height).show(
-        ui,
-        Id::Terminal,
-        rect,
-        |ui, content, seen| {
+    ScrollArea::new(&mut shell.scroll, height)
+        .style(style)
+        .show(ui, Id::Terminal, rect, |ui, content, seen| {
             let hit = Rect::new(seen.x, seen.y, (seen.width - BAR).max(0.0), seen.height);
             focused = ui
                 .interact(Id::Terminal, 1, hit, Sense::Click, true)
@@ -382,8 +393,7 @@ pub fn show(
                 ui.fill(at, palette.text.with_alpha(120))?;
             }
             Ok(())
-        },
-    )?;
+        })?;
     shell.app_keys = app_keys;
     // scrolled back to the bottom: follow again
     shell.follow = shell.scroll + rect.height >= height - LINE;
