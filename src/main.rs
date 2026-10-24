@@ -21,13 +21,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::{Rc, Weak};
 
-use aurea::dialog::FileDialog;
+use aurea::dialog::{FileDialog, MessageButtons, MessageChoice, MessageDialog, MessageKind};
 use aurea::elements::{Orientation, Stack};
 use aurea::menu::{MenuItem, SubMenu};
 use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
 use aurea::{AureaResult, Container, Window};
 
-use crate::app::{App, Command, Dialog};
+use crate::app::{App, Command, Dialog, DialogStart};
 use crate::editor::{CaretOp, FoldOp, LineOp};
 use crate::lang::Lang;
 use crate::workbench::panels::Panel;
@@ -79,10 +79,7 @@ fn run() -> AureaResult<()> {
                 }
             }
             let close = std::mem::take(&mut a.close_now);
-            let dialog = a.take_dialog().map(|d| match d {
-                Dialog::SaveAs(view) => (d, Some(a.save_as_start(view))),
-                Dialog::Open => (d, Some((String::new(), a.root().to_path_buf()))),
-            });
+            let dialog = a.take_dialog().map(|d| (d, a.dialog_start(d)));
             if let Some(dialog) = dialog {
                 show_dialog(&drawn, &shown_in_draw, id, dialog);
             }
@@ -135,7 +132,7 @@ fn show_dialog(
     app: &Rc<RefCell<App>>,
     window: &Rc<RefCell<Weak<Window>>>,
     id: CanvasId,
-    (dialog, start): (Dialog, Option<(String, PathBuf)>),
+    (dialog, start): (Dialog, DialogStart),
 ) {
     let app = Rc::clone(app);
     let window = Rc::clone(window);
@@ -143,7 +140,22 @@ fn show_dialog(
         let Some(window) = window.borrow().upgrade() else {
             return;
         };
-        let (name, folder) = start.unwrap_or_default();
+        let (name, folder) = match start {
+            DialogStart::File(name, folder) => (name, folder),
+            DialogStart::Message(title, text) => {
+                let choice = MessageDialog::new(title)
+                    .message(text)
+                    .kind(MessageKind::Warning)
+                    .buttons(MessageButtons::SaveDiscardCancel)
+                    .show(&window)
+                    .unwrap_or(MessageChoice::Cancel);
+                if let Ok(mut a) = app.try_borrow_mut() {
+                    a.answered(dialog, choice);
+                }
+                request_canvas_redraw(id);
+                return;
+            }
+        };
         let picked = match dialog {
             Dialog::Open => FileDialog::new()
                 .directory(&folder)
@@ -158,6 +170,7 @@ fn show_dialog(
                 .flatten()
                 .into_iter()
                 .collect(),
+            Dialog::Unsaved(_) => Vec::new(),
         };
         if let Ok(mut a) = app.try_borrow_mut() {
             a.dialog_done(dialog, picked);

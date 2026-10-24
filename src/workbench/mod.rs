@@ -91,6 +91,20 @@ impl Workbench {
     /// closes a tab if that loses nothing. editors hand their view to
     /// `docs`; the last editor leaves a welcome tab behind.
     pub fn close(&mut self, pane: PaneId, docs: &mut Documents) -> Result<(), Refused> {
+        self.close_with(pane, docs, false)
+    }
+
+    /// closes a tab even with unsaved edits; the user chose to drop them.
+    pub fn close_discarding(&mut self, pane: PaneId, docs: &mut Documents) -> Result<(), Refused> {
+        self.close_with(pane, docs, true)
+    }
+
+    fn close_with(
+        &mut self,
+        pane: PaneId,
+        docs: &mut Documents,
+        discard: bool,
+    ) -> Result<(), Refused> {
         match self.panels.get(pane) {
             None => {
                 self.tree().remove(pane);
@@ -101,7 +115,7 @@ impl Workbench {
                 self.tree().remove(pane);
             }
             Some(Panel::Editor(view)) => {
-                if docs.close_loses_work(view) {
+                if !discard && docs.close_loses_work(view) {
                     return Err(Refused::Unsaved);
                 }
                 let last = !self

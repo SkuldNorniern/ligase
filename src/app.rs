@@ -145,6 +145,16 @@ const COMMANDS: &[(&str, Command)] = &[
 pub enum Dialog {
     Open,
     SaveAs(ViewId),
+    /// unsaved edits would go: the window closing (none) or one tab.
+    Unsaved(Option<PaneId>),
+}
+
+/// how a dialog starts out.
+pub enum DialogStart {
+    /// a file dialog: the name and the folder.
+    File(String, PathBuf),
+    /// a message box: its title and text.
+    Message(String, String),
 }
 
 /// what the worker hands back.
@@ -211,6 +221,10 @@ pub struct App {
     typed_at: Instant,
     /// a dialog main should show after this frame.
     dialog: Option<Dialog>,
+    /// "save" was the answer to closing: close once every file is written.
+    close_after_save: bool,
+    /// the same for one tab.
+    close_pane_after_save: Option<PaneId>,
     /// the terminal panel had the keyboard last frame.
     shell_focus: bool,
     canvas: Option<CanvasId>,
@@ -259,6 +273,8 @@ impl App {
             last_editor: None,
             typed_at: Instant::now(),
             dialog: None,
+            close_after_save: false,
+            close_pane_after_save: None,
             shell_focus: false,
             canvas: None,
             session: workbench::session_path(root),
@@ -889,10 +905,131 @@ impl App {
                     self.last_editor = None;
                 }
             }
-            Err(Refused::Unsaved) => {
-                self.status = self.texts.tr("save it first, it has changes").to_owned();
-            }
+            Err(Refused::Unsaved) => self.dialog = Some(Dialog::Unsaved(Some(pane))),
             Err(Refused::KeepsEditorArea) => {}
+        }
+    }
+
+    /// names of the files with unsaved edits that a close would drop.
+    fn unsaved_names(&self, pane: Option<PaneId>) -> Vec<String> {
+        match pane {
+            Some(pane) => match self.bench.panels.get(pane) {
+                Some(Panel::Editor(view)) => self
+                    .docs
+                    .doc_of(view)
+                    .map(document::Document::name)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            },
+            None => self
+                .docs
+                .all()
+                .filter(|d| d.is_dirty())
+                .map(document::Document::name)
+                .collect(),
+        }
+    }
+
+    /// how the dialog main is about to show starts out.
+    pub fn dialog_start(&self, dialog: Dialog) -> DialogStart {
+        match dialog {
+            Dialog::SaveAs(view) => {
+                let (name, folder) = self.save_as_start(view);
+                DialogStart::File(name, folder)
+            }
+            Dialog::Open => DialogStart::File(String::new(), self.root().to_path_buf()),
+            Dialog::Unsaved(pane) => {
+                let names = self.unsaved_names(pane);
+                let mut list: Vec<String> = names.iter().take(8).cloned().collect();
+                if names.len() > list.len() {
+                    list.push(format!("+{}", names.len() - list.len()));
+                }
+                let title = self.texts.tr("Unsaved changes").to_owned();
+                let text = format!(
+                    "{}\n\n{}",
+                    self.texts.tr("save the changes before closing?"),
+                    list.join("\n")
+                );
+                DialogStart::Message(title, text)
+            }
+        }
+    }
+
+    /// the answer to a save / discard / cancel box.
+    pub fn answered(&mut self, dialog: Dialog, choice: aurea::dialog::MessageChoice) {
+        use aurea::dialog::MessageChoice;
+        let Dialog::Unsaved(pane) = dialog else {
+            return;
+        };
+        match (pane, choice) {
+            (None, MessageChoice::Save) => {
+                self.close_after_save = true;
+                self.save_all_for_close();
+            }
+            (None, MessageChoice::Discard) => self.close_saving_layout(),
+            (Some(pane), MessageChoice::Save) => {
+                if let Some(Panel::Editor(view)) = self.bench.panels.get(pane) {
+                    self.close_pane_after_save = Some(pane);
+                    self.save(view);
+                }
+            }
+            (Some(pane), MessageChoice::Discard)
+                if self.bench.close_discarding(pane, &mut self.docs).is_ok() =>
+            {
+                self.layout_dirty = true;
+                if self
+                    .last_editor
+                    .is_some_and(|v| self.docs.view(v).is_none())
+                {
+                    self.last_editor = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// saves every file with edits for a close; a never saved one asks
+    /// where first and the close waits for it.
+    fn save_all_for_close(&mut self) {
+        let views = self.docs.dirty_views();
+        if views.is_empty() {
+            self.close_saving_layout();
+            return;
+        }
+        for view in views {
+            // untitled ones ask where, one at a time
+            if self.docs.doc_of(view).is_some_and(|d| d.untitled) {
+                if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::SaveAs(view));
+                }
+            } else {
+                self.save(view);
+            }
+        }
+    }
+
+    /// a save came back: a close that waited on it goes ahead.
+    fn after_save(&mut self, doc: DocumentId, ok: bool) {
+        if !ok {
+            // a failed save keeps everything open
+            self.close_after_save = false;
+            self.close_pane_after_save = None;
+            return;
+        }
+        if let Some(pane) = self.close_pane_after_save
+            && let Some(Panel::Editor(view)) = self.bench.panels.get(pane)
+            && self.docs.view(view).is_some_and(|v| v.doc == doc)
+        {
+            self.close_pane_after_save = None;
+            self.close_pane(pane);
+        }
+        if self.close_after_save && !self.docs.any_dirty() {
+            self.close_after_save = false;
+            self.close_saving_layout();
+        } else if self.close_after_save && self.dialog.is_none() {
+            // more never saved files: ask for the next one
+            self.save_all_for_close();
         }
     }
 
@@ -1178,9 +1315,15 @@ impl App {
             return;
         }
         if self.docs.any_dirty() {
-            self.status = self.texts.tr("save it first, it has changes").to_owned();
+            // ask: save, drop them, or stay
+            self.dialog = Some(Dialog::Unsaved(None));
             return;
         }
+        self.close_saving_layout();
+    }
+
+    /// closes the window once the layout is written.
+    fn close_saving_layout(&mut self) {
         // before the saved session is back, writing would wipe it
         if self.restored && self.save_layout() {
             self.closing = true;
@@ -1230,6 +1373,8 @@ impl App {
     /// what the user picked in a dialog; empty when cancelled.
     pub fn dialog_done(&mut self, dialog: Dialog, picked: Vec<PathBuf>) {
         match dialog {
+            // answered through `answered`
+            Dialog::Unsaved(_) => {}
             Dialog::Open => {
                 for path in picked {
                     let view = self.open_file(&path);
@@ -1239,6 +1384,8 @@ impl App {
             }
             Dialog::SaveAs(view) => {
                 let Some(path) = picked.into_iter().next() else {
+                    // cancelled: a close waiting on this file stays open
+                    self.close_after_save = false;
                     return;
                 };
                 let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
@@ -1477,9 +1624,11 @@ impl App {
                         self.docs.saved(doc, point);
                         self.docs.set_disk(doc, disk);
                         self.status = format!("{} {name}", self.texts.tr("saved"));
+                        self.after_save(doc, true);
                     }
                     Err(why) => {
                         self.status = format!("{} {name}: {why}", self.texts.tr("can't save"));
+                        self.after_save(doc, false);
                     }
                 },
                 Done::Shell(result) => self.shell.started(result),
@@ -1913,4 +2062,69 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aurea::dialog::MessageChoice;
+
+    fn app() -> App {
+        let dir = std::env::temp_dir().join(format!("ligase-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        App::new(&dir, Lang::En)
+    }
+
+    /// a file with an edit in it, open in a tab.
+    fn dirty(app: &mut App) -> ViewId {
+        let doc = app.docs.new_untitled();
+        let view = app.docs.add_view(doc);
+        app.docs.edit(view, vec![(0..0, "x".to_owned())], false);
+        app.bench.show_editor(view);
+        view
+    }
+
+    #[test]
+    fn close_with_nothing_unsaved_closes() {
+        let mut app = app();
+        app.event(&WindowEvent::CloseRequested);
+        assert!(app.close_now || app.closing);
+        assert!(app.take_dialog().is_none());
+    }
+
+    #[test]
+    fn close_with_edits_asks_and_discard_closes() {
+        let mut app = app();
+        dirty(&mut app);
+        app.event(&WindowEvent::CloseRequested);
+        assert!(!app.close_now && !app.closing, "not before the answer");
+        let dialog = app.take_dialog().expect("asks");
+        assert_eq!(dialog, Dialog::Unsaved(None));
+        app.answered(dialog, MessageChoice::Cancel);
+        assert!(!app.close_now && !app.closing);
+        app.answered(dialog, MessageChoice::Discard);
+        assert!(app.close_now || app.closing);
+    }
+
+    #[test]
+    fn save_on_close_asks_where_for_a_new_file() {
+        let mut app = app();
+        let view = dirty(&mut app);
+        app.answered(Dialog::Unsaved(None), MessageChoice::Save);
+        assert_eq!(app.take_dialog(), Some(Dialog::SaveAs(view)));
+        // cancelling that keeps the window open
+        app.dialog_done(Dialog::SaveAs(view), Vec::new());
+        assert!(!app.close_after_save);
+    }
+
+    #[test]
+    fn closing_a_dirty_tab_asks_and_discard_drops_it() {
+        let mut app = app();
+        let view = dirty(&mut app);
+        let pane = app.bench.panels.find(Panel::Editor(view)).unwrap();
+        app.close_pane(pane);
+        assert_eq!(app.take_dialog(), Some(Dialog::Unsaved(Some(pane))));
+        app.answered(Dialog::Unsaved(Some(pane)), MessageChoice::Discard);
+        assert!(app.docs.view(view).is_none());
+    }
 }
