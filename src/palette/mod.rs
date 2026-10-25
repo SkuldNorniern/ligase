@@ -16,6 +16,8 @@ pub enum Kind {
     Commands,
     /// named things in the editor's file, `@` in front.
     Symbols,
+    /// a line of text asked for (a new file's name, say); no list.
+    Prompt,
 }
 
 /// one row: what is shown, and a note on the right like a shortcut.
@@ -54,6 +56,8 @@ pub struct Palette {
     generation: usize,
     /// just opened; it slides in from here.
     pub opened: bool,
+    /// what a prompt asks for.
+    pub hint: String,
 }
 
 impl Palette {
@@ -69,11 +73,19 @@ impl Palette {
         self.query = match kind {
             Kind::Commands => ">".to_owned(),
             Kind::Symbols => "@".to_owned(),
-            Kind::Files => String::new(),
+            Kind::Files | Kind::Prompt => String::new(),
         };
         self.pick = 0;
         self.top = 0;
         self.made_for = None;
+    }
+
+    /// asks for a line of text, starting as `start`, with `hint` shown
+    /// while it is empty.
+    pub fn prompt(&mut self, hint: String, start: String) {
+        self.open(Kind::Prompt);
+        self.hint = hint;
+        self.query = start;
     }
 
     pub fn close(&mut self) {
@@ -99,6 +111,9 @@ impl Palette {
     /// the list asked for by the query: `>` in front means commands, `@`
     /// the symbols of the open file.
     pub fn wanted(&self) -> (Kind, &str) {
+        if self.kind == Some(Kind::Prompt) {
+            return (Kind::Prompt, self.query.trim());
+        }
         if let Some(rest) = self.query.strip_prefix('>') {
             (Kind::Commands, rest.trim_start())
         } else if let Some(rest) = self.query.strip_prefix('@') {
@@ -113,6 +128,7 @@ impl Palette {
             Kind::Files => &self.files,
             Kind::Commands => &self.commands,
             Kind::Symbols => &self.symbols,
+            Kind::Prompt => &[],
         }
     }
 

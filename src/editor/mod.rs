@@ -691,6 +691,8 @@ pub struct Shown {
     pub blink: Option<Duration>,
     /// ctrl and a click: the app asks for the definition at the caret.
     pub definition: bool,
+    /// a right click: where, for the menu.
+    pub menu: Option<Point>,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -1188,6 +1190,7 @@ pub fn show(
             if !input.held {
                 column = None;
             }
+            shown.menu = ui.secondary_at(Id::Editor(id), 1);
             if let Some(press) = ui.press(Id::Editor(id), 1).filter(|_| !toggled) {
                 let at = hit_test(ui, press.at);
                 let alt = press.modifiers.alt;

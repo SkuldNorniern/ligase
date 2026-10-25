@@ -187,6 +187,32 @@ impl Documents {
         id
     }
 
+    /// a file or folder was renamed: documents at or under `from` follow it
+    /// to `to`, text and edits kept.
+    pub fn moved(&mut self, from: &Path, to: &Path) {
+        for doc in self.docs.values_mut() {
+            if let Ok(rest) = doc.path.strip_prefix(from) {
+                doc.path = if rest.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rest)
+                };
+                doc.language = syntax::language_for(&doc.path);
+                doc.spans.clear();
+                doc.asked = None;
+            }
+        }
+    }
+
+    /// documents at or under `path`, for a delete.
+    pub fn under(&self, path: &Path) -> Vec<DocumentId> {
+        self.docs
+            .iter()
+            .filter(|(_, d)| d.path.starts_with(path))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// gives the document its real file, from save as.
     pub fn set_path(&mut self, id: DocumentId, path: &Path) {
         if let Some(doc) = self.docs.get_mut(&id) {

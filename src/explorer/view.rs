@@ -8,12 +8,17 @@ use crate::app::Id;
 const ROW: f32 = 22.0;
 const INDENT: f32 = 14.0;
 
+/// what a frame of the tree tells the app.
+#[derive(Default)]
+pub struct Shown {
+    /// a click on a row to act on.
+    pub click: Option<Click>,
+    /// a right click: where, and the row under it if any.
+    pub menu: Option<(Point, Option<usize>)>,
+}
+
 /// draws the tree. a click on a row comes back for the app to act on.
-pub fn show(
-    ui: &mut Ui<'_, Id>,
-    explorer: &mut Explorer,
-    rect: Rect,
-) -> AureaResult<Option<Click>> {
+pub fn show(ui: &mut Ui<'_, Id>, explorer: &mut Explorer, rect: Rect) -> AureaResult<Shown> {
     let font = ui.theme.font(13.0);
     let palette = ui.theme.palette;
     let before = explorer.selected;
@@ -55,9 +60,26 @@ pub fn show(
         )
     });
     let acted = (selected != before && !keyed) || response.activated;
-    Ok(selected
-        .filter(|_| acted)
-        .and_then(|row| explorer.click(row)))
+    let menu = ui
+        .secondary_at(Id::Explorer, 1)
+        .or_else(|| ui.secondary_at(Id::Explorer, 0))
+        .map(|at| {
+            // the row under the pointer, from the scroll and row height
+            let row = ((at.y - rect.y + scroll) / ROW).floor();
+            let row = (row >= 0.0)
+                .then_some(row as usize)
+                .filter(|&r| r < explorer.len());
+            if row.is_some() {
+                explorer.selected = row;
+            }
+            (at, row)
+        });
+    Ok(Shown {
+        click: selected
+            .filter(|_| acted)
+            .and_then(|row| explorer.click(row)),
+        menu,
+    })
 }
 
 /// small arrow: right when closed, down when open.

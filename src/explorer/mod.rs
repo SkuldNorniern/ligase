@@ -117,6 +117,28 @@ impl Explorer {
 
     /// scan result for `path`. ignored when the folder is gone from the tree
     /// or already listed.
+    /// the path of row `index` and whether it is a folder.
+    pub fn row_path(&self, index: usize) -> Option<(PathBuf, bool)> {
+        let node = &self.nodes[*self.rows.get(index)?];
+        Some((node.path.clone(), node.dir))
+    }
+
+    /// forgets what folder `path` held, so a new scan fills it again. true
+    /// when it was listed and open, and so wants that scan now.
+    pub fn forget(&mut self, path: &Path) -> bool {
+        let Some(node) = self.nodes.iter_mut().find(|n| n.dir && n.path == path) else {
+            return false;
+        };
+        if node.children.is_none() {
+            return false;
+        }
+        node.children = None;
+        let wants = node.open;
+        node.scanning = wants;
+        self.rebuild();
+        wants
+    }
+
     pub fn listed(&mut self, path: &Path, entries: Vec<(String, bool)>) {
         let Some(parent) = self
             .nodes
@@ -176,6 +198,50 @@ impl Explorer {
 
 /// lists one folder: folders first, then files, names compared without case.
 /// runs on the worker.
+/// a name typed for a new or renamed entry: one plain path part.
+pub fn plain_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+        || name.chars().any(char::is_control);
+    (!bad).then_some(name)
+}
+
+/// makes an empty file; never over one already there. runs on the worker.
+pub fn create_file(path: &Path) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+pub fn create_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|e| e.to_string())
+}
+
+/// renames `from` to `to`; never over something already at `to`.
+pub fn rename(from: &Path, to: &Path) -> Result<(), String> {
+    if to.exists() {
+        return Err("something with that name is already there".to_owned());
+    }
+    std::fs::rename(from, to).map_err(|e| e.to_string())
+}
+
+/// deletes a file, or a folder with what is in it. the user said yes first.
+pub fn delete(path: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|e| e.to_string())
+}
+
 pub fn scan(path: &Path) -> Result<Vec<(String, bool)>, String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
@@ -284,5 +350,33 @@ mod tests {
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["Zeta", "A.rs", "b.rs"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_are_one_plain_part() {
+        assert_eq!(plain_name(" a.rs "), Some("a.rs"));
+        assert_eq!(plain_name("a/b"), None);
+        assert_eq!(plain_name(".."), None);
+        assert_eq!(plain_name(""), None);
+        assert_eq!(plain_name("가.txt"), Some("가.txt"));
+    }
+
+    #[test]
+    fn file_ops_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("ligase-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        create_file(&a).unwrap();
+        assert!(create_file(&a).is_err(), "already there");
+        let b = dir.join("b.txt");
+        create_file(&b).unwrap();
+        assert!(rename(&a, &b).is_err(), "never over b");
+        rename(&a, &dir.join("c.txt")).unwrap();
+        create_dir(&dir.join("sub")).unwrap();
+        delete(&dir.join("sub")).unwrap();
+        delete(&b).unwrap();
+        assert!(!b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@ use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
 use resolvase::{Encoding, Point, Revision, SavePoint};
 
 use crate::completion::{self, Popup};
+use crate::context_menu::{self, Act, ContextMenu};
 use crate::document::{self, DocumentId, Documents, ViewId};
 use crate::editor::cursor::Selection;
 use crate::editor::find::{self, Bar, Mode};
@@ -54,6 +55,7 @@ pub enum Id {
     Completion,
     CompletionRow(u16),
     ProblemList,
+    Menu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +170,8 @@ pub enum Dialog {
     SaveAs(ViewId),
     /// unsaved edits would go: the window closing (none) or one tab.
     Unsaved(Option<PaneId>),
+    /// delete the file or folder in `App::delete_path`?
+    ConfirmDelete,
 }
 
 /// how a dialog starts out.
@@ -176,6 +180,37 @@ pub enum DialogStart {
     File(String, PathBuf),
     /// a message box: its title and text.
     Message(String, String),
+    /// an ok / cancel question: its title and text.
+    Confirm(String, String),
+}
+
+/// what a right-click menu was opened on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    /// an explorer entry, and whether it is a folder.
+    Entry(PathBuf, bool),
+    /// the explorer's empty space: the workspace folder.
+    Root,
+    Tab(PaneId),
+    Editor(ViewId),
+}
+
+/// what a prompt in the palette is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromptFor {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+}
+
+/// a file operation's outcome, for the explorer and open documents.
+#[derive(Debug, Default)]
+struct FileDone {
+    /// the folder to list again.
+    rescan: PathBuf,
+    open: Option<PathBuf>,
+    moved: Option<(PathBuf, PathBuf)>,
+    deleted: Option<PathBuf>,
 }
 
 /// what the worker hands back.
@@ -204,6 +239,9 @@ enum Done {
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
+    FileOp(Result<FileDone, String>),
+    /// something the worker did that only has a status to say.
+    Note(Option<String>),
     /// the settings file's text, when there is one.
     Settings(Option<String>),
     /// the settings file to open, made with every key shown when missing.
@@ -234,6 +272,11 @@ pub struct App {
     bar: Bar,
     /// quick open and commands.
     palette: Palette,
+    menu: ContextMenu,
+    menu_target: Option<Target>,
+    prompt_for: Option<PromptFor>,
+    /// what a delete waiting on its yes / no would remove.
+    delete_path: Option<PathBuf>,
     /// language server completions under the caret.
     completion: Option<Popup>,
     /// ask for completions once the server has the text as it is now.
@@ -304,6 +347,10 @@ impl App {
             zoom: editor::SIZE,
             bar: Bar::default(),
             palette: Palette::default(),
+            menu: ContextMenu::default(),
+            menu_target: None,
+            prompt_for: None,
+            delete_path: None,
             completion: None,
             want_complete: None,
             complete_for: None,
@@ -1054,6 +1101,186 @@ impl App {
         self.layout_dirty = true;
     }
 
+    /// a right-click menu row was picked.
+    fn menu_act(&mut self, act: Act) {
+        let Some(target) = self.menu_target.take() else {
+            return;
+        };
+        let root = self.explorer.root().to_path_buf();
+        // the folder new entries go in, and the path the row is about
+        let (folder, path) = match &target {
+            Target::Entry(path, true) => (path.clone(), Some(path.clone())),
+            Target::Entry(path, false) => (
+                path.parent()
+                    .map_or_else(|| root.clone(), Path::to_path_buf),
+                Some(path.clone()),
+            ),
+            Target::Root => (root.clone(), None),
+            Target::Tab(pane) => match self.bench.panels.get(*pane) {
+                Some(Panel::Editor(view)) => {
+                    let p = self
+                        .docs
+                        .doc_of(view)
+                        .filter(|d| !d.untitled)
+                        .map(|d| d.path.clone());
+                    (root.clone(), p)
+                }
+                _ => (root.clone(), None),
+            },
+            Target::Editor(view) => (
+                root.clone(),
+                self.docs
+                    .doc_of(*view)
+                    .filter(|d| !d.untitled)
+                    .map(|d| d.path.clone()),
+            ),
+        };
+        match act {
+            Act::Run(command) => {
+                // the command acts on what was clicked
+                let view = match target {
+                    Target::Editor(view) => Some(view),
+                    Target::Tab(pane) => match self.bench.panels.get(pane) {
+                        Some(Panel::Editor(view)) => {
+                            self.bench.dock.tree.activate(pane);
+                            Some(view)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(view) = view {
+                    self.focus = Some(view);
+                    self.last_editor = Some(view);
+                    self.ui.focus(Id::Editor(view), 1);
+                }
+                self.run(command);
+            }
+            Act::NewFile | Act::NewFolder => {
+                let hint = if act == Act::NewFile {
+                    self.texts.tr("new file's name")
+                } else {
+                    self.texts.tr("new folder's name")
+                };
+                self.prompt_for = Some(if act == Act::NewFile {
+                    PromptFor::NewFile(folder)
+                } else {
+                    PromptFor::NewFolder(folder)
+                });
+                self.palette.prompt(hint.to_owned(), String::new());
+                self.ui.focus(Id::PaletteField, 0);
+            }
+            Act::Rename => {
+                let Some(path) = path else { return };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.prompt_for = Some(PromptFor::Rename(path));
+                self.palette
+                    .prompt(self.texts.tr("new name").to_owned(), name);
+                self.ui.focus(Id::PaletteField, 0);
+            }
+            Act::Delete => {
+                if let Some(path) = path {
+                    self.delete_path = Some(path);
+                    self.dialog = Some(Dialog::ConfirmDelete);
+                }
+            }
+            Act::Reveal => {
+                if let Some(path) = path {
+                    // starts a file manager: a process, so on the worker
+                    self.jobs.run(move || {
+                        Done::Note(aurea::reveal_path(&path).err().map(|e| e.to_string()))
+                    });
+                }
+            }
+            Act::CopyPath => {
+                if let Some(path) = path {
+                    let _ = aurea::clipboard::set_clipboard_text(&path.display().to_string());
+                }
+            }
+            Act::CloseOthers | Act::CloseAll => {
+                let keep = match target {
+                    Target::Tab(pane) if act == Act::CloseOthers => Some(pane),
+                    _ => None,
+                };
+                let panes: Vec<PaneId> = self
+                    .bench
+                    .panels
+                    .iter()
+                    .filter(|(id, p)| matches!(p, Panel::Editor(_)) && Some(*id) != keep)
+                    .map(|(id, _)| id)
+                    .collect();
+                // ones with unsaved edits ask, one at a time; the rest go
+                for pane in panes {
+                    self.close_pane(pane);
+                }
+            }
+        }
+    }
+
+    /// the line typed into a prompt.
+    fn prompt_done(&mut self, answer: &str) {
+        let Some(prompt) = self.prompt_for.take() else {
+            return;
+        };
+        let Some(name) = explorer::plain_name(answer) else {
+            self.status = self.texts.tr("that name won't do").to_owned();
+            return;
+        };
+        let name = name.to_owned();
+        let job: Box<dyn FnOnce() -> Done + Send> = match prompt {
+            PromptFor::NewFile(dir) => Box::new(move || {
+                let path = dir.join(&name);
+                Done::FileOp(explorer::create_file(&path).map(|()| FileDone {
+                    rescan: dir,
+                    open: Some(path),
+                    ..FileDone::default()
+                }))
+            }),
+            PromptFor::NewFolder(dir) => Box::new(move || {
+                Done::FileOp(explorer::create_dir(&dir.join(&name)).map(|()| FileDone {
+                    rescan: dir,
+                    ..FileDone::default()
+                }))
+            }),
+            PromptFor::Rename(from) => Box::new(move || {
+                let dir = from.parent().map(Path::to_path_buf).unwrap_or_default();
+                let to = dir.join(&name);
+                Done::FileOp(explorer::rename(&from, &to).map(|()| FileDone {
+                    rescan: dir,
+                    moved: Some((from, to)),
+                    ..FileDone::default()
+                }))
+            }),
+        };
+        self.jobs.run(job);
+    }
+
+    /// a file operation came back: the explorer lists the folder again,
+    /// open documents follow a rename, a deleted file's text is kept.
+    fn file_done(&mut self, done: FileDone) {
+        if self.explorer.forget(&done.rescan) {
+            self.scan(done.rescan.clone());
+        }
+        if let Some((from, to)) = &done.moved {
+            self.docs.moved(from, to);
+            self.layout_dirty = true;
+        }
+        if let Some(path) = &done.deleted {
+            for id in self.docs.under(path) {
+                // the text stays; saving puts the file back
+                self.docs.mark_conflict(id);
+            }
+        }
+        if let Some(path) = done.open {
+            let view = self.open_file(&path);
+            self.ui.focus(Id::Editor(view), 1);
+            self.last_editor = Some(view);
+        }
+    }
+
     /// keys while completions are up: they move the pick, take it or close.
     /// true when the key was used.
     fn completion_key(&mut self, key: KeyCode) -> bool {
@@ -1278,6 +1505,17 @@ impl App {
                 DialogStart::File(name, folder)
             }
             Dialog::Open => DialogStart::File(String::new(), self.root().to_path_buf()),
+            Dialog::ConfirmDelete => {
+                let name = self
+                    .delete_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                DialogStart::Confirm(
+                    self.texts.tr("Delete").to_owned(),
+                    format!("{}\n\n{name}", self.texts.tr("delete this for good?")),
+                )
+            }
             Dialog::Unsaved(pane) => {
                 let names = self.unsaved_names(pane);
                 let mut list: Vec<String> = names.iter().take(8).cloned().collect();
@@ -1298,6 +1536,19 @@ impl App {
     /// the answer to a save / discard / cancel box.
     pub fn answered(&mut self, dialog: Dialog, choice: aurea::dialog::MessageChoice) {
         use aurea::dialog::MessageChoice;
+        if dialog == Dialog::ConfirmDelete {
+            if let (MessageChoice::Ok, Some(path)) = (choice, self.delete_path.take()) {
+                let rescan = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.jobs.run(move || {
+                    Done::FileOp(explorer::delete(&path).map(|()| FileDone {
+                        rescan,
+                        deleted: Some(path),
+                        ..FileDone::default()
+                    }))
+                });
+            }
+            return;
+        }
         let Dialog::Unsaved(pane) = dialog else {
             return;
         };
@@ -1376,6 +1627,7 @@ impl App {
     fn palette_ask(&mut self, ask: palette::view::Ask) {
         let editor = self.last_editor;
         let (kind, query) = self.palette.wanted();
+        let query = query.to_owned();
         let goto = (kind == Kind::Files)
             .then(|| query.strip_prefix(':').and_then(find::parse_goto))
             .flatten();
@@ -1396,8 +1648,13 @@ impl App {
             }
             return;
         }
+        if kind == Kind::Prompt {
+            self.prompt_done(&query);
+            return;
+        }
         let Some(item) = picked else { return };
         match kind {
+            Kind::Prompt => {}
             Kind::Files => {
                 let Some(rel) = self.palette.files.get(item).map(|i| i.text.clone()) else {
                     return;
@@ -1785,7 +2042,7 @@ impl App {
     pub fn dialog_done(&mut self, dialog: Dialog, picked: Vec<PathBuf>) {
         match dialog {
             // answered through `answered`
-            Dialog::Unsaved(_) => {}
+            Dialog::Unsaved(_) | Dialog::ConfirmDelete => {}
             Dialog::Open => {
                 for path in picked {
                     let view = self.open_file(&path);
@@ -2088,6 +2345,13 @@ impl App {
                 Done::Shell(result) => self.shell.started(result),
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
                 Done::Files(files) => self.palette.set_files(files),
+                Done::FileOp(Ok(done)) => self.file_done(done),
+                Done::FileOp(Err(why)) => self.status = why,
+                Done::Note(note) => {
+                    if let Some(note) = note {
+                        self.status = note;
+                    }
+                }
                 Done::Settings(text) => {
                     if let Some(text) = text {
                         match settings::parse(&text) {
@@ -2201,6 +2465,9 @@ impl App {
         let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
         let titles = self.titles();
         let mut clicks: Vec<Click> = Vec::new();
+        let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
+        let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
+        let menu_act;
         let mut focus = None;
         let mut ime = None;
         let mut pressed: Vec<ViewId> = Vec::new();
@@ -2246,7 +2513,11 @@ impl App {
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
             let content = |ui: &mut Ui<'_, Id>, pane: PaneId, rect: Rect| match panels.get(pane) {
                 Some(Panel::Explorer) => {
-                    clicks.extend(explorer::view::show(ui, explorer, rect)?);
+                    let shown = explorer::view::show(ui, explorer, rect)?;
+                    clicks.extend(shown.click);
+                    if let Some((at, row)) = shown.menu {
+                        explorer_menu = Some((at, row.and_then(|r| explorer.row_path(r))));
+                    }
                     Ok(())
                 }
                 Some(Panel::Editor(view)) => {
@@ -2287,6 +2558,9 @@ impl App {
                         }
                         if shown.definition {
                             definition = Some(view);
+                        }
+                        if let Some(at) = shown.menu {
+                            editor_menu = Some((at, view));
                         }
                     }
                     if let Some(v) = docs.view_mut(view) {
@@ -2329,6 +2603,7 @@ impl App {
             {
                 picked_completion = completion::view::show(&mut ui, popup, caret, main)?;
             }
+            menu_act = self.menu.show(&mut ui, texts, &self.keymap);
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
             status_bar(&mut ui, status, &message, &place)?;
         }
@@ -2394,9 +2669,29 @@ impl App {
             self.layout_dirty = true;
         }
         for event in self.bench.dock.take_tab_events() {
-            if let DockTabEvent::CloseRequested(pane) = event {
-                self.close_pane(pane);
+            match event {
+                DockTabEvent::CloseRequested(pane) => self.close_pane(pane),
+                DockTabEvent::ContextMenu { panel, at } => {
+                    let editor = matches!(self.bench.panels.get(panel), Some(Panel::Editor(_)));
+                    self.menu_target = Some(Target::Tab(panel));
+                    self.menu.ask(at, context_menu::tab(editor));
+                }
             }
+        }
+        if let Some((at, entry)) = explorer_menu {
+            let on_entry = entry.is_some();
+            self.menu_target = Some(match entry {
+                Some((path, dir)) => Target::Entry(path, dir),
+                None => Target::Root,
+            });
+            self.menu.ask(at, context_menu::explorer(on_entry));
+        }
+        if let Some((at, view)) = editor_menu {
+            self.menu_target = Some(Target::Editor(view));
+            self.menu.ask(at, context_menu::editor());
+        }
+        if let Some(act) = menu_act {
+            self.menu_act(act);
         }
         for click in clicks {
             match click {
@@ -2654,4 +2949,18 @@ mod tests {
         app.answered(Dialog::Unsaved(Some(pane)), MessageChoice::Discard);
         assert!(app.docs.view(view).is_none());
     }
+
+    #[test]
+    fn new_file_from_the_menu_asks_a_name() {
+        let mut app = app();
+        app.menu_target = Some(Target::Root);
+        app.menu_act(Act::NewFile);
+        assert!(matches!(app.prompt_for, Some(PromptFor::NewFile(_))));
+        assert_eq!(app.palette.kind, Some(Kind::Prompt));
+        // a name with a slash is refused before any file work
+        app.prompt_done("a/b");
+        assert!(app.prompt_for.is_none());
+        assert!(!app.status.is_empty());
+    }
+
 }

@@ -4,6 +4,7 @@
 
 mod app;
 mod completion;
+mod context_menu;
 mod document;
 mod editor;
 mod explorer;
@@ -144,11 +145,16 @@ fn show_dialog(
         };
         let (name, folder) = match start {
             DialogStart::File(name, folder) => (name, folder),
-            DialogStart::Message(title, text) => {
+            DialogStart::Message(title, text) | DialogStart::Confirm(title, text) => {
+                let buttons = if matches!(dialog, Dialog::ConfirmDelete) {
+                    MessageButtons::OkCancel
+                } else {
+                    MessageButtons::SaveDiscardCancel
+                };
                 let choice = MessageDialog::new(title)
                     .message(text)
                     .kind(MessageKind::Warning)
-                    .buttons(MessageButtons::SaveDiscardCancel)
+                    .buttons(buttons)
                     .show(&window)
                     .unwrap_or(MessageChoice::Cancel);
                 if let Ok(mut a) = app.try_borrow_mut() {
@@ -172,7 +178,7 @@ fn show_dialog(
                 .flatten()
                 .into_iter()
                 .collect(),
-            Dialog::Unsaved(_) => Vec::new(),
+            Dialog::Unsaved(_) | Dialog::ConfirmDelete => Vec::new(),
         };
         if let Ok(mut a) = app.try_borrow_mut() {
             a.dialog_done(dialog, picked);
