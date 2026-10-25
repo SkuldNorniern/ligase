@@ -8,6 +8,7 @@ pub mod input;
 pub mod lines;
 pub mod multi;
 pub mod pairs;
+pub mod rows;
 
 use std::ops::Range;
 use std::time::Duration;
@@ -90,7 +91,28 @@ pub fn act_with(docs: &mut Documents, view: ViewId, action: Action, opts: &EditO
     match action {
         Action::Move(motion, extend) => {
             let before = v.sel;
-            v.sel = cursor::motion(&text, v.sel, motion, extend, &mut v.goal);
+            let row_step = match motion {
+                cursor::Motion::Up => Some(true),
+                cursor::Motion::Down => Some(false),
+                _ => None,
+            };
+            let stepped = v.wrap_cols.zip(row_step).and_then(|(cols, up)| {
+                rows::step(
+                    &text,
+                    v.sel.head,
+                    up,
+                    cols,
+                    opts.unit.len().max(1),
+                    &mut v.goal,
+                )
+            });
+            v.sel = match stepped {
+                Some(head) => Selection {
+                    anchor: if extend { v.sel.anchor } else { head },
+                    head,
+                },
+                None => cursor::motion(&text, v.sel, motion, extend, &mut v.goal),
+            };
             if !v.folded.is_empty() {
                 // moves step over folded lines instead of opening them
                 let hidden = fold::hidden(&text, &v.folded);
@@ -999,8 +1021,24 @@ pub fn show(
     view.folded.retain(|f| {
         doc.folds.contains(f) && !fold::hides(text, f).is_some_and(|(a, b)| (a..=b).contains(&here))
     });
-    let hidden = fold::hidden(text, &view.folded);
-    let row_count = fold::rows(lines, &hidden).max(1);
+    // wrapping: as many columns as fit, never fewer than a few
+    let char_w = ui.text_width(" ", &font).max(1.0);
+    let wrap_cols = settings.word_wrap.then(|| {
+        (((rect.width - gutter - BAR - 12.0) / char_w)
+            .floor()
+            .max(8.0)) as usize
+    });
+    let mut cache = std::mem::take(&mut view.wrap);
+    let rows = rows::Rows::new(
+        text,
+        &view.folded,
+        wrap_cols,
+        settings.tab_size.max(1),
+        &mut cache,
+    );
+    view.wrap = cache;
+    view.wrap_cols = rows.wraps().then_some(rows.cols);
+    let row_count = rows.total(lines);
     // the last line can scroll up to near the top
     let height = row_count as f32 * line_h + (rect.height - 3.0 * line_h).max(line_h);
     // lines folds start on and lines folded now, sorted, looked up per row
@@ -1025,8 +1063,7 @@ pub fn show(
         } else {
             0.0
         };
-        let line = text.line_of(view.sel.head).unwrap_or(0);
-        let y = fold::row_of(line, &hidden) as f32 * line_h;
+        let y = rows.row_of(text, view.sel.head).0 as f32 * line_h;
         if y - margin < view.scroll {
             view.scroll = (y - margin).max(0.0);
         } else if y + line_h + margin > view.scroll + rect.height {
@@ -1047,13 +1084,26 @@ pub fn show(
         |ui, content, seen| {
             let first_row = ((seen.y - content.y) / line_h).floor().max(0.0) as usize;
             let count = (seen.height / line_h).ceil() as usize + 1;
-            // the lines in sight, top down, folded ones left out
-            let visible: Vec<usize> = (first_row..first_row + count)
-                .map(|r| fold::line_of_row(r, &hidden))
-                .take_while(|&l| l < lines)
-                .collect();
+            // the rows in sight, top down: a line, or the piece of it a
+            // wrapped row shows, with whether it is the first and last piece
+            let mut visible: Vec<(usize, Range<usize>, bool, bool)> = Vec::with_capacity(count);
+            let mut pieces_line = usize::MAX;
+            let mut pieces: Vec<Range<usize>> = Vec::new();
+            for r in first_row..first_row + count {
+                let (line, k) = rows.line_of_row(r);
+                if line >= lines {
+                    break;
+                }
+                if line != pieces_line {
+                    pieces = rows.pieces_of(text, line);
+                    pieces_line = line;
+                }
+                let Some(piece) = pieces.get(k) else {
+                    break;
+                };
+                visible.push((line, piece.clone(), k == 0, k + 1 == pieces.len()));
+            }
             let row_y = |i: usize| content.y + (first_row + i) as f32 * line_h;
-            let line_y = |line: usize| content.y + fold::row_of(line, &hidden) as f32 * line_h;
             let text_x = content.x + gutter;
             let area = Rect::new(
                 text_x,
@@ -1061,6 +1111,10 @@ pub fn show(
                 (seen.x + seen.width - BAR - text_x).max(0.0),
                 seen.height,
             );
+            // wrapped lines never need sideways scrolling
+            if rows.wraps() {
+                hscroll = 0.0;
+            }
             let hshown = ui.animate(
                 Id::Editor(id),
                 PART_H,
@@ -1077,15 +1131,21 @@ pub fn show(
             if input.hovered {
                 ui.set_cursor(CursorIcon::Text);
             }
-            let line_at_y = |y: f32| {
+            // the line and the piece of it on the row at `y`
+            let piece_at_y = |y: f32| {
                 let row = ((y - content.y) / line_h)
                     .floor()
                     .clamp(0.0, (row_count - 1) as f32) as usize;
-                fold::line_of_row(row, &hidden).min(lines - 1)
+                let (line, k) = rows.line_of_row(row);
+                let line = line.min(lines - 1);
+                let all = rows.pieces_of(text, line);
+                let piece = all.get(k).or(all.last()).cloned().unwrap_or(0..0);
+                (line, piece)
             };
+            let line_at_y = |y: f32| piece_at_y(y).0;
             let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
-                let line = line_at_y(at.y);
-                lay(text, span(text, line), tab).offset_at(ui, &font, at.x - body_x)
+                let (_, piece) = piece_at_y(at.y);
+                lay(text, piece, tab).offset_at(ui, &font, at.x - body_x)
             };
             let mut pull = 0.0;
             // the fold arrow column: a press there folds or opens
@@ -1204,27 +1264,35 @@ pub fn show(
             }
             // sideways wheel, or shift and the wheel, moves along long lines
             let (wx, _) = ui.wheel();
-            if wx != 0.0 && ui.pointer().is_some_and(|p| seen.contains(p)) {
+            if !rows.wraps() && wx != 0.0 && ui.pointer().is_some_and(|p| seen.contains(p)) {
                 hscroll = (hscroll - wx * H_STEP).max(0.0);
                 ui.consume_wheel((wx, 0.0));
             }
 
             let range = sel.range();
             let caret_line = text.line_of(sel.head).unwrap_or(0);
-            let char_w = ui.text_width(" ", &font);
+            let (caret_row, caret_piece) = rows.row_of(text, sel.head);
 
             // gutter: numbers, the caret's line brighter, a mark for problems
             let mut marks: Vec<Option<Severity>> = vec![None; visible.len()];
+            let first_line = visible.first().map_or(0, |v| v.0);
+            let last_line = visible.last().map_or(0, |v| v.0);
             for diag in &doc.diags {
                 if let Ok(l) = text.line_of(diag.range.start)
-                    && let Ok(i) = visible.binary_search(&l)
+                    && (first_line..=last_line).contains(&l)
+                    && let Some(i) = visible.iter().position(|v| v.0 == l && v.2)
                 {
                     let mark = &mut marks[i];
                     *mark = Some(mark.map_or(diag.severity, |m| m.min(diag.severity)));
                 }
             }
             let small = ui.theme.font(11.0);
-            for (i, &line) in visible.iter().enumerate() {
+            for (i, (line, _, first_piece, _)) in visible.iter().enumerate() {
+                let (line, first_piece) = (*line, *first_piece);
+                // a wrapped line's number goes on its first row only
+                if !first_piece {
+                    continue;
+                }
                 let y = row_y(i);
                 let number = Rect::new(content.x, y, gutter - 26.0, line_h);
                 let color = if line == caret_line {
@@ -1235,7 +1303,8 @@ pub fn show(
                 let shown_number = match settings.line_numbers {
                     LineNumbers::On => Some(line + 1),
                     LineNumbers::Relative if line == caret_line => Some(line + 1),
-                    LineNumbers::Relative => Some(line.abs_diff(caret_line)),
+                    // rows apart, so folded and wrapped lines count as drawn
+                    LineNumbers::Relative => Some((first_row + i).abs_diff(caret_row)),
                     LineNumbers::Off => None,
                 };
                 if let Some(n) = shown_number {
@@ -1262,7 +1331,7 @@ pub fn show(
                 .then(|| pairs::matching(text, sel.head))
                 .flatten();
             // the caret's place in text space, lines from the top
-            let caret_laid = lay(text, span(text, caret_line), tab);
+            let caret_laid = lay(text, caret_piece.clone(), tab);
             let mut target_x = caret_laid.x_of(ui, &font, sel.head);
             let mut preedit_w = 0.0;
             if let Some((composing, at)) = &preedit {
@@ -1285,15 +1354,16 @@ pub fn show(
             let mut widest: f32 = 0.0;
             ui.clipped(area, |ui| {
                 let mut carry = 0;
-                if let Some(back) = visible.first().and_then(|l| l.checked_sub(1)) {
+                if let Some(back) = visible.first().and_then(|v| v.0.checked_sub(1)) {
                     let s = span(text, back);
                     carry = depth(&text.slice(s).unwrap_or_default(), tab.len()).unwrap_or(0);
                 }
-                for (i, &line) in visible.iter().enumerate() {
+                for (i, (line, piece, first_piece, last_piece)) in visible.iter().enumerate() {
+                    let (line, first_piece, last_piece) = (*line, *first_piece, *last_piece);
                     let y = row_y(i);
                     let body =
                         Rect::new(body_x, y, (area.x + area.width - body_x).max(0.0), line_h);
-                    let span = span(text, line);
+                    let span = piece.clone();
                     let raw = text.slice(span.clone()).unwrap_or_default();
                     let laid = lay(text, span.clone(), tab);
                     if settings.current_line && focused && sel.is_empty() && line == caret_line {
@@ -1301,8 +1371,15 @@ pub fn show(
                         ui.fill(row, palette.raised.fade(0.45))?;
                     }
                     // indent guides; a blank line keeps the ones above it
-                    let levels = depth(&raw, tab.len()).unwrap_or(carry);
-                    carry = levels;
+                    // guides follow a line's indent, on its first row only
+                    let levels = if first_piece {
+                        depth(&raw, tab.len()).unwrap_or(carry)
+                    } else {
+                        0
+                    };
+                    if first_piece {
+                        carry = levels;
+                    }
                     let guides = if settings.indent_guides { levels } else { 0 };
                     for level in 1..guides {
                         let x = (body_x + (level * tab.len()) as f32 * char_w).round() + 0.5;
@@ -1344,7 +1421,7 @@ pub fn show(
                         if from < to || (range.start <= span.end && range.end > span.end) {
                             let x0 = laid.x_of(ui, &font, from);
                             let mut x1 = laid.x_of(ui, &font, to);
-                            if range.end > span.end {
+                            if last_piece && range.end > span.end {
                                 x1 += char_w;
                             }
                             let picked = Rect::new(body.x + x0, y, x1 - x0, line_h);
@@ -1400,7 +1477,7 @@ pub fn show(
                         }
                     }
                     // a folded line ends in a pill standing for what it hides
-                    if closed_lines.binary_search(&line).is_ok() {
+                    if last_piece && closed_lines.binary_search(&line).is_ok() {
                         let dots = Rect::new(body.x + drawn_w + 6.0, y + 3.0, 26.0, line_h - 6.0);
                         ui.round(dots, 4.0, palette.raised)?;
                         ui.text("⋯", dots, &font, palette.dim, Align::Center)?;
@@ -1408,7 +1485,7 @@ pub fn show(
                 }
 
                 // the caret glides to its place; a long jump just lands
-                let target_y = fold::row_of(caret_line, &hidden) as f32 * line_h;
+                let target_y = caret_row as f32 * line_h;
                 let jump = preedit.is_some()
                     || look.still
                     || !settings.smooth_caret
@@ -1488,15 +1565,12 @@ pub fn show(
                 // the other carets blink with the main one, no glide
                 if on || moving {
                     for extra in &extras {
-                        let Ok(line) = text.line_of(extra.head) else {
-                            continue;
-                        };
-                        if visible.binary_search(&line).is_err() {
+                        let (row, piece) = rows.row_of(text, extra.head);
+                        if row < first_row || row >= first_row + visible.len() {
                             continue;
                         }
-                        let ex =
-                            body_x + lay(text, span(text, line), tab).x_of(ui, &font, extra.head);
-                        let ey = line_y(line);
+                        let ex = body_x + lay(text, piece, tab).x_of(ui, &font, extra.head);
+                        let ey = content.y + row as f32 * line_h;
                         let bar = Rect::new(ex.round() - 0.5, ey + 2.0, 2.0, line_h - 4.0);
                         ui.fill(bar, palette.accent.fade(0.85))?;
                     }
@@ -1675,6 +1749,19 @@ mod tests {
         assert!(!tidy_for_save(&mut docs, v, true, true), "already tidy");
         assert!(docs.undo(v));
         assert_eq!(text(&docs, v), "a  \nb\t\nc", "one undo step");
+    }
+
+    #[test]
+    fn down_walks_wrapped_rows_of_one_line() {
+        let (mut docs, v) = open("aaaa bbbb cccc\nxy");
+        docs.view_mut(v).unwrap().wrap_cols = Some(10);
+        caret(&mut docs, v, 2);
+        act(&mut docs, v, Action::Move(Motion::Down, false));
+        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(12), "next row, same line");
+        act(&mut docs, v, Action::Move(Motion::Down, false));
+        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(17));
+        act(&mut docs, v, Action::Move(Motion::Up, true));
+        assert_eq!(docs.view(v).unwrap().sel.anchor, 17, "shift keeps the anchor");
     }
 
     #[test]

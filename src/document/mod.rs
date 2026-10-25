@@ -109,6 +109,10 @@ pub struct View {
     pub column: Option<(usize, f32)>,
     /// folded ranges in this view; the lines after each first one are hidden.
     pub folded: Vec<Range<usize>>,
+    /// wrap counts kept between frames.
+    pub wrap: crate::editor::rows::WrapCache,
+    /// columns lines wrap at, from the last frame; none when not wrapping.
+    pub wrap_cols: Option<usize>,
     /// column up and down aim for.
     pub goal: Option<usize>,
     /// ime text not committed yet, and the caret inside it.
@@ -225,6 +229,8 @@ impl Documents {
                 extra: Vec::new(),
                 column: None,
                 folded: Vec::new(),
+                wrap: crate::editor::rows::WrapCache::default(),
+                wrap_cols: None,
                 goal: None,
                 preedit: None,
                 reveal: false,

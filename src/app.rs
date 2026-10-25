@@ -88,6 +88,7 @@ pub enum Command {
     GotoSymbol,
     OpenSettings,
     ReopenClosed,
+    ToggleWrap,
     CloseTab,
     NextTab,
     PrevTab,
@@ -103,6 +104,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Save All", Command::SaveAll),
     ("Close Tab", Command::CloseTab),
     ("Reopen Closed Tab", Command::ReopenClosed),
+    ("Word Wrap", Command::ToggleWrap),
     ("Next Tab", Command::NextTab),
     ("Previous Tab", Command::PrevTab),
     ("Undo", Command::Undo),
@@ -659,6 +661,10 @@ impl App {
                 } else if let Some(view) = focus.or(self.last_editor) {
                     self.open_bar(view, Mode::Find);
                 }
+                return;
+            }
+            Command::ToggleWrap => {
+                self.settings.word_wrap = !self.settings.word_wrap;
                 return;
             }
             Command::ReopenClosed => {
@@ -2248,6 +2254,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::O).shift(), Command::GotoSymbol)
         .bind(Chord::command(KeyCode::W), Command::CloseTab)
         .bind(Chord::command(KeyCode::T).shift(), Command::ReopenClosed)
+        .bind(Chord::key(KeyCode::Z).alt(), Command::ToggleWrap)
         .bind(Chord::key(KeyCode::Tab).ctrl(), Command::NextTab)
         .bind(Chord::key(KeyCode::Tab).ctrl().shift(), Command::PrevTab)
         .bind(Chord::command(KeyCode::F), Command::Find)

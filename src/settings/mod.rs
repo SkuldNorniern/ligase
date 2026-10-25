@@ -68,6 +68,8 @@ pub struct Settings {
     pub final_newline: bool,
     /// files with edits are saved when the window loses focus.
     pub save_on_focus_loss: bool,
+    /// long lines go on in the next row instead of past the right edge.
+    pub word_wrap: bool,
 }
 
 impl Default for Settings {
@@ -92,6 +94,7 @@ impl Default for Settings {
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
+            word_wrap: false,
         }
     }
 }
@@ -125,6 +128,7 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # trim_trailing_whitespace = false
 # final_newline = false
 # save_on_focus_loss = false
+# word_wrap = false         # alt+z switches it for now
 "#;
 
 /// reads settings from `text`. unknown keys and bad values are skipped;
@@ -220,7 +224,8 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
         | "auto_pairs"
         | "trim_trailing_whitespace"
         | "final_newline"
-        | "save_on_focus_loss" => {
+        | "save_on_focus_loss"
+        | "word_wrap" => {
             let Some(on) = value.as_bool() else {
                 return false;
             };
@@ -233,6 +238,7 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
                 "trim_trailing_whitespace" => &mut out.trim_trailing_whitespace,
                 "final_newline" => &mut out.final_newline,
                 "save_on_focus_loss" => &mut out.save_on_focus_loss,
+                "word_wrap" => &mut out.word_wrap,
                 _ => &mut out.auto_pairs,
             };
             *slot = on;

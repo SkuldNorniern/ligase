@@ -288,6 +288,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     let mut view = bar.add_submenu(a.texts.tr("View"))?;
     add(&mut view, "Command Palette", Command::Commands)?;
     add(&mut view, "Settings", Command::OpenSettings)?;
+    add(&mut view, "Word Wrap", Command::ToggleWrap)?;
     view.add_separator()?;
     add(&mut view, "Fold", Command::Fold(FoldOp::Fold))?;
     add(&mut view, "Unfold", Command::Fold(FoldOp::Unfold))?;
