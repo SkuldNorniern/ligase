@@ -1036,7 +1036,6 @@ pub fn show(
         settings.tab_size.max(1),
         &mut cache,
     );
-    view.wrap = cache;
     view.wrap_cols = rows.wraps().then_some(rows.cols);
     let row_count = rows.total(lines);
     // the last line can scroll up to near the top
@@ -1596,6 +1595,8 @@ pub fn show(
     view.extra = extras;
     view.column = column;
     view.folded = folded;
+    drop(rows);
+    view.wrap = cache;
     multi::merge(view);
     view.preedit = preedit;
     Ok(shown)
@@ -1757,11 +1758,19 @@ mod tests {
         docs.view_mut(v).unwrap().wrap_cols = Some(10);
         caret(&mut docs, v, 2);
         act(&mut docs, v, Action::Move(Motion::Down, false));
-        assert_eq!(docs.view(v).unwrap().sel, Selection::caret(12), "next row, same line");
+        assert_eq!(
+            docs.view(v).unwrap().sel,
+            Selection::caret(12),
+            "next row, same line"
+        );
         act(&mut docs, v, Action::Move(Motion::Down, false));
         assert_eq!(docs.view(v).unwrap().sel, Selection::caret(17));
         act(&mut docs, v, Action::Move(Motion::Up, true));
-        assert_eq!(docs.view(v).unwrap().sel.anchor, 17, "shift keeps the anchor");
+        assert_eq!(
+            docs.view(v).unwrap().sel.anchor,
+            17,
+            "shift keeps the anchor"
+        );
     }
 
     #[test]

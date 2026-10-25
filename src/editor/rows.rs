@@ -106,11 +106,11 @@ fn line_text(text: &TextSnapshot, line: usize) -> (usize, String) {
     (start, text.slice(start..end).unwrap_or_default())
 }
 
-/// the row map for one frame.
-pub struct Rows {
+/// the row map for one frame, reading the view's wrap counts.
+pub struct Rows<'c> {
     pub hidden: Hidden,
     /// with wrapping: the first row of each line, and one past the last.
-    first: Option<Vec<usize>>,
+    first: Option<&'c [usize]>,
     pub cols: usize,
     pub tab: usize,
 }
@@ -123,14 +123,14 @@ pub struct WrapCache {
     first: Vec<usize>,
 }
 
-impl Rows {
+impl<'c> Rows<'c> {
     /// rows for `text` with `folded` folds, wrapped at `cols` when given.
     pub fn new(
         text: &TextSnapshot,
         folded: &[Range<usize>],
         wrap: Option<usize>,
         tab: usize,
-        cache: &mut WrapCache,
+        cache: &'c mut WrapCache,
     ) -> Self {
         let hidden = fold::hidden(text, folded);
         let Some(cols) = wrap.filter(|_| text.len() <= WRAP_MAX) else {
@@ -159,7 +159,7 @@ impl Rows {
         }
         Self {
             hidden,
-            first: Some(cache.first.clone()),
+            first: Some(&cache.first),
             cols,
             tab,
         }
@@ -170,7 +170,7 @@ impl Rows {
     }
 
     pub fn total(&self, lines: usize) -> usize {
-        match &self.first {
+        match self.first {
             Some(first) => first.last().copied().unwrap_or(1),
             None => fold::rows(lines, &self.hidden),
         }
@@ -179,7 +179,7 @@ impl Rows {
 
     /// the line on `row` and which piece of it.
     pub fn line_of_row(&self, row: usize) -> (usize, usize) {
-        match &self.first {
+        match self.first {
             Some(first) => {
                 let line = first.partition_point(|&r| r <= row).saturating_sub(1);
                 let line = line.min(first.len().saturating_sub(2));
@@ -206,7 +206,7 @@ impl Rows {
         let line = text.line_of(at).unwrap_or(0);
         let pieces = self.pieces_of(text, line);
         let k = pieces.iter().rposition(|p| p.start <= at).unwrap_or(0);
-        let row = match &self.first {
+        let row = match self.first {
             Some(first) => first.get(line).copied().unwrap_or(0) + k,
             None => fold::row_of(line, &self.hidden),
         };
@@ -293,7 +293,8 @@ mod tests {
         assert_eq!(rows.line_of_row(4), (2, 1));
         let (row, piece) = rows.row_of(&t, 12);
         assert_eq!((row, piece), (1, 10..14));
-        let plain = Rows::new(&t, &[], None, 4, &mut cache);
+        let mut other = WrapCache::default();
+        let plain = Rows::new(&t, &[], None, 4, &mut other);
         assert_eq!(plain.total(3), 3);
     }
 
