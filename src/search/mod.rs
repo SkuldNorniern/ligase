@@ -64,6 +64,23 @@ impl Finder {
         self.running.is_some()
     }
 
+    /// shows `hits` found some other way (a language server's references)
+    /// as the panel's results, under `title`.
+    pub fn show_results(&mut self, title: String, hits: Vec<Hit>) {
+        self.running = None;
+        let files = {
+            let mut paths: Vec<&PathBuf> = hits.iter().map(|h| &h.path).collect();
+            paths.sort();
+            paths.dedup();
+            paths.len()
+        };
+        self.query = title;
+        self.hits = hits;
+        self.done = Some((files, false));
+        self.scroll = 0.0;
+        self.selected = None;
+    }
+
     /// starts a search for the current query, stopping any old one.
     pub fn start(&mut self, root: &Path, canvas: Option<CanvasId>) {
         self.running = None;

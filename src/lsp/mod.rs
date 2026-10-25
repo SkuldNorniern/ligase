@@ -4,6 +4,7 @@
 //! against the text of the version it was made for.
 
 pub mod complete;
+pub mod edit;
 pub mod rpc;
 pub mod server;
 pub mod uri;
@@ -60,6 +61,16 @@ pub enum Event {
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
     Hover(ViewId, usize, String),
+    /// changes to make in files, positions in `Encoding`: a rename or a
+    /// format. `revision` is the asking document's, to drop a late one.
+    Edits(
+        crate::document::DocumentId,
+        Revision,
+        Vec<(PathBuf, Vec<edit::Edit>)>,
+        Encoding,
+    ),
+    /// places a name is used, for find references.
+    Locations(Vec<(PathBuf, Point)>, Encoding),
     /// completions for a view, positions in the text of `revision`.
     Completion(ViewId, Revision, Vec<complete::Item>),
     Status(String),
@@ -83,6 +94,9 @@ struct Synced {
 enum Pending {
     Definition,
     Hover(ViewId, usize),
+    /// a rename or format for a document as of a revision.
+    Edits(crate::document::DocumentId, Revision),
+    References,
     Complete(ViewId, Revision, crate::document::DocumentId),
 }
 
@@ -214,8 +228,47 @@ impl Lsp {
 
     /// asks where the thing at the caret of `view` is defined.
     pub fn definition(&mut self, docs: &Documents, view: ViewId) -> bool {
-        self.ask(docs, view, "textDocument/definition", Pending::Definition)
+        self.ask(
+            docs,
+            view,
+            "textDocument/definition",
+            Pending::Definition,
+            json!({}),
+        )
+        .is_some()
+    }
+
+    /// asks to rename the name at the caret to `name` everywhere.
+    pub fn rename(&mut self, docs: &Documents, view: ViewId, name: &str) -> bool {
+        let Some(kind) = edits_for(docs, view) else {
+            return false;
+        };
+        let extra = json!({ "newName": name });
+        self.ask(docs, view, "textDocument/rename", kind, extra)
             .is_some()
+    }
+
+    /// asks to format the whole document of `view`.
+    pub fn format(&mut self, docs: &Documents, view: ViewId, tab: usize) -> bool {
+        let Some(kind) = edits_for(docs, view) else {
+            return false;
+        };
+        let extra = json!({ "options": { "tabSize": tab, "insertSpaces": true } });
+        self.ask(docs, view, "textDocument/formatting", kind, extra)
+            .is_some()
+    }
+
+    /// asks where the name at the caret is used.
+    pub fn references(&mut self, docs: &Documents, view: ViewId) -> bool {
+        let extra = json!({ "context": { "includeDeclaration": true } });
+        self.ask(
+            docs,
+            view,
+            "textDocument/references",
+            Pending::References,
+            extra,
+        )
+        .is_some()
     }
 
     /// asks for completions at the caret of `view`.
@@ -238,7 +291,7 @@ impl Lsp {
             self.pending.remove(&key);
         }
         let kind = Pending::Complete(view, doc.buffer.revision(), v.doc);
-        let Some(key) = self.ask(docs, view, "textDocument/completion", kind) else {
+        let Some(key) = self.ask(docs, view, "textDocument/completion", kind, json!({})) else {
             return false;
         };
         self.completing = Some((key, Instant::now()));
@@ -267,8 +320,14 @@ impl Lsp {
 
     pub fn hover(&mut self, docs: &Documents, view: ViewId) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
-        self.ask(docs, view, "textDocument/hover", Pending::Hover(view, at))
-            .is_some()
+        self.ask(
+            docs,
+            view,
+            "textDocument/hover",
+            Pending::Hover(view, at),
+            json!({}),
+        )
+        .is_some()
     }
 
     /// sends `method` for the caret of `view`; gives the request's key.
@@ -278,6 +337,7 @@ impl Lsp {
         view: ViewId,
         method: &str,
         kind: Pending,
+        extra: Value,
     ) -> Option<(&'static str, i64)> {
         let v = docs.view(view)?;
         let synced = self.synced.get(&v.doc)?;
@@ -290,13 +350,14 @@ impl Lsp {
             return None;
         };
         let at = doc.buffer.text().point(v.sel.head, *encoding).ok()?;
-        let id = server.request(
-            method,
-            json!({
-                "textDocument": { "uri": synced.uri },
-                "position": { "line": at.line, "character": at.column },
-            }),
-        );
+        let mut params = json!({
+            "textDocument": { "uri": synced.uri },
+            "position": { "line": at.line, "character": at.column },
+        });
+        if let (Some(params), Value::Object(extra)) = (params.as_object_mut(), extra) {
+            params.extend(extra);
+        }
+        let id = server.request(method, params);
         self.pending.insert((synced.language, id), kind);
         Some((synced.language, id))
     }
@@ -380,6 +441,26 @@ impl Lsp {
                 }
                 let encoding = *encoding;
                 match self.pending.remove(&(language, id)) {
+                    Some(Pending::Edits(doc, revision)) => {
+                        if let Some(why) = msg["error"]["message"].as_str() {
+                            events.push(Event::Status(why.chars().take(200).collect()));
+                            return;
+                        }
+                        let result = &msg["result"];
+                        // a rename answers with a workspace edit, a format
+                        // with the edits of the one document
+                        let files = if result.is_array() {
+                            let path = self.synced.get(&doc).and_then(|s| uri::to_path(&s.uri));
+                            path.map(|p| vec![(p, edit::text_edits(result))])
+                                .unwrap_or_default()
+                        } else {
+                            edit::workspace_edit(result)
+                        };
+                        events.push(Event::Edits(doc, revision, files, encoding));
+                    }
+                    Some(Pending::References) => {
+                        events.push(Event::Locations(edit::locations(&msg["result"]), encoding));
+                    }
                     Some(Pending::Definition) => {
                         if let Some(event) = definition(&msg["result"], encoding) {
                             events.push(event);
@@ -450,6 +531,13 @@ impl Lsp {
             .collect();
         Some(Event::Diagnostics(doc, text.revision(), diags))
     }
+}
+
+/// what an edit request is for: the document of `view` as it is now.
+fn edits_for(docs: &Documents, view: ViewId) -> Option<Pending> {
+    let v = docs.view(view)?;
+    let doc = docs.doc(v.doc)?;
+    Some(Pending::Edits(v.doc, doc.buffer.revision()))
 }
 
 fn point(value: &Value) -> Option<Point> {
@@ -622,6 +710,21 @@ mod tests {
             "an error squiggle on the string: {diags:?}"
         );
         assert!(lsp.hover(&docs, view));
+        // rename `x` (offset 20) to `renamed`
+        docs.view_mut(view).unwrap().sel = crate::editor::cursor::Selection::caret(20);
+        assert!(lsp.rename(&docs, view, "renamed"));
+        let start = Instant::now();
+        let mut renamed = None;
+        while start.elapsed() < Duration::from_secs(30) && renamed.is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+            for event in lsp.poll() {
+                if let Event::Edits(_, _, files, _) = event {
+                    renamed = Some(files);
+                }
+            }
+        }
+        let files = renamed.expect("a rename edit");
+        assert!(files.iter().any(|(_, edits)| edits.iter().any(|e| e.text == "renamed")));
         // completion after "x." on a u32 lists its methods
         let end = docs.doc(doc).unwrap().buffer.len() - 2;
         docs.edit(view, vec![(end..end, "\n    x.".to_owned())], false);

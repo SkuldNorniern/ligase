@@ -71,6 +71,9 @@ pub enum Command {
     GotoLine,
     GotoDefinition,
     ShowHover,
+    Rename,
+    Format,
+    References,
     Complete,
     FindInFiles,
     ToggleExplorer,
@@ -137,6 +140,9 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Go to Symbol", Command::GotoSymbol),
     ("Go to Definition", Command::GotoDefinition),
     ("Show Hover", Command::ShowHover),
+    ("Rename Symbol", Command::Rename),
+    ("Format Document", Command::Format),
+    ("Find References", Command::References),
     ("Complete", Command::Complete),
     ("Explorer", Command::ToggleExplorer),
     ("Terminal", Command::ToggleTerminal),
@@ -233,6 +239,8 @@ pub struct App {
     /// a dialog main should show after this frame.
     dialog: Option<Dialog>,
     settings: Settings,
+    /// server edits for files still being read, put in once they are.
+    waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
     /// files of tabs closed lately, newest last, for reopen.
     closed: Vec<PathBuf>,
     /// the theme in force is dark.
@@ -294,6 +302,7 @@ impl App {
             dialog: None,
             settings: Settings::default(),
             closed: Vec::new(),
+            waiting_edits: Vec::new(),
             dark: true,
             edit_opts: editor::EditOpts::default(),
             still: aurea::reduced_motion(),
@@ -761,6 +770,39 @@ impl App {
                 }
                 return;
             }
+            Command::Rename => {
+                if let Some(view) = focus.or(self.last_editor) {
+                    // the bar starts with the name under the caret
+                    let word =
+                        self.docs
+                            .doc_of(view)
+                            .zip(self.docs.view(view))
+                            .and_then(|(d, v)| {
+                                let text = d.buffer.text();
+                                text.slice(editor::cursor::word_at(text, v.sel.head).range())
+                                    .ok()
+                            });
+                    self.open_bar(view, Mode::Rename);
+                    self.bar.rename = word.unwrap_or_default();
+                }
+                return;
+            }
+            Command::Format => {
+                if let Some(view) = focus.or(self.last_editor)
+                    && !self.lsp.format(&self.docs, view, self.settings.tab_size)
+                {
+                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                }
+                return;
+            }
+            Command::References => {
+                if let Some(view) = focus.or(self.last_editor)
+                    && !self.lsp.references(&self.docs, view)
+                {
+                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                }
+                return;
+            }
             Command::ShowHover => {
                 if let Some(view) = focus
                     && !self.lsp.hover(&self.docs, view)
@@ -806,6 +848,131 @@ impl App {
                 }
             }
         }
+        self.layout_dirty = true;
+    }
+
+    /// a rename or format came back: its edits go in, one undo step per
+    /// file. dropped when the asking document changed since.
+    fn server_edits(
+        &mut self,
+        asking: DocumentId,
+        revision: Revision,
+        files: Vec<(PathBuf, Vec<lsp::edit::Edit>)>,
+        encoding: Encoding,
+    ) {
+        if self.docs.doc(asking).map(|d| d.buffer.revision()) != Some(revision) {
+            self.status = self.texts.tr("the text changed, try again").to_owned();
+            return;
+        }
+        let mut changed = 0;
+        for (path, edits) in files {
+            let view = self
+                .view_of_path(&path)
+                .unwrap_or_else(|| self.open_file(&path));
+            let loaded = self
+                .docs
+                .doc_of(view)
+                .is_some_and(|d| d.load == document::Load::Ready);
+            if loaded {
+                if self.apply_server_edits(view, &edits, encoding) {
+                    changed += 1;
+                }
+            } else if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
+                // goes in once the file is read
+                self.waiting_edits.push((doc, edits, encoding));
+                changed += 1;
+            }
+        }
+        self.status = format!("{} {changed}", self.texts.tr("files changed:"));
+    }
+
+    /// a view on the document at `path`, when one is open.
+    fn view_of_path(&self, path: &Path) -> Option<ViewId> {
+        self.bench.panels.iter().find_map(|(_, p)| match p {
+            Panel::Editor(v) if self.docs.doc_of(v).is_some_and(|d| d.path == path) => Some(v),
+            _ => None,
+        })
+    }
+
+    /// puts server edits into `view`'s document as one step. false when
+    /// they overlap or don't fit the text.
+    fn apply_server_edits(
+        &mut self,
+        view: ViewId,
+        edits: &[lsp::edit::Edit],
+        encoding: Encoding,
+    ) -> bool {
+        let Some(doc) = self.docs.doc_of(view) else {
+            return false;
+        };
+        let text = doc.buffer.text();
+        let mut ranges: Vec<(Range<usize>, String)> = edits
+            .iter()
+            .map(|e| {
+                let start = lsp::offset_near(text, e.start, encoding);
+                let end = lsp::offset_near(text, e.end, encoding).max(start);
+                (start..end, e.text.clone())
+            })
+            .collect();
+        ranges.sort_by_key(|(r, _)| (r.start, r.end));
+        if ranges.windows(2).any(|w| w[0].0.end > w[1].0.start) {
+            return false;
+        }
+        if let Some((doc, _)) = self.docs.editable(view) {
+            doc.buffer.break_join();
+        }
+        let keep = self.docs.view(view).map(|v| v.sel);
+        let done = self.docs.edit(view, ranges, false);
+        // the caret stays near where it was, not at the last edit
+        if let (true, Some(sel)) = (done, keep)
+            && let Some((doc, v)) = self.docs.editable(view)
+        {
+            let len = doc.buffer.len();
+            v.sel = Selection {
+                anchor: sel.anchor.min(len),
+                head: sel.head.min(len),
+            };
+        }
+        done
+    }
+
+    /// references from a server, listed in the search panel.
+    fn show_locations(&mut self, places: Vec<(PathBuf, Point)>, encoding: Encoding) {
+        let hits = places
+            .into_iter()
+            .map(|(path, at)| {
+                // open files show the line; others just their place
+                let (column, preview) = self
+                    .view_of_path(&path)
+                    .and_then(|v| self.docs.doc_of(v))
+                    .map(|d| {
+                        let text = d.buffer.text();
+                        let offset = lsp::offset_near(text, at, encoding);
+                        let start = text.line_start(at.line).unwrap_or(0);
+                        let end = editor::cursor::line_end(text, at.line);
+                        let line = text.slice(start..end).unwrap_or_default();
+                        (
+                            offset.saturating_sub(start),
+                            line.trim().chars().take(200).collect(),
+                        )
+                    })
+                    .unwrap_or((at.column, String::new()));
+                search::Hit {
+                    path,
+                    line: at.line,
+                    column,
+                    len: 0,
+                    preview,
+                }
+            })
+            .collect::<Vec<_>>();
+        if hits.is_empty() {
+            self.status = self.texts.tr("no references").to_owned();
+            return;
+        }
+        let title = self.texts.tr("references").to_owned();
+        self.finder.show_results(title, hits);
+        self.bench.show(Panel::Search);
         self.layout_dirty = true;
     }
 
@@ -1355,6 +1522,17 @@ impl App {
                     self.status = format!("{} {count}", self.texts.tr("replaced"));
                 }
             }
+            find::Ask::Rename => {
+                let name = self.bar.rename.trim().to_owned();
+                self.bar.mode = None;
+                self.ui.focus(Id::Editor(view), 1);
+                if name.is_empty() {
+                    return;
+                }
+                if !self.lsp.rename(&self.docs, view, &name) {
+                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                }
+            }
             find::Ask::Goto => {
                 if let Some((line, column)) = find::parse_goto(&self.bar.goto)
                     && let Some(v) = self.docs.view_mut(view)
@@ -1714,6 +1892,10 @@ impl App {
                         v.goto = Some((at, encoding));
                     }
                 }
+                lsp::Event::Edits(doc, revision, files, encoding) => {
+                    self.server_edits(doc, revision, files, encoding);
+                }
+                lsp::Event::Locations(places, encoding) => self.show_locations(places, encoding),
                 lsp::Event::Completion(view, revision, items) => {
                     self.completed(view, revision, items);
                 }
@@ -1754,6 +1936,25 @@ impl App {
                 Done::Loaded(doc, result, disk) => {
                     self.docs.loaded(doc, result);
                     self.docs.set_disk(doc, disk);
+                    let waiting: Vec<_> = self
+                        .waiting_edits
+                        .iter()
+                        .filter(|w| w.0 == doc)
+                        .cloned()
+                        .collect();
+                    self.waiting_edits.retain(|w| w.0 != doc);
+                    for (_, edits, encoding) in waiting {
+                        let view = self.view_of_path(
+                            &self
+                                .docs
+                                .doc(doc)
+                                .map(|d| d.path.clone())
+                                .unwrap_or_default(),
+                        );
+                        if let Some(view) = view {
+                            self.apply_server_edits(view, &edits, encoding);
+                        }
+                    }
                 }
                 Done::Disk(stamps) => self.disk_checked(stamps),
                 Done::Reloaded(doc, revision, Ok(text), disk) => {
@@ -2263,6 +2464,9 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::key(KeyCode::F3).shift(), Command::FindPrev)
         .bind(Chord::command(KeyCode::G), Command::GotoLine)
         .bind(Chord::key(KeyCode::F12), Command::GotoDefinition)
+        .bind(Chord::key(KeyCode::F12).shift(), Command::References)
+        .bind(Chord::key(KeyCode::F2), Command::Rename)
+        .bind(Chord::key(KeyCode::F).alt().shift(), Command::Format)
         .bind(Chord::command(KeyCode::I), Command::ShowHover)
         .bind(Chord::key(KeyCode::Space).ctrl(), Command::Complete)
         .bind(Chord::command(KeyCode::Equals), Command::ZoomIn)

@@ -23,6 +23,8 @@ pub enum Mode {
     Find,
     Replace,
     Goto,
+    /// a new name for the name at the caret.
+    Rename,
 }
 
 /// every match of `query` in `text`, smart case, at most `MAX_HITS`.
@@ -79,6 +81,7 @@ pub struct Bar {
     pub query: String,
     pub with: String,
     pub goto: String,
+    pub rename: String,
     /// matches for (document, revision, query).
     pub hits: Vec<Range<usize>>,
     pub found_for: Option<(DocumentId, Revision, String)>,
@@ -101,6 +104,7 @@ pub enum Ask {
     Replace,
     ReplaceAll,
     Goto,
+    Rename,
     Close,
     /// the query changed; find again and jump.
     Changed,
@@ -180,13 +184,23 @@ pub fn show(
     if small(ui, "×", 0, close)?.clicked {
         ask = Some(Ask::Close);
     }
-    if mode == Mode::Goto {
-        let typed = TextField::new(&mut bar.goto)
-            .placeholder(texts.tr("line, or line:column"))
-            .max_chars(32)
+    if mode == Mode::Goto || mode == Mode::Rename {
+        let (field, hint, done, max) = if mode == Mode::Goto {
+            (
+                &mut bar.goto,
+                texts.tr("line, or line:column"),
+                Ask::Goto,
+                32,
+            )
+        } else {
+            (&mut bar.rename, texts.tr("new name"), Ask::Rename, 200)
+        };
+        let typed = TextField::new(field)
+            .placeholder(hint)
+            .max_chars(max)
             .show(ui, Id::FindField, top)?;
         if typed.submitted {
-            ask = Some(Ask::Goto);
+            ask = Some(done);
         }
         if typed.cancelled {
             ask = Some(Ask::Close);
