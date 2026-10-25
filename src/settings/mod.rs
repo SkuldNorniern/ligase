@@ -128,8 +128,9 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 "#;
 
 /// reads settings from `text`. unknown keys and bad values are skipped;
-/// the second part says what was skipped, for the status bar.
-pub fn parse(text: &str) -> (Settings, Vec<String>) {
+/// the second part says what was skipped, for the status bar. none when the
+/// file isn't toml at all: then the settings in force stay as they are.
+pub fn parse(text: &str) -> (Option<Settings>, Vec<String>) {
     let mut out = Settings::default();
     let mut problems = Vec::new();
     let table = match text.parse::<toml::Table>() {
@@ -137,7 +138,7 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
         Err(e) => {
             let first = e.to_string();
             let first = first.lines().next().unwrap_or_default().to_owned();
-            return (out, vec![first]);
+            return (None, vec![first]);
         }
     };
     for (key, value) in &table {
@@ -146,7 +147,7 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
             problems.push(format!("{key} = {value}"));
         }
     }
-    (out, problems)
+    (Some(out), problems)
 }
 
 fn word<'a>(value: &'a toml::Value, choices: &[&str]) -> Option<&'a str> {
@@ -248,7 +249,7 @@ mod tests {
     #[test]
     fn starter_file_is_all_defaults() {
         let (s, problems) = parse(STARTER);
-        assert_eq!(s, Settings::default());
+        assert_eq!(s, Some(Settings::default()));
         assert!(problems.is_empty());
     }
 
@@ -256,6 +257,7 @@ mod tests {
     fn values_apply_and_bad_ones_are_named() {
         let text = "theme = \"light\"\neditor_size = 16\nline_numbers = \"relative\"\ntab_size = 2.5\nwat = 1\ncaret_blink = false";
         let (s, problems) = parse(text);
+        let s = s.unwrap();
         assert_eq!(s.theme, ThemeChoice::Light);
         assert_eq!(s.editor_size, 16.0);
         assert_eq!(s.line_numbers, LineNumbers::Relative);
@@ -267,9 +269,9 @@ mod tests {
     #[test]
     fn broken_file_gives_defaults_and_why() {
         let (s, problems) = parse("theme = ");
-        assert_eq!(s, Settings::default());
+        assert_eq!(s, None, "the settings in force stay");
         assert_eq!(problems.len(), 1);
         let (s, _) = parse("editor_size = 9000");
-        assert_eq!(s.editor_size, 14.0);
+        assert_eq!(s.unwrap().editor_size, 14.0);
     }
 }

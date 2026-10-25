@@ -980,7 +980,11 @@ impl App {
                     self.last_editor = None;
                 }
             }
-            Err(Refused::Unsaved) => self.dialog = Some(Dialog::Unsaved(Some(pane))),
+            Err(Refused::Unsaved) => {
+                if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::Unsaved(Some(pane)));
+                }
+            }
             Err(Refused::KeepsEditorArea) => {}
         }
     }
@@ -1203,6 +1207,14 @@ impl App {
         }
     }
 
+    fn settings_problem(&mut self, problems: &[String]) {
+        self.status = format!(
+            "{}: {}",
+            self.texts.tr("settings skipped"),
+            problems.join(", ")
+        );
+    }
+
     /// the settings file was saved: read it from the buffer, no disk.
     fn settings_saved(&mut self, doc: DocumentId) {
         let Some(d) = self.docs.doc(doc) else { return };
@@ -1211,7 +1223,11 @@ impl App {
         }
         let (settings, problems) = settings::parse(&d.buffer.text().to_string());
         let clean = problems.is_empty();
-        self.apply_settings(settings, problems);
+        match settings {
+            Some(settings) => self.apply_settings(settings, problems),
+            // not toml: keep what is in force, say why
+            None => self.settings_problem(&problems),
+        }
         if clean {
             self.status = self.texts.tr("settings applied").to_owned();
         }
@@ -1446,8 +1462,10 @@ impl App {
             return;
         }
         if self.docs.any_dirty() {
-            // ask: save, drop them, or stay
-            self.dialog = Some(Dialog::Unsaved(None));
+            // ask: save, drop them, or stay; never over a dialog already asked
+            if self.dialog.is_none() {
+                self.dialog = Some(Dialog::Unsaved(None));
+            }
             return;
         }
         self.close_saving_layout();
@@ -1517,6 +1535,7 @@ impl App {
                 let Some(path) = picked.into_iter().next() else {
                     // cancelled: a close waiting on this file stays open
                     self.close_after_save = false;
+                    self.close_pane_after_save = None;
                     return;
                 };
                 let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
@@ -1746,6 +1765,8 @@ impl App {
                 }
                 Done::Reloaded(_, _, Err(why), _) => self.status = why,
                 Done::Conflict(doc, name, now) => {
+                    // not written: a close waiting on it stays open
+                    self.after_save(doc, false);
                     // this is the warning; the next save writes over what
                     // is there now, if nothing else changes it first
                     self.docs.mark_conflict(doc);
@@ -1775,8 +1796,10 @@ impl App {
                 Done::Files(files) => self.palette.set_files(files),
                 Done::Settings(text) => {
                     if let Some(text) = text {
-                        let (settings, problems) = settings::parse(&text);
-                        self.apply_settings(settings, problems);
+                        match settings::parse(&text) {
+                            (Some(settings), problems) => self.apply_settings(settings, problems),
+                            (None, problems) => self.settings_problem(&problems),
+                        }
                     }
                 }
                 Done::SettingsFile(Ok(path)) => {

@@ -1383,6 +1383,10 @@ pub fn show(
                                 .any(|r| r.start <= at && at < r.end)
                         };
                         for (i, c) in raw.char_indices() {
+                            // past the drawn part there is nothing to mark
+                            if i >= MAX_DRAWN {
+                                break;
+                            }
                             let at = span.start + i;
                             if !matches!(c, ' ' | '\t')
                                 || (settings.whitespace == Whitespace::Selection && !picked(at))
