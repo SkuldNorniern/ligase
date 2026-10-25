@@ -205,8 +205,26 @@ pub fn plain_name(name: &str) -> Option<&str> {
         || name == "."
         || name == ".."
         || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
-        || name.chars().any(char::is_control);
+        || name.chars().any(char::is_control)
+        // windows drops these quietly, so the file would get another name
+        || name.ends_with(['.', ' '])
+        || reserved(name);
     (!bad).then_some(name)
+}
+
+/// windows device names, with or without an extension: `nul.txt` opens
+/// the device, not a file.
+fn reserved(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
 }
 
 /// makes an empty file; never over one already there. runs on the worker.
@@ -223,12 +241,39 @@ pub fn create_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir(path).map_err(|e| e.to_string())
 }
 
-/// renames `from` to `to`; never over something already at `to`.
+/// renames `from` to `to`; never over something already at `to`. a name
+/// changing only its letter case is the same file and is fine.
 pub fn rename(from: &Path, to: &Path) -> Result<(), String> {
-    if to.exists() {
+    let same = to.exists() && std::fs::canonicalize(from).ok() == std::fs::canonicalize(to).ok();
+    if to.exists() && !same {
         return Err("something with that name is already there".to_owned());
     }
-    std::fs::rename(from, to).map_err(|e| e.to_string())
+    move_no_replace(from, to).map_err(|e| e.to_string())
+}
+
+/// a move that fails instead of replacing what appeared at `to` meanwhile.
+#[cfg(windows)]
+fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+    let (a, b) = (wide(from), wide(to));
+    // SAFETY: both are nul ended utf-16 paths that live past the call; no
+    // flags, so an existing target is an error, never replaced
+    let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), 0) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// unix rename replaces; the check above is the guard, with a small window.
+#[cfg(not(windows))]
+fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 /// deletes a file, or a folder with what is in it. the user said yes first.
@@ -359,6 +404,11 @@ mod tests {
         assert_eq!(plain_name(".."), None);
         assert_eq!(plain_name(""), None);
         assert_eq!(plain_name("가.txt"), Some("가.txt"));
+        assert_eq!(plain_name("nul.txt"), None);
+        assert_eq!(plain_name("COM3"), None);
+        assert_eq!(plain_name("com0"), Some("com0"));
+        assert_eq!(plain_name("a."), None);
+        assert_eq!(plain_name("console.log"), Some("console.log"));
     }
 
     #[test]
@@ -373,6 +423,8 @@ mod tests {
         create_file(&b).unwrap();
         assert!(rename(&a, &b).is_err(), "never over b");
         rename(&a, &dir.join("c.txt")).unwrap();
+        // only the case changes: the same file, allowed where names fold
+        rename(&dir.join("c.txt"), &dir.join("C.txt")).unwrap();
         create_dir(&dir.join("sub")).unwrap();
         delete(&dir.join("sub")).unwrap();
         delete(&b).unwrap();

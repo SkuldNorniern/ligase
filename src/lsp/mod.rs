@@ -155,12 +155,16 @@ impl Lsp {
 
     /// sends opens, changes and closes so servers see what the editor has.
     pub fn sync(&mut self, docs: &Documents) {
-        // closed documents
+        // closed documents, and ones whose file moved (renamed folder, save
+        // as): closed under the old uri, opened again under the new one
         let gone: Vec<_> = self
             .synced
-            .keys()
-            .filter(|id| docs.doc(**id).is_none())
-            .copied()
+            .iter()
+            .filter(|(id, s)| {
+                docs.doc(**id)
+                    .is_none_or(|d| uri::from_path(&d.path) != s.uri)
+            })
+            .map(|(id, _)| *id)
             .collect();
         for id in gone {
             if let Some(synced) = self.synced.remove(&id)

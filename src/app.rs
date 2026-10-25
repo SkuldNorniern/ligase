@@ -277,6 +277,8 @@ pub struct App {
     prompt_for: Option<PromptFor>,
     /// what a delete waiting on its yes / no would remove.
     delete_path: Option<PathBuf>,
+    /// tabs close all / close others still has to close.
+    close_queue: Vec<PaneId>,
     /// language server completions under the caret.
     completion: Option<Popup>,
     /// ask for completions once the server has the text as it is now.
@@ -351,6 +353,7 @@ impl App {
             menu_target: None,
             prompt_for: None,
             delete_path: None,
+            close_queue: Vec::new(),
             completion: None,
             want_complete: None,
             complete_for: None,
@@ -1212,10 +1215,24 @@ impl App {
                     .filter(|(id, p)| matches!(p, Panel::Editor(_)) && Some(*id) != keep)
                     .map(|(id, _)| id)
                     .collect();
-                // ones with unsaved edits ask, one at a time; the rest go
-                for pane in panes {
-                    self.close_pane(pane);
-                }
+                // ones with unsaved edits ask, one at a time; each answer
+                // goes on to the next
+                self.close_queue = panes;
+                self.close_next();
+            }
+        }
+    }
+
+    /// closes queued tabs until one asks about unsaved edits.
+    fn close_next(&mut self) {
+        while let Some(pane) = self.close_queue.first().copied() {
+            self.close_queue.remove(0);
+            if self.bench.panels.get(pane).is_none() {
+                continue;
+            }
+            self.close_pane(pane);
+            if self.dialog.is_some() {
+                return;
             }
         }
     }
@@ -1511,10 +1528,31 @@ impl App {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                DialogStart::Confirm(
-                    self.texts.tr("Delete").to_owned(),
-                    format!("{}\n\n{name}", self.texts.tr("delete this for good?")),
-                )
+                // open files with edits in there are named: their text stays
+                // open, but there will be no folder to save them to
+                let dirty: Vec<String> = self
+                    .delete_path
+                    .as_ref()
+                    .map(|p| {
+                        self.docs
+                            .under(p)
+                            .into_iter()
+                            .filter_map(|id| self.docs.doc(id))
+                            .filter(|d| d.is_dirty())
+                            .map(document::Document::name)
+                            .take(8)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut text = format!("{}\n\n{name}", self.texts.tr("delete this for good?"));
+                if !dirty.is_empty() {
+                    text.push_str(&format!(
+                        "\n\n{} {}",
+                        self.texts.tr("unsaved changes in:"),
+                        dirty.join(", ")
+                    ));
+                }
+                DialogStart::Confirm(self.texts.tr("Delete").to_owned(), text)
             }
             Dialog::Unsaved(pane) => {
                 let names = self.unsaved_names(pane);
@@ -1564,6 +1602,7 @@ impl App {
                     self.save(view);
                 }
             }
+            (Some(_), MessageChoice::Cancel) => self.close_queue.clear(),
             (Some(pane), MessageChoice::Discard)
                 if self.bench.close_discarding(pane, &mut self.docs).is_ok() =>
             {
@@ -1576,6 +1615,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if pane.is_some() && choice != MessageChoice::Save {
+            self.close_next();
         }
     }
 
@@ -1613,6 +1655,7 @@ impl App {
         {
             self.close_pane_after_save = None;
             self.close_pane(pane);
+            self.close_next();
         }
         if self.close_after_save && !self.docs.any_dirty() {
             self.close_after_save = false;
@@ -2679,6 +2722,9 @@ impl App {
             }
         }
         if let Some((at, entry)) = explorer_menu {
+            // the workspace folder's own row is never renamed or deleted
+            let root = self.explorer.root().to_path_buf();
+            let entry = entry.filter(|(path, _)| *path != root);
             let on_entry = entry.is_some();
             self.menu_target = Some(match entry {
                 Some((path, dir)) => Target::Entry(path, dir),
@@ -2962,5 +3008,4 @@ mod tests {
         assert!(app.prompt_for.is_none());
         assert!(!app.status.is_empty());
     }
-
 }
