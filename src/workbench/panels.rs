@@ -11,6 +11,8 @@ pub enum Panel {
     Explorer,
     Search,
     Terminal,
+    /// diagnostics of every open file.
+    Problems,
     /// stands in the editor area when no file is open.
     Welcome,
     Editor(ViewId),

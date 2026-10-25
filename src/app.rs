@@ -24,6 +24,7 @@ use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
 use crate::lsp::{self, Lsp};
 use crate::palette::{self, Kind, Palette};
+use crate::problems::{self, Problems};
 use crate::search::{self, Finder};
 use crate::settings::{self, Settings, ThemeChoice};
 use crate::syntax::Syntax;
@@ -50,6 +51,7 @@ pub enum Id {
     PaletteRow(u16),
     Completion,
     CompletionRow(u16),
+    ProblemList,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +80,8 @@ pub enum Command {
     FindInFiles,
     ToggleExplorer,
     ToggleTerminal,
+    ToggleProblems,
+    SplitEditor,
     ResetLayout,
     ZoomIn,
     ZoomOut,
@@ -146,6 +150,8 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Complete", Command::Complete),
     ("Explorer", Command::ToggleExplorer),
     ("Terminal", Command::ToggleTerminal),
+    ("Problems", Command::ToggleProblems),
+    ("Split Editor", Command::SplitEditor),
     ("Zoom In", Command::ZoomIn),
     ("Zoom Out", Command::ZoomOut),
     ("Reset Zoom", Command::ZoomReset),
@@ -214,6 +220,7 @@ pub struct App {
     syntax: Syntax,
     shell: Shell,
     finder: Finder,
+    problems: Problems,
     lsp: Lsp,
     /// hover text for a view, while its caret stays where it was asked.
     hover: Option<(ViewId, usize, String)>,
@@ -288,6 +295,7 @@ impl App {
             syntax: Syntax::default(),
             shell: Shell::default(),
             finder: Finder::default(),
+            problems: Problems::default(),
             lsp: Lsp::default(),
             hover: None,
             line_clip: None,
@@ -831,6 +839,29 @@ impl App {
             }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
+            Command::ToggleProblems => self.bench.toggle(Panel::Problems),
+            Command::SplitEditor => {
+                let Some(view) = focus.or(self.last_editor) else {
+                    return;
+                };
+                let Some(pane) = self.bench.panels.find(Panel::Editor(view)) else {
+                    return;
+                };
+                let Some(old) = self.docs.view(view).cloned() else {
+                    return;
+                };
+                // the new view starts where the old one is
+                let other = self.docs.add_view(old.doc);
+                if let Some(v) = self.docs.view_mut(other) {
+                    v.sel = old.sel;
+                    v.scroll = old.scroll;
+                    v.folded = old.folded;
+                    v.reveal = true;
+                }
+                self.bench.split(pane, other);
+                self.ui.focus(Id::Editor(other), 1);
+                self.last_editor = Some(other);
+            }
             Command::ResetLayout => {
                 // editors stay open, only their places reset
                 let views: Vec<ViewId> = self
@@ -2080,6 +2111,14 @@ impl App {
                     Panel::Explorer => self.texts.tr("Explorer").to_owned(),
                     Panel::Search => self.texts.tr("Search").to_owned(),
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
+                    Panel::Problems => {
+                        let n = self.problems.rows.len();
+                        if n == 0 {
+                            self.texts.tr("Problems").to_owned()
+                        } else {
+                            format!("{} {n}", self.texts.tr("Problems"))
+                        }
+                    }
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
                     Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
                         // ! when the file also changed on disk
@@ -2111,6 +2150,10 @@ impl App {
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
         self.refilter_completion();
+        if self.shows(Panel::Problems) {
+            self.problems.gather(&self.docs);
+        }
+        let mut problem_picked = None;
         self.fill_symbols();
         let mut picked_completion = None;
         let mut found = None;
@@ -2140,6 +2183,7 @@ impl App {
             let shell = &mut self.shell;
             let hover = &self.hover;
             let finder = &mut self.finder;
+            let problems = &mut self.problems;
             let bar = &mut self.bar;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
@@ -2198,6 +2242,10 @@ impl App {
                     found = search::view::show(ui, finder, &root, rect, texts)?;
                     Ok(())
                 }
+                Some(Panel::Problems) => {
+                    problem_picked = problems::show(ui, problems, &root, rect, texts)?;
+                    Ok(())
+                }
                 Some(Panel::Terminal) => {
                     shell_focus = terminal::show(ui, shell, rect, texts, terminal_size)?;
                     Ok(())
@@ -2238,6 +2286,14 @@ impl App {
         }
         if let Some(ask) = palette_ask {
             self.palette_ask(ask);
+        }
+        if let Some(p) = problem_picked {
+            let view = self.open_file(&p.path);
+            if let Some(v) = self.docs.view_mut(view) {
+                v.goto = Some((Point::new(p.line, p.column), Encoding::Utf32));
+            }
+            self.ui.focus(Id::Editor(view), 1);
+            self.last_editor = Some(view);
         }
         if let Some(index) = picked_completion {
             self.accept_completion(index);
@@ -2473,7 +2529,9 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Minus), Command::ZoomOut)
         .bind(Chord::command(KeyCode::Key0), Command::ZoomReset)
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
-        .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal);
+        .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
+        .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
+        .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
 }
 

@@ -724,7 +724,11 @@ mod tests {
             }
         }
         let files = renamed.expect("a rename edit");
-        assert!(files.iter().any(|(_, edits)| edits.iter().any(|e| e.text == "renamed")));
+        assert!(
+            files
+                .iter()
+                .any(|(_, edits)| edits.iter().any(|e| e.text == "renamed"))
+        );
         // completion after "x." on a u32 lists its methods
         let end = docs.doc(doc).unwrap().buffer.len() - 2;
         docs.edit(view, vec![(end..end, "\n    x.".to_owned())], false);

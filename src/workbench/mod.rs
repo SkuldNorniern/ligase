@@ -110,7 +110,7 @@ impl Workbench {
                 self.tree().remove(pane);
             }
             Some(Panel::Welcome) => return Err(Refused::KeepsEditorArea),
-            Some(Panel::Explorer | Panel::Search | Panel::Terminal) => {
+            Some(Panel::Explorer | Panel::Search | Panel::Terminal | Panel::Problems) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
             }
@@ -145,6 +145,19 @@ impl Workbench {
         Some(next)
     }
 
+    /// puts `view` beside `pane`, to the right: a second editor on the same
+    /// file, or any view.
+    pub fn split(&mut self, pane: PaneId, view: ViewId) -> PaneId {
+        let new = self.panels.pane(Panel::Editor(view));
+        if self.dock.tree.contains(pane) {
+            self.tree().insert(new, pane, DockSide::Right);
+        } else {
+            self.show_editor(view);
+        }
+        self.tree().activate(new);
+        new
+    }
+
     /// shows or hides a tool panel. it comes back at its home spot.
     pub fn toggle(&mut self, panel: Panel) {
         let pane = self.panels.pane(panel);
@@ -161,9 +174,13 @@ impl Workbench {
     pub fn show(&mut self, panel: Panel) {
         let pane = self.panels.pane(panel);
         if !self.dock.tree.contains(pane) {
+            // tool panels share a spot: explorer with search, the bottom
+            // ones with each other
             let sibling = match panel {
                 Panel::Explorer => Some(Panel::Search),
                 Panel::Search => Some(Panel::Explorer),
+                Panel::Terminal => Some(Panel::Problems),
+                Panel::Problems => Some(Panel::Terminal),
                 _ => None,
             }
             .and_then(|p| self.panels.find(p))
@@ -177,7 +194,7 @@ impl Workbench {
                         return;
                     };
                     let (side, share) = match panel {
-                        Panel::Terminal => (DockSide::Bottom, 0.28),
+                        Panel::Terminal | Panel::Problems => (DockSide::Bottom, 0.28),
                         _ => (DockSide::Left, 0.22),
                     };
                     self.tree().insert_sized(pane, area, side, share);
@@ -198,6 +215,7 @@ impl Workbench {
                     Panel::Explorer => "explorer".to_owned(),
                     Panel::Search => "search".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
+                    Panel::Problems => "problems".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
                     Panel::Editor(view) => {
                         // a file never saved has no path to come back to
@@ -275,6 +293,7 @@ impl Workbench {
                     "explorer" => Panel::Explorer,
                     "search" => Panel::Search,
                     "terminal" => Panel::Terminal,
+                    "problems" => Panel::Problems,
                     "welcome" => Panel::Welcome,
                     other => {
                         let index: usize = other.strip_prefix("editor")?.parse().ok()?;
@@ -402,6 +421,22 @@ mod tests {
         assert_eq!(bench.close(pane, &mut docs), Ok(()));
         assert!(in_tree(&bench, Panel::Welcome));
         assert!(docs.view(view).is_none());
+    }
+
+    #[test]
+    fn split_puts_a_second_view_beside() {
+        let mut docs = Documents::default();
+        let mut bench = Workbench::default();
+        let view = open_file(&mut docs, "a.rs");
+        let pane = bench.show_editor(view);
+        let doc = docs.view(view).unwrap().doc;
+        let other = docs.add_view(doc);
+        let new = bench.split(pane, other);
+        assert!(bench.dock.tree.contains(new));
+        assert_ne!(
+            bench.dock.tree.group_of(&new),
+            bench.dock.tree.group_of(&pane)
+        );
     }
 
     #[test]

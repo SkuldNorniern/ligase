@@ -11,6 +11,7 @@ mod jobs;
 mod lang;
 mod lsp;
 mod palette;
+mod problems;
 mod search;
 mod settings;
 mod syntax;
@@ -302,6 +303,8 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;
     let terminal = add(&mut view, "Terminal", Command::ToggleTerminal)?;
+    let problems = add(&mut view, "Problems", Command::ToggleProblems)?;
+    add(&mut view, "Split Editor", Command::SplitEditor)?;
     view.add_separator()?;
     add(&mut view, "Zoom In", Command::ZoomIn)?;
     add(&mut view, "Zoom Out", Command::ZoomOut)?;
@@ -309,7 +312,11 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     view.add_separator()?;
     add(&mut view, "Reset Layout", Command::ResetLayout)?;
     Ok(Ticks {
-        items: vec![(Panel::Explorer, explorer), (Panel::Terminal, terminal)],
-        shown: vec![false, false],
+        items: vec![
+            (Panel::Explorer, explorer),
+            (Panel::Terminal, terminal),
+            (Panel::Problems, problems),
+        ],
+        shown: vec![false, false, false],
     })
 }
