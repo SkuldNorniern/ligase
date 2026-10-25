@@ -10,8 +10,8 @@ use super::cursor;
 use super::fold::{self, Hidden};
 
 /// files longer than this don't wrap; counting pieces is a pass over all of
-/// the text whenever it changes.
-pub const WRAP_MAX: usize = 4 * 1024 * 1024;
+/// the text whenever it changes, on the ui thread, so it stays small.
+pub const WRAP_MAX: usize = 1024 * 1024;
 
 /// columns a char takes: a tab to the next stop, wide east asian chars 2.
 fn width(c: char, col: usize, tab: usize) -> usize {

@@ -1143,8 +1143,19 @@ pub fn show(
             };
             let line_at_y = |y: f32| piece_at_y(y).0;
             let hit_test = |ui: &mut Ui<'_, Id>, at: Point| {
-                let (_, piece) = piece_at_y(at.y);
-                lay(text, piece, tab).offset_at(ui, &font, at.x - body_x)
+                let (line, piece) = piece_at_y(at.y);
+                let hit = lay(text, piece.clone(), tab).offset_at(ui, &font, at.x - body_x);
+                // past the end of a wrapped row that isn't the line's last:
+                // its end is the next row's start, so stop one char before
+                if hit >= piece.end && piece.end < cursor::line_end(text, line) {
+                    return text
+                        .prev_grapheme(piece.end)
+                        .ok()
+                        .flatten()
+                        .filter(|&p| p >= piece.start)
+                        .unwrap_or(piece.start);
+                }
+                hit
             };
             let mut pull = 0.0;
             // the fold arrow column: a press there folds or opens
