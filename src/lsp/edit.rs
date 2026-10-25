@@ -48,11 +48,14 @@ pub fn text_edits(value: &Value) -> Vec<Edit> {
         .collect()
 }
 
-/// a `WorkspaceEdit`: `changes` by uri, or `documentChanges` with text
-/// edits (file create, rename and delete operations are skipped).
+/// a `WorkspaceEdit`: `documentChanges` with text edits when it has them
+/// (file create, rename and delete operations are skipped), else `changes`
+/// by uri. never both: a server may send the same edits in each.
 pub fn workspace_edit(value: &Value) -> Vec<(PathBuf, Vec<Edit>)> {
     let mut out: Vec<(PathBuf, Vec<Edit>)> = Vec::new();
-    if let Some(changes) = value["changes"].as_object() {
+    if value["documentChanges"].is_array() {
+        // handled below
+    } else if let Some(changes) = value["changes"].as_object() {
         for (u, edits) in changes.iter().take(MAX_FILES) {
             if let Some(path) = uri::to_path(u) {
                 out.push((path, text_edits(edits)));
@@ -118,6 +121,11 @@ mod tests {
         assert_eq!(workspace_edit(&docs).len(), 1);
         assert!(workspace_edit(&json!(null)).is_empty());
         assert!(workspace_edit(&json!({ "changes": { "file:///x": "junk" } })).is_empty());
+        let both = json!({
+            "changes": { "file:///D:/b.rs": [edit] },
+            "documentChanges": [{ "textDocument": { "uri": "file:///D:/b.rs" }, "edits": [edit] }],
+        });
+        assert_eq!(workspace_edit(&both).len(), 1, "one copy, not two");
     }
 
     #[test]

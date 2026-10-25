@@ -78,6 +78,8 @@
 "the text changed, try again" = "글이 바뀌었어요. 다시 해 보세요"
 "files changed:" = "바뀐 파일:"
 "no references" = "참조 없음"
+"too many files to change here" = "여기서 바꾸기엔 파일이 너무 많아요"
+"the server's edits don't fit" = "서버가 준 수정이 맞지 않아요"
 "references" = "참조"
 "Word Wrap" = "자동 줄 바꿈"
 "Reopen Closed Tab" = "닫은 탭 다시 열기"

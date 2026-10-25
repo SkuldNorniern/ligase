@@ -66,6 +66,7 @@ pub enum Event {
     Edits(
         crate::document::DocumentId,
         Revision,
+        Seen,
         Vec<(PathBuf, Vec<edit::Edit>)>,
         Encoding,
     ),
@@ -94,8 +95,9 @@ struct Synced {
 enum Pending {
     Definition,
     Hover(ViewId, usize),
-    /// a rename or format for a document as of a revision.
-    Edits(crate::document::DocumentId, Revision),
+    /// a rename or format for a document as of a revision, and every open
+    /// document's revision then.
+    Edits(crate::document::DocumentId, Revision, Seen),
     References,
     Complete(ViewId, Revision, crate::document::DocumentId),
 }
@@ -441,7 +443,7 @@ impl Lsp {
                 }
                 let encoding = *encoding;
                 match self.pending.remove(&(language, id)) {
-                    Some(Pending::Edits(doc, revision)) => {
+                    Some(Pending::Edits(doc, revision, seen)) => {
                         if let Some(why) = msg["error"]["message"].as_str() {
                             events.push(Event::Status(why.chars().take(200).collect()));
                             return;
@@ -456,7 +458,7 @@ impl Lsp {
                         } else {
                             edit::workspace_edit(result)
                         };
-                        events.push(Event::Edits(doc, revision, files, encoding));
+                        events.push(Event::Edits(doc, revision, seen, files, encoding));
                     }
                     Some(Pending::References) => {
                         events.push(Event::Locations(edit::locations(&msg["result"]), encoding));
@@ -533,11 +535,18 @@ impl Lsp {
     }
 }
 
+/// every open document and its revision when a request went out.
+pub type Seen = Vec<(crate::document::DocumentId, Revision)>;
+
 /// what an edit request is for: the document of `view` as it is now.
 fn edits_for(docs: &Documents, view: ViewId) -> Option<Pending> {
     let v = docs.view(view)?;
     let doc = docs.doc(v.doc)?;
-    Some(Pending::Edits(v.doc, doc.buffer.revision()))
+    let seen = docs
+        .all_with_ids()
+        .map(|(id, d)| (id, d.buffer.revision()))
+        .collect();
+    Some(Pending::Edits(v.doc, doc.buffer.revision(), seen))
 }
 
 fn point(value: &Value) -> Option<Point> {
@@ -555,7 +564,12 @@ fn range_in(text: &TextSnapshot, range: &Value, encoding: Encoding) -> Option<Ra
 /// byte offset of a server position, pulled back onto the text when it is
 /// past a line end, past the last line, or inside a char.
 pub fn offset_near(text: &TextSnapshot, at: Point, encoding: Encoding) -> usize {
-    let line = at.line.min(text.line_count() - 1);
+    // the line after the last one is the end of the text (an edit to the
+    // end of a file without a final break names it)
+    if at.line >= text.line_count() {
+        return text.len();
+    }
+    let line = at.line;
     let mut column = at.column;
     loop {
         match text.offset(Point::new(line, column), encoding) {
@@ -629,7 +643,11 @@ mod tests {
         );
         assert_eq!(offset_near(&text, Point::new(0, 3), Encoding::Utf16), 5);
         assert_eq!(offset_near(&text, Point::new(0, 99), Encoding::Utf16), 6);
-        assert_eq!(offset_near(&text, Point::new(9, 1), Encoding::Utf8), 8);
+        assert_eq!(
+            offset_near(&text, Point::new(9, 1), Encoding::Utf8),
+            text.len(),
+            "past the last line is the end"
+        );
     }
 
     #[test]
@@ -718,7 +736,7 @@ mod tests {
         while start.elapsed() < Duration::from_secs(30) && renamed.is_none() {
             std::thread::sleep(Duration::from_millis(100));
             for event in lsp.poll() {
-                if let Event::Edits(_, _, files, _) = event {
+                if let Event::Edits(_, _, _, files, _) = event {
                     renamed = Some(files);
                 }
             }

@@ -32,6 +32,8 @@ use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
 use crate::workbench::{self, Refused, Workbench};
 
+/// tabs a rename may open for files that weren't open.
+const MAX_OPENED_BY_EDIT: usize = 50;
 const STATUS_HEIGHT: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -883,35 +885,69 @@ impl App {
     }
 
     /// a rename or format came back: its edits go in, one undo step per
-    /// file. dropped when the asking document changed since.
+    /// file, all or none. dropped when any open file changed since the
+    /// request: the server's positions are for the text it had.
     fn server_edits(
         &mut self,
         asking: DocumentId,
         revision: Revision,
+        seen: lsp::Seen,
         files: Vec<(PathBuf, Vec<lsp::edit::Edit>)>,
         encoding: Encoding,
     ) {
-        if self.docs.doc(asking).map(|d| d.buffer.revision()) != Some(revision) {
+        let moved = self.docs.doc(asking).map(|d| d.buffer.revision()) != Some(revision)
+            || seen.iter().any(|(id, r)| {
+                self.docs
+                    .doc(*id)
+                    .is_some_and(|d| d.buffer.revision() != *r)
+            });
+        if moved {
             self.status = self.texts.tr("the text changed, try again").to_owned();
             return;
         }
-        let mut changed = 0;
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
         for (path, edits) in files {
-            let view = self
-                .view_of_path(&path)
-                .unwrap_or_else(|| self.open_file(&path));
-            let loaded = self
-                .docs
-                .doc_of(view)
-                .is_some_and(|d| d.load == document::Load::Ready);
-            if loaded {
-                if self.apply_server_edits(view, &edits, encoding) {
-                    changed += 1;
+            match self.view_of_path(&path) {
+                Some(view) => open.push((view, edits)),
+                None => closed.push((path, edits)),
+            }
+        }
+        // every file that isn't open becomes a tab; past this many, no
+        if closed.len() > MAX_OPENED_BY_EDIT {
+            self.status = format!(
+                "{} ({})",
+                self.texts.tr("too many files to change here"),
+                open.len() + closed.len()
+            );
+            return;
+        }
+        // all checked first, so a bad file never leaves the rest half done
+        let mut planned = Vec::new();
+        for (view, edits) in &open {
+            match self.plan_server_edits(*view, edits, encoding) {
+                Some(ranges) => planned.push((*view, ranges)),
+                None => {
+                    let name = self
+                        .docs
+                        .doc_of(*view)
+                        .map(document::Document::name)
+                        .unwrap_or_default();
+                    self.status =
+                        format!("{} {name}", self.texts.tr("the server's edits don't fit"));
+                    return;
                 }
-            } else if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
+            }
+        }
+        let changed = planned.len() + closed.len();
+        for (view, ranges) in planned {
+            self.commit_server_edits(view, ranges);
+        }
+        for (path, edits) in closed {
+            let view = self.open_file(&path);
+            if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
                 // goes in once the file is read
                 self.waiting_edits.push((doc, edits, encoding));
-                changed += 1;
             }
         }
         self.status = format!("{} {changed}", self.texts.tr("files changed:"));
@@ -925,18 +961,22 @@ impl App {
         })
     }
 
-    /// puts server edits into `view`'s document as one step. false when
-    /// they overlap or don't fit the text.
-    fn apply_server_edits(
-        &mut self,
+    /// server edits as byte ranges in `view`'s text, sorted. none when
+    /// they overlap or name lines the text doesn't have.
+    fn plan_server_edits(
+        &self,
         view: ViewId,
         edits: &[lsp::edit::Edit],
         encoding: Encoding,
-    ) -> bool {
-        let Some(doc) = self.docs.doc_of(view) else {
-            return false;
-        };
-        let text = doc.buffer.text();
+    ) -> Option<Vec<(Range<usize>, String)>> {
+        let text = self.docs.doc_of(view)?.buffer.text();
+        let lines = text.line_count();
+        if edits
+            .iter()
+            .any(|e| e.start.line > lines || e.end.line > lines)
+        {
+            return None;
+        }
         let mut ranges: Vec<(Range<usize>, String)> = edits
             .iter()
             .map(|e| {
@@ -947,14 +987,19 @@ impl App {
             .collect();
         ranges.sort_by_key(|(r, _)| (r.start, r.end));
         if ranges.windows(2).any(|w| w[0].0.end > w[1].0.start) {
-            return false;
+            return None;
         }
+        Some(ranges)
+    }
+
+    /// makes planned edits as one undo step; the caret stays near where it
+    /// was, not at the last edit.
+    fn commit_server_edits(&mut self, view: ViewId, ranges: Vec<(Range<usize>, String)>) -> bool {
         if let Some((doc, _)) = self.docs.editable(view) {
             doc.buffer.break_join();
         }
         let keep = self.docs.view(view).map(|v| v.sel);
         let done = self.docs.edit(view, ranges, false);
-        // the caret stays near where it was, not at the last edit
         if let (true, Some(sel)) = (done, keep)
             && let Some((doc, v)) = self.docs.editable(view)
         {
@@ -987,7 +1032,9 @@ impl App {
                             line.trim().chars().take(200).collect(),
                         )
                     })
-                    .unwrap_or((at.column, String::new()));
+                    // a closed file's column is in the server's encoding;
+                    // its line start is the safe place to land
+                    .unwrap_or((0, String::new()));
                 search::Hit {
                     path,
                     line: at.line,
@@ -1923,8 +1970,8 @@ impl App {
                         v.goto = Some((at, encoding));
                     }
                 }
-                lsp::Event::Edits(doc, revision, files, encoding) => {
-                    self.server_edits(doc, revision, files, encoding);
+                lsp::Event::Edits(doc, revision, seen, files, encoding) => {
+                    self.server_edits(doc, revision, seen, files, encoding);
                 }
                 lsp::Event::Locations(places, encoding) => self.show_locations(places, encoding),
                 lsp::Event::Completion(view, revision, items) => {
@@ -1982,8 +2029,17 @@ impl App {
                                 .map(|d| d.path.clone())
                                 .unwrap_or_default(),
                         );
-                        if let Some(view) = view {
-                            self.apply_server_edits(view, &edits, encoding);
+                        let planned = view.and_then(|v| {
+                            self.plan_server_edits(v, &edits, encoding).map(|r| (v, r))
+                        });
+                        match planned {
+                            Some((view, ranges)) => {
+                                self.commit_server_edits(view, ranges);
+                            }
+                            None => {
+                                self.status =
+                                    self.texts.tr("the server's edits don't fit").to_owned();
+                            }
                         }
                     }
                 }
