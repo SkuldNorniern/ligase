@@ -84,10 +84,7 @@ pub fn show(
         (caret.y - height - 2.0).max(area.y)
     };
     let x = caret.x.min(area.x + area.width - width).max(area.x);
-    if std::mem::take(&mut popup.opened) {
-        ui.set_animated(Id::Completion, 0, Channel::Custom(0), 0.0);
-    }
-    let shown = ui.animate(Id::Completion, 0, Channel::Custom(0), 1.0, 22.0);
+    let shown = ui.animate_from(Id::Completion, 0, Channel::Custom(0), 0.0, 1.0, 22.0);
     let card = Rect::new(x, y + (1.0 - shown) * 4.0, width, height);
     ui.round(card.inset(-2.0), 7.0, palette.shadow.fade(0.3 * shown))?;
     ui.round(card, 6.0, palette.raised.fade(shown))?;

@@ -54,8 +54,6 @@ pub struct Palette {
     made_for: Option<(Kind, String, usize)>,
     /// bumped each time the file list is replaced.
     generation: usize,
-    /// just opened; it slides in from here.
-    pub opened: bool,
     /// what a prompt asks for.
     pub hint: String,
 }
@@ -66,9 +64,6 @@ impl Palette {
     }
 
     pub fn open(&mut self, kind: Kind) {
-        if self.kind.is_none() {
-            self.opened = true;
-        }
         self.kind = Some(kind);
         self.query = match kind {
             Kind::Commands => ">".to_owned(),

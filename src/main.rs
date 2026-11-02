@@ -76,10 +76,6 @@ fn run() -> AureaResult<()> {
             ticks.update(&a);
             if let Some(window) = &window {
                 a.ui.sync_window(window);
-                // the editor is not an aurea text field, so its caret is set here
-                if let Some(caret) = a.ime {
-                    let _ = window.set_ime_cursor_area(caret);
-                }
             }
             let close = std::mem::take(&mut a.close_now);
             let dialog = a.take_dialog().map(|d| (d, a.dialog_start(d)));
@@ -115,7 +111,7 @@ fn run() -> AureaResult<()> {
             // an event sent from inside a frame; the frame redraws anyway
             return;
         };
-        let redraw = a.event(&event);
+        let redraw = a.event(event);
         let close = std::mem::take(&mut a.close_now);
         drop(a);
         if close && let Some(window) = weak.upgrade() {

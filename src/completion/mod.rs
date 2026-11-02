@@ -28,8 +28,6 @@ pub struct Popup {
     pub top: usize,
     /// what `shown` was made for.
     typed: Option<String>,
-    /// just opened; it fades in from here.
-    pub opened: bool,
 }
 
 /// identifier chars: what a completed word is made of.
@@ -65,7 +63,6 @@ impl Popup {
             pick: 0,
             top: 0,
             typed: None,
-            opened: true,
         }
     }
 

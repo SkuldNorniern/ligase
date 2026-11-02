@@ -87,10 +87,7 @@ pub fn show(
         } else {
             0.0
         };
-    if std::mem::take(&mut palette.opened) {
-        ui.set_animated(Id::Palette, 0, Channel::Custom(0), 0.0);
-    }
-    let shown = ui.animate(Id::Palette, 0, Channel::Custom(0), 1.0, 18.0);
+    let shown = ui.animate_from(Id::Palette, 0, Channel::Custom(0), 0.0, 1.0, 18.0);
     let card = Rect::new(
         area.x + (area.width - width) / 2.0,
         area.y + 8.0 - (1.0 - shown) * 12.0,

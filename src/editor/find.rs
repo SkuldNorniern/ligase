@@ -90,8 +90,6 @@ pub struct Bar {
     pub current: Option<usize>,
     /// jump to the first match after this once matches come in.
     pub jump_from: Option<usize>,
-    /// just opened; it slides in from here.
-    pub opened: bool,
     /// next, back or replace asked while matches were on the way.
     pub pending: Option<Ask>,
 }
@@ -159,10 +157,7 @@ pub fn show(
     let width = WIDTH.min(editor.width - 24.0).max(160.0);
     let height = rows * ROW + (rows + 1.0) * PAD;
     // slides down from under the tab bar as it opens
-    if std::mem::take(&mut bar.opened) {
-        ui.set_animated(Id::FindBar, 0, Channel::Custom(0), 0.0);
-    }
-    let shown = ui.animate(Id::FindBar, 0, Channel::Custom(0), 1.0, 16.0);
+    let shown = ui.animate_from(Id::FindBar, 0, Channel::Custom(0), 0.0, 1.0, 16.0);
     let card = Rect::new(
         editor.x + editor.width - width - 18.0,
         editor.y + 4.0 - (1.0 - shown) * 10.0,

@@ -1,7 +1,7 @@
 //! app state, input routing and one frame. long work goes to the file
 //! worker; results come back through `Done`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -301,7 +301,6 @@ pub struct App {
     dark: bool,
     edit_opts: editor::EditOpts,
     /// the system asked for less motion; read when the window gets focus.
-    still: bool,
     /// "save" was the answer to closing: close once every file is written.
     close_after_save: bool,
     /// the same for one tab.
@@ -314,8 +313,6 @@ pub struct App {
     status: String,
     /// the editor view with the keyboard, from the last frame.
     focus: Option<ViewId>,
-    /// caret box of that view, for the ime window.
-    pub ime: Option<Rect>,
     /// the layout changed since it was last written.
     layout_dirty: bool,
     /// the saved session came back, or there was none.
@@ -365,7 +362,6 @@ impl App {
             waiting_edits: Vec::new(),
             dark: true,
             edit_opts: editor::EditOpts::default(),
-            still: aurea::reduced_motion(),
             close_after_save: false,
             close_pane_after_save: None,
             shell_focus: false,
@@ -373,7 +369,6 @@ impl App {
             session: workbench::session_path(root),
             status: String::new(),
             focus: None,
-            ime: None,
             layout_dirty: false,
             restored: false,
             closing: false,
@@ -422,7 +417,6 @@ impl App {
         if matches!(event, WindowEvent::Focused) {
             // back from another program: files may have changed under us
             self.check_disk();
-            self.still = aurea::reduced_motion();
         }
         if matches!(event, WindowEvent::Unfocused) && self.settings.save_on_focus_loss {
             for view in self.docs.dirty_views() {
@@ -1401,14 +1395,7 @@ impl App {
             return;
         };
         let start = completion::word_start(doc.buffer.text(), v.sel.head);
-        let mut popup = Popup::new(view, items, start);
-        // keep the light on the same row when a new list replaces an old one
-        if let Some(old) = &self.completion
-            && old.view == view
-        {
-            popup.opened = false;
-        }
-        self.completion = Some(popup);
+        self.completion = Some(Popup::new(view, items, start));
     }
 
     /// narrows the popup to the word typed so far, or closes it once the
@@ -1808,10 +1795,8 @@ impl App {
     /// opens the bar on `view`. find starts from the selection, when it is
     /// a bit of one line.
     fn open_bar(&mut self, view: ViewId, mode: Mode) {
-        let was_open = self.bar.is_open();
         self.bar.mode = Some(mode);
         self.bar.view = Some(view);
-        self.bar.opened = !was_open;
         if mode == Mode::Goto {
             self.bar.goto.clear();
         } else {
@@ -2485,15 +2470,28 @@ impl App {
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
                     Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
                         // ! when the file also changed on disk
-                        match (d.is_dirty(), d.conflict) {
-                            (_, true) => format!("{} !", d.name()),
-                            (true, false) => format!("{} *", d.name()),
-                            (false, false) => d.name(),
+                        if d.conflict {
+                            format!("{} !", d.name())
+                        } else {
+                            d.name()
                         }
                     }),
                 };
                 (id, title)
             })
+            .collect()
+    }
+
+    /// tabs with unsaved changes, for the dock's dots.
+    fn dirty_panes(&self) -> HashSet<PaneId> {
+        self.bench
+            .panels
+            .iter()
+            .filter(|(_, panel)| {
+                matches!(panel, Panel::Editor(view)
+                    if self.docs.doc_of(*view).is_some_and(|d| d.is_dirty()))
+            })
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -2507,6 +2505,7 @@ impl App {
         ctx.clear(self.theme.palette.background)?;
         let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
         let titles = self.titles();
+        let dirty = self.dirty_panes();
         let mut clicks: Vec<Click> = Vec::new();
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
@@ -2530,7 +2529,6 @@ impl App {
         let mut rects: Vec<(ViewId, Rect)> = Vec::new();
         let settings = &self.settings;
         let dark = self.dark;
-        let still = self.still;
         let terminal_size = self.settings.terminal_size;
         let mut bar_ask = None;
         let palette_ask;
@@ -2582,7 +2580,6 @@ impl App {
                         let look = editor::Look {
                             settings,
                             dark,
-                            still,
                             size: zoom,
                             idle,
                             hover,
@@ -2594,6 +2591,9 @@ impl App {
                         if shown.focused {
                             focus = Some(view);
                             ime = shown.caret;
+                            if let Some(caret) = ime {
+                                ui.set_ime_area(caret);
+                            }
                             blink = shown.blink;
                         }
                         if shown.pressed {
@@ -2630,6 +2630,7 @@ impl App {
             let response = DockView::new(dock, title, content)
                 .style(DockStyle::new(&self.theme))
                 .close_buttons(true)
+                .dirty(|pane| dirty.contains(&pane))
                 .show(&mut ui, Id::Dock, main)?;
             changed = response.changed;
             if let Some(view) = bar.view
@@ -2654,7 +2655,6 @@ impl App {
         if focus.is_some() {
             self.last_editor = focus;
         }
-        self.ime = ime;
         if let Some(ask) = bar_ask {
             self.bar_ask(ask);
         }

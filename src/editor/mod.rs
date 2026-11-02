@@ -906,8 +906,6 @@ pub struct Look<'a> {
     pub settings: &'a crate::settings::Settings,
     /// the theme is dark; picks the syntax colours.
     pub dark: bool,
-    /// the system asked for less motion: the caret lands, no glide.
-    pub still: bool,
 }
 
 /// line height for a font size and a multiple of it.
@@ -1500,7 +1498,6 @@ pub fn show(
                 // the caret glides to its place; a long jump just lands
                 let target_y = caret_row as f32 * line_h;
                 let jump = preedit.is_some()
-                    || look.still
                     || !settings.smooth_caret
                     || seen_line.is_none_or(|l: usize| l.abs_diff(caret_line) > 6);
                 let (cx, cy) = if jump {
