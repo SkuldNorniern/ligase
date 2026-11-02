@@ -454,11 +454,11 @@ impl App {
         if let WindowEvent::MouseWheel {
             delta_y, modifiers, ..
         } = event
-            && modifiers.ctrl
+            && modifiers.command()
             && !self.shell_focus
             && *delta_y != 0.0
         {
-            // ctrl and the wheel zoom the editor
+            // ctrl (cmd on a mac) and the wheel zoom the editor
             self.zoom_by(if *delta_y > 0.0 { 1.0 } else { -1.0 });
             return true;
         }

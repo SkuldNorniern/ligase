@@ -1193,11 +1193,7 @@ pub fn show(
                 let at = hit_test(ui, press.at);
                 let alt = press.modifiers.alt;
                 // ctrl, or command on mac, follows the name to its definition
-                let follow = if cfg!(target_os = "macos") {
-                    press.modifiers.meta
-                } else {
-                    press.modifiers.ctrl
-                };
+                let follow = press.modifiers.command();
                 if alt && press.shift && press.clicks == 1 {
                     // alt, shift and a drag: a box, one selection a line
                     column = Some((line_at_y(press.at.y), press.at.x - body_x));
