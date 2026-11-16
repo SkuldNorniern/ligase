@@ -59,6 +59,7 @@ pub enum Id {
     ScmCommit,
     ScmList,
     ScmRow(u16),
+    Status,
     Menu,
     Welcome,
 }
@@ -2884,6 +2885,7 @@ impl App {
         let tab_icons = self.tab_icons();
         let mut clicks: Vec<Click> = Vec::new();
         let mut welcome_pick: Option<Command> = None;
+        let status_pick: Option<Command>;
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let menu_act;
@@ -3057,7 +3059,7 @@ impl App {
             }
             menu_act = self.menu.show(&mut ui, texts, &self.keymap);
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
-            status_bar(&mut ui, status, self.branch.as_deref(), &message, &place)?;
+            status_pick = status_bar(&mut ui, status, self.branch.as_deref(), &message, &place)?;
         }
         self.focus = focus;
         if focus.is_some() {
@@ -3154,7 +3156,7 @@ impl App {
             self.menu_target = Some(Target::Editor(view));
             self.menu.ask(at, context_menu::editor());
         }
-        if let Some(command) = welcome_pick {
+        if let Some(command) = welcome_pick.or(status_pick) {
             self.run(command);
         }
         if let Some(folder) = recent_pick {
@@ -3181,13 +3183,14 @@ impl App {
 }
 
 impl App {
-    /// "Ln 3, Col 7" for the focused editor.
-    fn place(&self) -> String {
+    /// the focused editor's facts for the status bar, each with what a
+    /// click on it does.
+    fn place(&self) -> Vec<(String, Option<Command>)> {
         let Some(view) = self.focus.and_then(|v| self.docs.view(v)) else {
-            return String::new();
+            return Vec::new();
         };
         let Some(doc) = self.docs.doc(view.doc) else {
-            return String::new();
+            return Vec::new();
         };
         let errors = doc
             .diags
@@ -3219,12 +3222,19 @@ impl App {
             },
             None => "text".to_owned(),
         };
-        let about = format!("{at}    {indent}    UTF-8    {eol}    {language}");
-        if errors + warnings == 0 {
-            about
-        } else {
-            format!("E {errors}  W {warnings}    {about}")
+        let mut parts = Vec::new();
+        if errors + warnings > 0 {
+            parts.push((
+                format!("E {errors}  W {warnings}"),
+                Some(Command::ToggleProblems),
+            ));
         }
+        parts.push((at, Some(Command::GotoLine)));
+        parts.push((indent, None));
+        parts.push(("UTF-8".to_owned(), None));
+        parts.push((eol.to_owned(), None));
+        parts.push((language, None));
+        parts
     }
 
     /// the message of the diagnostic under the caret, for the status bar.
@@ -3372,26 +3382,63 @@ fn status_bar(
     rect: Rect,
     branch: Option<&str>,
     message: &str,
-    place: &str,
-) -> AureaResult<()> {
+    place: &[(String, Option<Command>)],
+) -> AureaResult<Option<Command>> {
     let palette = ui.theme.palette;
     ui.fill(rect, palette.surface)?;
     ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
     let font = ui.theme.font(12.0);
-    let mut inner = rect.inset_xy(10.0, 0.0);
+    let mut picked = None;
+    // a part a click does something with lights up under the pointer
+    let mut part =
+        |ui: &mut Ui<'_, Id>, at: Rect, text: &str, colour, command: Option<Command>, n: u16| {
+            if let Some(command) = command {
+                let input = ui.interact(Id::Status, n, at, Sense::Click, true);
+                if input.hovered {
+                    ui.fill(at, palette.hover)?;
+                    ui.set_cursor(CursorIcon::Pointer);
+                }
+                if input.clicked {
+                    picked = Some(command);
+                }
+            }
+            ui.text(text, at, &font, colour, Align::Center)
+        };
+    let mut x = rect.x + 4.0;
     // the branch first, the way vs code and zed start theirs
     if let Some(branch) = branch {
-        let wanted = ui.text_width(branch, &font) + 16.0;
-        let (left, rest) = inner.split_left(wanted.min(inner.width * 0.3), 8.0);
-        ui.text_clipped(branch, left, &font, palette.text, Align::Start)?;
-        inner = rest;
+        let w = (ui.text_width(branch, &font) + 16.0).min(rect.width * 0.3);
+        part(
+            ui,
+            Rect::new(x, rect.y + 1.0, w, rect.height - 1.0),
+            branch,
+            palette.text,
+            Some(Command::ToggleGit),
+            0,
+        )?;
+        x += w + 4.0;
     }
-    // the file's facts take what they need, the message the rest
-    let wanted = ui.text_width(place, &font) + 8.0;
-    let (right, left) = inner.split_right(wanted.min(inner.width * 0.6), 8.0);
+    // the file's facts from the right edge in, the message in what is left
+    let mut right = rect.x + rect.width - 4.0;
+    for (i, (text, command)) in place.iter().enumerate().rev() {
+        let w = ui.text_width(text, &font) + 16.0;
+        if right - w < x + 40.0 {
+            break;
+        }
+        right -= w;
+        let n = u16::try_from(i + 1).unwrap_or(u16::MAX);
+        part(
+            ui,
+            Rect::new(right, rect.y + 1.0, w, rect.height - 1.0),
+            text,
+            palette.dim,
+            *command,
+            n,
+        )?;
+    }
+    let left = Rect::new(x + 6.0, rect.y, (right - x - 12.0).max(0.0), rect.height);
     ui.text_clipped(message, left, &font, palette.dim, Align::Start)?;
-    ui.text(place, right, &font, palette.dim, Align::End)?;
-    Ok(())
+    Ok(picked)
 }
 
 fn keymap() -> Keymap<Command> {
