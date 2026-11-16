@@ -356,6 +356,8 @@ pub struct App {
     open_after: Option<(PathBuf, Option<usize>)>,
     /// a folder to open once this window has closed.
     reopen: Option<PathBuf>,
+    /// a save waiting on the server's formatting, and since when.
+    save_after_format: Option<(ViewId, DocumentId, Instant)>,
     /// files whose working tree edits wait on `Dialog::ConfirmDiscard`.
     discard_rels: Vec<String>,
     /// the new window's: no folder of its own.
@@ -426,6 +428,7 @@ impl App {
             restored: false,
             open_after: None,
             reopen: None,
+            save_after_format: None,
             discard_rels: Vec::new(),
             blank,
             recent: Vec::new(),
@@ -738,7 +741,7 @@ impl App {
         match command {
             Command::Save => {
                 if let Some(view) = focus.or(self.last_editor) {
-                    self.save(view);
+                    self.save_formatted(view);
                 }
                 return;
             }
@@ -2288,6 +2291,34 @@ impl App {
         self.save_with(view, false);
     }
 
+    /// saves `view`, formatted first when the settings ask and a server is
+    /// there. the save follows the server's edits, or comes anyway when it
+    /// stays silent.
+    fn save_formatted(&mut self, view: ViewId) {
+        let doc = self.docs.view(view).map(|v| v.doc);
+        let untitled = self.docs.doc_of(view).is_none_or(|d| d.untitled);
+        if self.settings.format_on_save
+            && !untitled
+            && let Some(doc) = doc
+            && self.lsp.format(&self.docs, view, self.settings.tab_size)
+        {
+            self.save_after_format = Some((view, doc, Instant::now()));
+            return;
+        }
+        self.save(view);
+    }
+
+    /// the save a format was asked for, once its edits are in or it gave up.
+    fn finish_format_save(&mut self, doc: DocumentId, timed_out: bool) {
+        let Some((view, waiting, at)) = self.save_after_format else {
+            return;
+        };
+        if waiting == doc && (!timed_out || at.elapsed() >= FORMAT_WAIT) {
+            self.save_after_format = None;
+            self.save(view);
+        }
+    }
+
     /// saves `view`'s document. the worker checks the file is still what
     /// was read or what the user was warned about; `force` skips that, for
     /// a path just picked in save as (the dialog asked already).
@@ -2510,6 +2541,15 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        // a server that never answers the format still lets the file save
+        if let Some((_, doc, _)) = self.save_after_format {
+            self.finish_format_save(doc, true);
+            if self.save_after_format.is_some()
+                && let Some(canvas) = self.canvas
+            {
+                request_canvas_redraw_at(canvas, Instant::now() + FORMAT_WAIT);
+            }
+        }
         // a panel back from the saved layout hasn't asked yet
         if !self.changes_known && !self.changes_asked {
             self.refresh_status();
@@ -2528,6 +2568,7 @@ impl App {
                 }
                 lsp::Event::Edits(doc, revision, seen, files, encoding) => {
                     self.server_edits(doc, revision, seen, files, encoding);
+                    self.finish_format_save(doc, false);
                 }
                 lsp::Event::Locations(places, encoding) => self.show_locations(places, encoding),
                 lsp::Event::Completion(view, revision, items) => {
@@ -3319,6 +3360,9 @@ fn welcome(
     }
     Ok((picked, folder))
 }
+
+/// how long a save waits on the server's formatting.
+const FORMAT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// how long a status message stays.
 const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(8);

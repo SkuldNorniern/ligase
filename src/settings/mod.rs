@@ -62,6 +62,8 @@ pub struct Settings {
     pub overview: bool,
     /// the lines that open the scopes the top line is in stay on top.
     pub sticky_scroll: bool,
+    /// the language server formats a file before it is saved.
+    pub format_on_save: bool,
     pub whitespace: Whitespace,
     /// other copies of the word under the caret lit.
     pub word_highlight: bool,
@@ -96,6 +98,7 @@ impl Default for Settings {
             breadcrumbs: true,
             overview: true,
             sticky_scroll: true,
+            format_on_save: false,
             whitespace: Whitespace::Selection,
             word_highlight: true,
             auto_pairs: true,
@@ -133,6 +136,7 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # breadcrumbs = true
 # overview = true          # problem and find marks by the scroll bar
 # sticky_scroll = true     # the lines a scope opens on stay on top
+# format_on_save = false   # the language server formats before a save
 # whitespace = "selection"  # "none", "selection" or "all"
 # word_highlight = true
 # auto_pairs = true
@@ -235,6 +239,7 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
         | "breadcrumbs"
         | "overview"
         | "sticky_scroll"
+        | "format_on_save"
         | "word_highlight"
         | "auto_pairs"
         | "trim_trailing_whitespace"
@@ -252,6 +257,7 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
                 "breadcrumbs" => &mut out.breadcrumbs,
                 "overview" => &mut out.overview,
                 "sticky_scroll" => &mut out.sticky_scroll,
+                "format_on_save" => &mut out.format_on_save,
                 "word_highlight" => &mut out.word_highlight,
                 "trim_trailing_whitespace" => &mut out.trim_trailing_whitespace,
                 "final_newline" => &mut out.final_newline,
