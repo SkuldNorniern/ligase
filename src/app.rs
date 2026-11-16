@@ -2765,6 +2765,28 @@ impl App {
             .collect()
     }
 
+    /// the icon before each tab's title.
+    fn tab_icons(&self) -> HashMap<PaneId, &'static str> {
+        self.bench
+            .panels
+            .iter()
+            .filter_map(|(id, panel)| {
+                let name = match panel {
+                    Panel::Editor(view) => {
+                        let doc = self.docs.doc_of(view)?;
+                        crate::icons::for_path(&doc.path, false, false)
+                    }
+                    Panel::Explorer => "folder",
+                    Panel::Search => "search",
+                    Panel::Git => "source-control",
+                    Panel::Terminal => "shell",
+                    Panel::Problems | Panel::Welcome => return None,
+                };
+                Some((id, name))
+            })
+            .collect()
+    }
+
     /// tabs with unsaved changes, for the dock's dots.
     fn dirty_panes(&self) -> HashSet<PaneId> {
         self.bench
@@ -2789,6 +2811,7 @@ impl App {
         let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
         let titles = self.titles();
         let dirty = self.dirty_panes();
+        let tab_icons = self.tab_icons();
         let mut clicks: Vec<Click> = Vec::new();
         let mut welcome_pick: Option<Command> = None;
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
@@ -2942,6 +2965,10 @@ impl App {
                 .style(DockStyle::new(&self.theme))
                 .close_buttons(true)
                 .dirty(|pane| dirty.contains(&pane))
+                .icon(|pane| {
+                    let name = tab_icons.get(&pane)?;
+                    Some(aurea::ui::IconSource::Vector(crate::icons::image(name)))
+                })
                 .show(&mut ui, Id::Dock, main)?;
             changed = response.changed;
             if let Some(view) = bar.view
