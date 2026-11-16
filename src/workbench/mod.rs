@@ -148,6 +148,8 @@ impl Workbench {
                 | Panel::Search
                 | Panel::Git
                 | Panel::Extensions
+                | Panel::SideView(_)
+                | Panel::BottomView(_)
                 | Panel::Terminal
                 | Panel::Problems,
             ) => {
@@ -254,7 +256,7 @@ impl Workbench {
         if !self.dock.tree.contains(pane) {
             // the bottom ones share a spot
             let sibling = match panel {
-                Panel::Terminal => Some(Panel::Problems),
+                Panel::Terminal | Panel::BottomView(_) => Some(Panel::Problems),
                 Panel::Problems => Some(Panel::Terminal),
                 _ => None,
             }
@@ -273,6 +275,27 @@ impl Workbench {
             }
         }
         self.tree().activate(pane);
+    }
+
+    /// takes every extension view out: the side bar, the dock and the
+    /// pane list. their numbers change when packages are read again.
+    pub fn drop_views(&mut self) {
+        if matches!(self.side.shown, Some(Panel::SideView(_))) {
+            self.side.shown = None;
+        }
+        if matches!(self.side.last, Panel::SideView(_)) {
+            self.side.last = Panel::Explorer;
+        }
+        let views: Vec<PaneId> = self
+            .panels
+            .iter()
+            .filter(|(_, p)| matches!(p, Panel::SideView(_) | Panel::BottomView(_)))
+            .map(|(id, _)| id)
+            .collect();
+        for pane in views {
+            self.tree().remove(pane);
+            self.panels.remove(pane);
+        }
     }
 
     /// the layout as a session file. editors save their file path.
@@ -301,7 +324,10 @@ impl Workbench {
                         format!("editor{}", editors.len() - 1)
                     }
                     // a diff left in the layout stands for the editor area
-                    Panel::Diff(_) => "welcome".to_owned(),
+                    // left out below: extension views come back from their package
+                    Panel::Diff(_) | Panel::SideView(_) | Panel::BottomView(_) => {
+                        "welcome".to_owned()
+                    }
                 };
                 (id, name)
             })
@@ -315,6 +341,15 @@ impl Workbench {
         // diffs aren't kept: their file's editor is. one alone in the editor
         // area stays, as the welcome tab, so the area comes back
         let mut tree = self.dock.tree.clone();
+        let views: Vec<PaneId> = self
+            .panels
+            .iter()
+            .filter(|(id, p)| matches!(p, Panel::BottomView(_)) && tree.contains(*id))
+            .map(|(id, _)| id)
+            .collect();
+        for pane in views {
+            tree.remove(pane);
+        }
         let diffs: Vec<PaneId> = self
             .panels
             .iter()
@@ -347,9 +382,16 @@ impl Workbench {
             Panel::Extensions => "extensions",
             _ => "explorer",
         };
-        let shown = self.side.shown.map_or("", side_name);
+        let shown = match self.side.shown {
+            Some(Panel::SideView(_)) | None => "",
+            Some(p) => side_name(p),
+        };
         file.insert("side".into(), shown.into());
-        file.insert("side_last".into(), side_name(self.side.last).into());
+        let last = match self.side.last {
+            Panel::SideView(_) => Panel::Explorer,
+            p => p,
+        };
+        file.insert("side_last".into(), side_name(last).into());
         file.insert("side_width".into(), f64::from(self.side.width).into());
         file.to_string()
     }

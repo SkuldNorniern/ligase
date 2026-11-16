@@ -5,6 +5,8 @@ use std::collections::HashSet;
 
 use toml::{Table, Value};
 
+use super::ui::{self, Node};
+
 /// largest manifest read, in bytes. bigger text is refused before parsing.
 pub const MAX_BYTES: usize = 256 * 1024;
 
@@ -27,6 +29,9 @@ const MAX_SNIPPETS: usize = 500;
 const MAX_PREFIX: usize = 40;
 const MAX_BODY: usize = 4096;
 const MAX_SNIPPET_DESCRIPTION: usize = 120;
+const MAX_VIEWS: usize = 20;
+const MAX_VIEW_ID: usize = 64;
+const MAX_TITLE: usize = 40;
 
 const LANG_ID_RULE: &str = "1-40 of a-z 0-9 _ + -, starting with a letter";
 
@@ -40,6 +45,7 @@ pub struct Manifest {
     pub permissions: Permissions,
     pub languages: Vec<Language>,
     pub snippets: Vec<Snippet>,
+    pub views: Vec<View>,
     /// things skipped but not fatal, e.g. unknown keys.
     pub warnings: Vec<String>,
 }
@@ -75,6 +81,26 @@ pub struct Snippet {
     pub prefix: String,
     pub body: String,
     pub description: String,
+}
+
+/// a panel a package adds, drawn by ligase from a ui tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct View {
+    pub id: String,
+    pub title: String,
+    pub placement: Placement,
+    /// a bundled icon name for its rail button.
+    pub icon: String,
+    pub body: Node,
+}
+
+/// where a view sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// in the side bar, one panel at a time, with a rail button.
+    Side,
+    /// a tab with the terminal and problems.
+    Bottom,
 }
 
 /// collected while parsing. errors make the parse fail, warnings do not.
@@ -248,7 +274,32 @@ fn parse_permissions(table: &Table, report: &mut Report) -> Permissions {
 }
 
 fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
-    check_keys(table, "contributions", &["languages", "snippets"], report);
+    check_keys(
+        table,
+        "contributions",
+        &["languages", "snippets", "views"],
+        report,
+    );
+
+    if let Some(items) = list(table, "contributions", "views", MAX_VIEWS, report) {
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.views[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            let Some(view) = parse_view(t, &path, report) else {
+                continue;
+            };
+            if out.views.iter().any(|other| other.id == view.id) {
+                report.error(
+                    &join(&path, "id"),
+                    &format!("duplicate view {}", shown(&view.id)),
+                );
+            } else {
+                out.views.push(view);
+            }
+        }
+    }
 
     if let Some(items) = list(table, "contributions", "languages", MAX_LANGUAGES, report) {
         for (i, item) in items.iter().enumerate() {
@@ -294,6 +345,95 @@ fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
             }
         }
     }
+}
+
+fn parse_view(table: &Table, path: &str, report: &mut Report) -> Option<View> {
+    check_keys(
+        table,
+        path,
+        &["id", "title", "placement", "icon", "body"],
+        report,
+    );
+    let id = required_string(table, path, "id", report);
+    let id_ok = id.is_some_and(|id| {
+        let ok = !id.is_empty()
+            && id.len() <= MAX_VIEW_ID
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !ok {
+            report.error(
+                &join(path, "id"),
+                &format!("must be 1-{MAX_VIEW_ID} of a-z A-Z 0-9 _ . -"),
+            );
+        }
+        ok
+    });
+    let title = required_string(table, path, "title", report);
+    let title_ok = title.is_some_and(|t| {
+        let ok = !t.is_empty() && t.chars().count() <= MAX_TITLE && !has_control(t);
+        if !ok {
+            report.error(
+                &join(path, "title"),
+                &format!("must be 1-{MAX_TITLE} chars, no control chars"),
+            );
+        }
+        ok
+    });
+    let placement = match string(table, path, "placement", report) {
+        None | Some("side") => Some(Placement::Side),
+        Some("bottom") => Some(Placement::Bottom),
+        Some(other) => {
+            report.error(
+                &join(path, "placement"),
+                &format!("{} is not side or bottom", shown(other)),
+            );
+            None
+        }
+    };
+    let icon = match string(table, path, "icon", report) {
+        None => Some("extensions"),
+        Some(icon)
+            if icon.len() <= 32 && icon.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') =>
+        {
+            Some(icon)
+        }
+        Some(other) => {
+            report.error(
+                &join(path, "icon"),
+                &format!("{} is not an icon name", shown(other)),
+            );
+            None
+        }
+    };
+    let body = match table.get("body") {
+        None => {
+            report.error(&join(path, "body"), "missing required field");
+            None
+        }
+        Some(value) => match ui::read(value, &join(path, "body")) {
+            Ok((node, warnings)) => {
+                // what read lets through, check lets through too
+                debug_assert!(ui::check(&node).is_ok());
+                report.warnings.extend(warnings);
+                Some(node)
+            }
+            Err(errors) => {
+                report.errors.extend(errors);
+                None
+            }
+        },
+    };
+    if !id_ok || !title_ok {
+        return None;
+    }
+    Some(View {
+        id: id?.to_owned(),
+        title: title?.to_owned(),
+        placement: placement?,
+        icon: icon?.to_owned(),
+        body: body?,
+    })
 }
 
 fn parse_language(table: &Table, path: &str, report: &mut Report) -> Option<Language> {
@@ -706,6 +846,7 @@ description = "a theorem"
     fn full_example_parses() {
         let m = ok(EXAMPLE);
         let expected = Manifest {
+            views: Vec::new(),
             id: "org.example.lean".into(),
             name: "Lean Support".into(),
             version: (0, 1, 0),
@@ -966,6 +1107,28 @@ description = "a theorem"
                     let _ = parse(&text);
                 }
             }
+        }
+    }
+    #[test]
+    fn views_read_their_tree_and_say_what_is_wrong() {
+        let text = format!(
+            "{PACKAGE}\n[[contributions.views]]\nid = \"goals\"\ntitle = \"Goals\"\nplacement = \"bottom\"\nbody = [{{ kind = \"heading\", text = \"Goals\" }}, {{ kind = \"button\", id = \"go\", label = \"Go\", command = \"view.problems\" }}]\n"
+        );
+        let m = ok(&text);
+        assert_eq!(m.views.len(), 1);
+        assert_eq!(m.views[0].placement, Placement::Bottom);
+        assert_eq!(m.views[0].icon, "extensions");
+        assert!(matches!(&m.views[0].body, Node::Column(c) if c.len() == 2));
+        let bad = format!(
+            "{PACKAGE}\n[[contributions.views]]\nid = \"a b\"\ntitle = \"\"\nplacement = \"left\"\nbody = [{{ kind = \"blink\" }}]\n"
+        );
+        let e = errs(&bad);
+        for field in ["id", "title", "placement", "body"] {
+            assert!(
+                e.iter()
+                    .any(|m| m.starts_with(&format!("contributions.views[0].{field}"))),
+                "{field}: {e:?}"
+            );
         }
     }
 }

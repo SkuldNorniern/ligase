@@ -114,6 +114,11 @@ fn parsed() -> &'static HashMap<&'static str, VectorImage> {
 }
 
 /// icon `name`, for a widget that takes an image; an unknown name draws nothing.
+/// the bundled icon called `name`, as a name that lives on.
+pub fn named(name: &str) -> Option<&'static str> {
+    ICONS.iter().find(|(n, _)| *n == name).map(|(n, _)| *n)
+}
+
 pub fn image(name: &str) -> &'static VectorImage {
     static NONE: OnceLock<VectorImage> = OnceLock::new();
     parsed()

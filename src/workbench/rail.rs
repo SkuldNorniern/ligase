@@ -7,7 +7,6 @@ use aurea::ui::{Align, Response, Sense, Splitter, SplitterStyle, Ui};
 use aurea::{AureaResult, CursorIcon, Keymap};
 
 use crate::app::{Command, Id};
-use crate::lang::Texts;
 use crate::settings::RailPlace;
 use crate::workbench::Side;
 
@@ -28,8 +27,8 @@ pub const HEAD: f32 = 32.0;
 /// one button on the rail.
 pub struct Item {
     pub icon: &'static str,
-    /// english, the key for the tooltip text.
-    pub label: &'static str,
+    /// the tooltip, translated.
+    pub label: String,
     pub command: Command,
     /// its panel is in sight.
     pub lit: bool,
@@ -44,7 +43,6 @@ pub fn show(
     rect: Rect,
     place: RailPlace,
     (top, bottom): (&[Item], &[Item]),
-    texts: &Texts,
     keymap: &Keymap<Command>,
 ) -> AureaResult<Option<Command>> {
     let palette = ui.theme.palette;
@@ -82,7 +80,7 @@ pub fn show(
             Rect::new(rect.x, along, rect.width, CELL)
         };
         let part = u16::try_from(part).unwrap_or(u16::MAX);
-        if cell(ui, at, place, item, part, (texts, keymap))? {
+        if cell(ui, at, place, item, part, keymap)? {
             picked = Some(item.command);
         }
     }
@@ -136,7 +134,7 @@ fn cell(
     place: RailPlace,
     item: &Item,
     part: u16,
-    (texts, keymap): (&Texts, &Keymap<Command>),
+    keymap: &Keymap<Command>,
 ) -> AureaResult<bool> {
     let palette = ui.theme.palette;
     let input = ui.interact(Id::Rail, part, at, Sense::Click, true);
@@ -176,7 +174,7 @@ fn cell(
     if item.badge > 0 {
         badge(ui, icon, item.badge, palette.accent, palette.on_accent)?;
     }
-    let label = texts.tr(item.label);
+    let label = item.label.as_str();
     let tip = match keymap.chord_for(&item.command) {
         Some(chord) => format!("{label}  {}", chord.label()),
         None => label.to_owned(),

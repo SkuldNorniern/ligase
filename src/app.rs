@@ -71,6 +71,10 @@ pub enum Id {
     SideSplit,
     ExtensionButton(u16),
     ExtensionList,
+    /// a node in an extension view: the view, then the node's place.
+    ExtView(u16, u16),
+    /// a row of a list or table node in an extension view.
+    ExtRow(u16, u16),
     Settings,
     SettingsSearch,
     SettingsFile,
@@ -110,6 +114,8 @@ pub enum Command {
     ToggleExplorer,
     ToggleSearch,
     ToggleExtensions,
+    /// an extension's view, by its number.
+    ToggleView(u16),
     ToggleTerminal,
     ToggleProblems,
     ToggleGit,
@@ -434,6 +440,8 @@ pub struct App {
     waiting_replace: Vec<(DocumentId, String, String)>,
     sheet: settings::view::Sheet,
     extensions: Extensions,
+    /// what each extension view keeps, by its number.
+    view_states: HashMap<u16, extension::draw::ViewState>,
     /// sheet changes not yet written, and whether a write is out.
     settings_writes: Vec<(&'static str, Option<String>)>,
     settings_writing: bool,
@@ -538,6 +546,7 @@ impl App {
             waiting_replace: Vec::new(),
             sheet: settings::view::Sheet::default(),
             extensions: Extensions::default(),
+            view_states: HashMap::new(),
             settings_writes: Vec::new(),
             settings_writing: false,
             dark: true,
@@ -1076,11 +1085,13 @@ impl App {
                         .iter()
                         .map(|(_, label, c)| palette::Item {
                             text: self.texts.tr(label).to_owned(),
-                            note: self
-                                .keymap
-                                .chord_for(c)
-                                .map(|chord| chord.label())
-                                .unwrap_or_default(),
+                            // the id is what extensions and key files name
+                            note: match (self.keymap.chord_for(c), command_id(*c)) {
+                                (Some(chord), Some(id)) => format!("{}   {id}", chord.label()),
+                                (None, Some(id)) => id.to_owned(),
+                                (Some(chord), None) => chord.label(),
+                                (None, None) => String::new(),
+                            },
                         })
                         .collect();
                     self.palette.open(Kind::Commands);
@@ -1204,6 +1215,13 @@ impl App {
             }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleExtensions => self.bench.toggle(Panel::Extensions),
+            Command::ToggleView(n) => match self.extensions.view(n).map(|(_, v)| v.placement) {
+                Some(extension::manifest::Placement::Side) => self.bench.toggle(Panel::SideView(n)),
+                Some(extension::manifest::Placement::Bottom) => {
+                    self.bench.toggle(Panel::BottomView(n));
+                }
+                None => {}
+            },
             Command::ToggleSearch => {
                 self.bench.toggle(Panel::Search);
                 if self.shows(Panel::Search) {
@@ -3184,6 +3202,11 @@ impl App {
                 let title = match panel {
                     Panel::Explorer => self.texts.tr("Explorer").to_owned(),
                     Panel::Extensions => self.texts.tr("Extensions").to_owned(),
+                    Panel::SideView(n) | Panel::BottomView(n) => self
+                        .extensions
+                        .view(n)
+                        .map(|(_, v)| v.title.clone())
+                        .unwrap_or_default(),
                     Panel::Search => self.texts.tr("Search").to_owned(),
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
                     Panel::Problems => {
@@ -3237,6 +3260,11 @@ impl App {
                     }
                     Panel::Explorer => "folder",
                     Panel::Extensions => "extensions",
+                    Panel::SideView(n) | Panel::BottomView(n) => self
+                        .extensions
+                        .view(n)
+                        .and_then(|(_, v)| crate::icons::named(&v.icon))
+                        .unwrap_or("extensions"),
                     Panel::Search => "search",
                     Panel::Git | Panel::Diff(_) => "source-control",
                     Panel::Terminal => "shell",
@@ -3288,6 +3316,7 @@ impl App {
         }
         let mut problem_picked = None;
         let mut ext_asked = None;
+        let mut view_done: Vec<extension::draw::Done> = Vec::new();
         let mut scm_asked = None;
         let mut diff_asked: Option<(DocumentId, crate::git::diff::Ask)> = None;
         self.fill_symbols();
@@ -3335,6 +3364,7 @@ impl App {
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
             let extensions = &mut self.extensions;
+            let view_states = &mut self.view_states;
             let changes_known = self.changes_known;
             let (diffs, diff_shown) = (&self.diffs, &mut self.diff_shown);
             let mono = aurea::render::Font::new(editor::MONO, (zoom - 1.0).max(10.0));
@@ -3419,6 +3449,14 @@ impl App {
                     ext_asked = extension::view::show(ui, extensions, rect, texts)?;
                     Ok(())
                 }
+                Some(Panel::SideView(n) | Panel::BottomView(n)) => {
+                    let Some((_, view)) = extensions.view(n) else {
+                        return Ok(());
+                    };
+                    let state = view_states.entry(n).or_default();
+                    view_done.push(extension::draw::show(ui, n, &view.body, state, rect)?);
+                    Ok(())
+                }
                 Some(Panel::Diff(doc)) => {
                     let name = docs
                         .doc(doc)
@@ -3480,7 +3518,6 @@ impl App {
                     rail_at,
                     rail_place,
                     (&rail_items.0, &rail_items.1),
-                    texts,
                     keymap,
                 )?
             };
@@ -3570,6 +3607,17 @@ impl App {
         }
         if let Some(ask) = scm_asked {
             self.scm_ask(ask);
+        }
+        for done in view_done {
+            for id in done.commands {
+                match command_by_id(&id) {
+                    // a view can't open more views or itself in a loop
+                    Some(command) => self.run(command),
+                    None => self.say(format!("{}: {id}", self.texts.tr("no such command"))),
+                }
+            }
+            // events go to the view's owner; declarative views have none yet
+            let _ = done.events;
         }
         match ext_asked {
             Some(extension::view::Ask::Reload) => self.scan_extensions(),
@@ -3723,6 +3771,8 @@ impl App {
     /// a scan came back: the packages go in and open files pick up the
     /// file types they add.
     fn take_extensions(&mut self, packages: Vec<extension::Package>, mut notes: Vec<String>) {
+        self.bench.drop_views();
+        self.view_states.clear();
         self.extensions.packages = packages;
         let (associations, more) = self.extensions.associations();
         notes.extend(more);
@@ -3757,16 +3807,16 @@ impl App {
     /// the rail's buttons: side bar panels on top; the panels under the
     /// editors and settings below.
     fn rail_items(&self) -> (Vec<rail::Item>, Vec<rail::Item>) {
-        let item = |icon, label, command, panel: Option<Panel>, badge| rail::Item {
+        let item = |icon, label: &str, command, panel: Option<Panel>, badge| rail::Item {
             icon,
-            label,
+            label: self.texts.tr(label).to_owned(),
             command,
             lit: panel.is_some_and(|p| self.shows(p)),
             badge,
         };
         let changes = self.changes.as_ref().map_or(0, |s| s.changes.len());
         let problems: usize = self.docs.all().map(|d| d.diags.len()).sum();
-        let top = vec![
+        let mut top = vec![
             item(
                 "files",
                 "Explorer",
@@ -3796,7 +3846,7 @@ impl App {
                 self.extensions.broken(),
             ),
         ];
-        let bottom = vec![
+        let mut bottom = vec![
             item(
                 "shell",
                 "Terminal",
@@ -3813,6 +3863,29 @@ impl App {
             ),
             item("settings", "Settings", Command::OpenSettings, None, 0),
         ];
+        // extension views: side ones with the side panels, bottom ones by
+        // the terminal
+        for (n, _, v) in self.extensions.views() {
+            let (group, panel) = match v.placement {
+                extension::manifest::Placement::Side => (&mut top, Panel::SideView(n)),
+                extension::manifest::Placement::Bottom => (&mut bottom, Panel::BottomView(n)),
+            };
+            // side ones after the side panels, bottom ones before settings
+            let at = match panel {
+                Panel::SideView(_) => group.len(),
+                _ => group.len().saturating_sub(1),
+            };
+            group.insert(
+                at,
+                rail::Item {
+                    icon: crate::icons::named(&v.icon).unwrap_or("extensions"),
+                    label: v.title.clone(),
+                    command: Command::ToggleView(n),
+                    lit: self.shows(panel),
+                    badge: 0,
+                },
+            );
+        }
         (top, bottom)
     }
 
@@ -3826,6 +3899,11 @@ impl App {
             Panel::Explorer => self.texts.tr("Explorer").to_owned(),
             Panel::Git => self.texts.tr("Source Control").to_owned(),
             Panel::Extensions => self.texts.tr("Extensions").to_owned(),
+            Panel::SideView(n) => self
+                .extensions
+                .view(n)
+                .map(|(_, v)| v.title.clone())
+                .unwrap_or_default(),
             _ => self
                 .bench
                 .panels
@@ -3842,6 +3920,11 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             Panel::Git => self.branch.clone().unwrap_or_default(),
+            Panel::SideView(n) => self
+                .extensions
+                .view(n)
+                .map(|(m, _)| m.name.clone())
+                .unwrap_or_default(),
             Panel::Extensions => {
                 let n = self.extensions.ready().count();
                 if n == 0 {

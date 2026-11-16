@@ -22,7 +22,7 @@ const MAX_COMMAND: usize = 100;
 const ID_RULE: &str = "1-64 bytes of a-z A-Z 0-9 _ . -";
 const COMMAND_RULE: &str = "1-100 bytes of a-z A-Z 0-9 _ . : -";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tone {
     Plain,
     Dim,
@@ -31,7 +31,7 @@ pub enum Tone {
     Bad,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     Column(Vec<Node>),
     Row(Vec<Node>),
@@ -69,7 +69,7 @@ pub enum Node {
     Separator,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub label: String,
     pub detail: String,
@@ -77,7 +77,7 @@ pub struct Item {
 }
 
 /// what a user did in a view, sent back to whoever drew it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Clicked(String),
     Toggled(String, bool),

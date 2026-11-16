@@ -2,6 +2,7 @@
 //! in a plain list. only declarative ones for now: file types that borrow
 //! a bundled syntax, and snippets. nothing in a package runs.
 
+pub mod draw;
 pub mod manifest;
 pub mod ui;
 pub mod view;
@@ -9,7 +10,7 @@ pub mod view;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use manifest::{MAX_BYTES, Manifest, Snippet};
+use manifest::{MAX_BYTES, Manifest, Snippet, View};
 
 use crate::syntax::{self, Associations};
 
@@ -114,6 +115,22 @@ impl Extensions {
             State::Ready(m) => Some(m),
             _ => None,
         })
+    }
+
+    /// every view of the ready packages, numbered in package order, with
+    /// the package it is from.
+    pub fn views(&self) -> impl Iterator<Item = (u16, &Manifest, &View)> {
+        self.ready()
+            .flat_map(|m| m.views.iter().map(move |v| (m, v)))
+            .take(usize::from(u16::MAX))
+            .enumerate()
+            .map(|(i, (m, v))| (u16::try_from(i).unwrap_or(u16::MAX), m, v))
+    }
+
+    pub fn view(&self, n: u16) -> Option<(&Manifest, &View)> {
+        self.views()
+            .find(|(i, _, _)| *i == n)
+            .map(|(_, m, v)| (m, v))
     }
 
     /// packages that are off: broken or a second copy.

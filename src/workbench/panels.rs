@@ -14,6 +14,10 @@ pub enum Panel {
     Git,
     /// packages found in the extensions folder.
     Extensions,
+    /// an extension's view in the side bar, by its place in the view list.
+    SideView(u16),
+    /// an extension's view with the terminal.
+    BottomView(u16),
     Terminal,
     /// diagnostics of every open file.
     Problems,
@@ -34,7 +38,7 @@ impl Panel {
     pub fn is_side(self) -> bool {
         matches!(
             self,
-            Panel::Explorer | Panel::Search | Panel::Git | Panel::Extensions
+            Panel::Explorer | Panel::Search | Panel::Git | Panel::Extensions | Panel::SideView(_)
         )
     }
 }
