@@ -28,6 +28,13 @@ pub struct ViewState {
     layout: Option<Layout>,
 }
 
+impl ViewState {
+    /// the tree changed: measure it again next frame.
+    pub fn forget_layout(&mut self) {
+        self.layout = None;
+    }
+}
+
 /// heights and wrapped text of every node, by the node's place in order.
 struct Layout {
     width: f32,

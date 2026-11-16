@@ -444,6 +444,8 @@ pub struct App {
     extensions: Extensions,
     /// what each extension view keeps, by its number.
     view_states: HashMap<u16, extension::draw::ViewState>,
+    /// fed views: what they asked and show, by view number.
+    feeds: HashMap<u16, extension::FeedState>,
     /// sheet changes not yet written, and whether a write is out.
     settings_writes: Vec<(&'static str, Option<String>)>,
     settings_writing: bool,
@@ -551,6 +553,7 @@ impl App {
             sheet: settings::view::Sheet::default(),
             extensions: Extensions::default(),
             view_states: HashMap::new(),
+            feeds: HashMap::new(),
             settings_writes: Vec::new(),
             settings_writing: false,
             dark: true,
@@ -2979,6 +2982,7 @@ impl App {
                 lsp::Event::Completion(view, revision, items) => {
                     self.completed(view, revision, items);
                 }
+                lsp::Event::Feed(n, view, at, result) => self.fed(n, view, at, &result),
                 lsp::Event::Hover(view, at, text) => {
                     if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
                         self.hover = Some((view, at, text));
@@ -2995,6 +2999,7 @@ impl App {
         if let Some(view) = self.lsp.take_again() {
             self.want_complete.get_or_insert(view);
         }
+        self.ask_feeds();
         if let Some(view) = self.want_complete.take() {
             self.complete_for = Some(view);
             // no server: extension snippets alone, and only on a word, not
@@ -3407,6 +3412,7 @@ impl App {
             let (scm, changes) = (&mut self.scm, &self.changes);
             let extensions = &mut self.extensions;
             let view_states = &mut self.view_states;
+            let feeds = &self.feeds;
             let changes_known = self.changes_known;
             let (diffs, diff_shown) = (&self.diffs, &mut self.diff_shown);
             let mono = aurea::render::Font::new(editor::MONO, (zoom - 1.0).max(10.0));
@@ -3496,7 +3502,12 @@ impl App {
                         return Ok(());
                     };
                     let state = view_states.entry(n).or_default();
-                    view_done.push(extension::draw::show(ui, n, &view.body, state, rect)?);
+                    // a fed view shows its body with the answer under it
+                    let body = feeds
+                        .get(&n)
+                        .and_then(|f| f.shown.as_ref())
+                        .unwrap_or(&view.body);
+                    view_done.push(extension::draw::show(ui, n, body, state, rect)?);
                     Ok(())
                 }
                 Some(Panel::Diff(doc)) => {
@@ -3803,6 +3814,74 @@ impl App {
 }
 
 impl App {
+    /// asks the fed views in sight about the caret in front, when it moved
+    /// or the text changed. one request a view at a time; one that gets no
+    /// answer stops holding the next after a while.
+    fn ask_feeds(&mut self) {
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+        let Some(view) = self.focus.or(self.last_editor) else {
+            return;
+        };
+        let Some(key) = self
+            .docs
+            .view(view)
+            .zip(self.docs.doc_of(view))
+            .map(|(v, d)| (view, v.sel.head, d.buffer.revision()))
+        else {
+            return;
+        };
+        let wanted: Vec<(u16, extension::manifest::Feed, extension::ui::Node)> = self
+            .extensions
+            .views()
+            .filter(|(n, _, _)| {
+                self.shows(Panel::SideView(*n)) || self.shows(Panel::BottomView(*n))
+            })
+            .filter_map(|(n, _, v)| v.feed.clone().map(|f| (n, f, v.body.clone())))
+            .collect();
+        for (n, feed, body) in wanted {
+            let state = self.feeds.entry(n).or_default();
+            if state.shown.is_none() {
+                state.shown = Some(extension::ui::Node::Column(vec![
+                    body,
+                    extension::ui::Node::Markdown(feed.empty.clone()),
+                ]));
+            }
+            let busy = state
+                .waiting
+                .is_some_and(|since| since.elapsed() < PATIENCE);
+            if busy || state.asked == Some(key) {
+                continue;
+            }
+            if self.lsp.feed(&self.docs, view, &feed.request, n) {
+                state.asked = Some(key);
+                state.waiting = Some(Instant::now());
+            }
+        }
+    }
+
+    /// a feed's answer came: shown when it is for where the caret still is.
+    fn fed(&mut self, n: u16, view: ViewId, at: usize, result: &serde_json::Value) {
+        let Some(feed) = self.extensions.view(n).and_then(|(_, v)| v.feed.clone()) else {
+            return;
+        };
+        let body = self.extensions.view(n).map(|(_, v)| v.body.clone());
+        let state = self.feeds.entry(n).or_default();
+        state.waiting = None;
+        if state
+            .asked
+            .is_none_or(|(v, head, _)| v != view || head != at)
+        {
+            return;
+        }
+        let text = extension::pick(result, &feed.field).unwrap_or(feed.empty);
+        state.shown = body.map(|body| {
+            extension::ui::Node::Column(vec![body, extension::ui::Node::Markdown(text)])
+        });
+        if let Some(s) = self.view_states.get_mut(&n) {
+            s.forget_layout();
+        }
+    }
+
     /// reads the extensions folder again, on the worker.
     fn scan_extensions(&mut self) {
         let Some(dir) = extension::folder() else {
@@ -3831,6 +3910,7 @@ impl App {
         }
         self.bench.drop_views();
         self.view_states.clear();
+        self.feeds.clear();
         self.extensions.packages = packages;
         let (associations, more) = self.extensions.associations();
         notes.extend(more);

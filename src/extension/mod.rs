@@ -59,6 +59,43 @@ pub struct Grammar {
     pub text: String,
 }
 
+/// a fed view's state: what it asked last and the tree it shows now.
+#[derive(Default)]
+pub struct FeedState {
+    /// the editor view, caret and text revision last asked about.
+    pub asked: Option<(crate::document::ViewId, usize, resolvase::Revision)>,
+    /// a request is out, since then.
+    pub waiting: Option<std::time::Instant>,
+    /// the body with the answer under it.
+    pub shown: Option<ui::Node>,
+}
+
+/// longest answer shown in a fed view.
+pub const MAX_FEED: usize = 64 * 1024;
+
+/// `field` (a dotted path, empty for the whole) of a server's answer, as
+/// text: a string as it is, nothing for null or a missing field, else the
+/// value as json. cut to `MAX_FEED`.
+pub fn pick(result: &serde_json::Value, field: &str) -> Option<String> {
+    let mut at = result;
+    for part in field.split('.').filter(|p| !p.is_empty()) {
+        at = at.get(part)?;
+    }
+    let mut text = match at {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if text.len() > MAX_FEED {
+        let mut cut = MAX_FEED;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// largest grammar file read.
 pub const MAX_GRAMMAR: u64 = 128 * 1024;
 

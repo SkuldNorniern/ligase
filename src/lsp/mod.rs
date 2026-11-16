@@ -97,6 +97,9 @@ pub enum Event {
     Locations(Vec<(PathBuf, Point)>, Encoding),
     /// completions for a view, positions in the text of `revision`.
     Completion(ViewId, Revision, Vec<complete::Item>),
+    /// what a view's feed asked for at a caret: the feed, the editor view,
+    /// the caret, and the server's result as it came.
+    Feed(u16, ViewId, usize, Value),
     Status(String),
 }
 
@@ -123,6 +126,7 @@ enum Pending {
     Edits(crate::document::DocumentId, Revision, Seen),
     References,
     Complete(ViewId, Revision, crate::document::DocumentId),
+    Feed(u16, ViewId, usize),
 }
 
 /// how a language's server is doing, for the status bar.
@@ -398,6 +402,14 @@ impl Lsp {
         .is_some()
     }
 
+    /// asks the server of `view`'s file `method` at its caret, for the
+    /// view fed by feed `key`. false when there is no server to ask yet.
+    pub fn feed(&mut self, docs: &Documents, view: ViewId, method: &str, key: u16) -> bool {
+        let at = docs.view(view).map_or(0, |v| v.sel.head);
+        self.ask(docs, view, method, Pending::Feed(key, view, at), json!({}))
+            .is_some()
+    }
+
     /// sends `method` for the caret of `view`; gives the request's key.
     fn ask(
         &mut self,
@@ -533,6 +545,10 @@ impl Lsp {
                         if let Some(event) = definition(&msg["result"], encoding) {
                             events.push(event);
                         }
+                    }
+                    Some(Pending::Feed(key, view, at)) => {
+                        // an error reply is an empty one: the view says so
+                        events.push(Event::Feed(key, view, at, msg["result"].clone()));
                     }
                     Some(Pending::Hover(view, at)) => {
                         let text = hover_text(&msg["result"]["contents"]);
