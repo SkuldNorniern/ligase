@@ -24,6 +24,87 @@ pub struct ViewState {
     fields: HashMap<String, String>,
     toggles: HashMap<String, bool>,
     picked: HashMap<String, usize>,
+    /// the tree measured at one width; measured again when it changes.
+    layout: Option<Layout>,
+}
+
+/// heights and wrapped text of every node, by the node's place in order.
+struct Layout {
+    width: f32,
+    heights: Vec<f32>,
+    lines: HashMap<u16, Vec<String>>,
+}
+
+/// `text` broken at spaces to fit `width`. a word wider than the width
+/// gets a row of its own and is cut when drawn.
+fn wrap(text: &str, width: f32, mut wide: impl FnMut(&str) -> f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        for word in line.split(' ') {
+            let tried = if row.is_empty() {
+                word.to_owned()
+            } else {
+                format!("{row} {word}")
+            };
+            if row.is_empty() || wide(&tried) <= width {
+                row = tried;
+            } else {
+                out.push(std::mem::replace(&mut row, word.to_owned()));
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// measures `n` at `width`, children first in the order drawing numbers
+/// them, so `heights[part]` is that node's height.
+fn measure(ui: &mut Ui<'_, Id>, n: &Node, width: f32, layout: &mut Layout) -> f32 {
+    let me = layout.heights.len();
+    layout.heights.push(0.0);
+    let h = match n {
+        Node::Column(children) => {
+            let mut total = 0.0;
+            for child in children {
+                total += measure(ui, child, width, layout);
+            }
+            total + GAP * children.len().saturating_sub(1) as f32
+        }
+        Node::Row(children) => {
+            let share = share(width, children.len());
+            let mut tallest: f32 = 0.0;
+            for child in children {
+                tallest = tallest.max(measure(ui, child, share, layout));
+            }
+            tallest
+        }
+        Node::Heading(_) => 24.0,
+        Node::Text { text, .. } => {
+            let small = ui.theme.font(12.0);
+            let lines = wrap(text, width, |s| ui.text_width(s, &small));
+            let h = lines.len().max(1) as f32 * LINE;
+            layout
+                .lines
+                .insert(u16::try_from(me).unwrap_or(u16::MAX), lines);
+            h
+        }
+        Node::Button { .. } | Node::Toggle { .. } | Node::Field { .. } => CONTROL,
+        Node::List { items, .. } => items.len() as f32 * ROW,
+        Node::Table { rows, .. } => (rows.len() + 1) as f32 * ROW,
+        Node::Separator => 9.0,
+    };
+    layout.heights[me] = h;
+    h
+}
+
+/// each child's width in a row of `n`.
+fn share(width: f32, n: usize) -> f32 {
+    if n == 0 {
+        0.0
+    } else {
+        ((width - GAP * (n - 1) as f32) / n as f32).max(0.0)
+    }
 }
 
 /// what came of a frame: events for the owner, commands to run by id.
@@ -43,23 +124,6 @@ fn tone(palette: &Palette, tone: &Tone) -> Color {
     }
 }
 
-/// how tall a node is; rows are as tall as their tallest child.
-fn height(node: &Node) -> f32 {
-    match node {
-        Node::Column(children) => {
-            let inner: f32 = children.iter().map(height).sum();
-            inner + GAP * children.len().saturating_sub(1) as f32
-        }
-        Node::Row(children) => children.iter().map(height).fold(0.0, f32::max),
-        Node::Heading(_) => 24.0,
-        Node::Text { text, .. } => text.lines().count().max(1) as f32 * LINE,
-        Node::Button { .. } | Node::Toggle { .. } | Node::Field { .. } => CONTROL,
-        Node::List { items, .. } => items.len() as f32 * ROW,
-        Node::Table { rows, .. } => (rows.len() + 1) as f32 * ROW,
-        Node::Separator => 9.0,
-    }
-}
-
 /// draws `root` filling `rect`, scrolling when taller. `view` tells the
 /// views apart for widget ids.
 pub fn show(
@@ -71,13 +135,29 @@ pub fn show(
 ) -> AureaResult<Done> {
     let mut done = Done::default();
     let inner = rect.inset(PAD);
-    let content = height(root);
+    // the scroll bar's room is left whatever the height, so the width the
+    // text wraps at doesn't swing with it
+    let width = (inner.width - 12.0).max(0.0);
+    if state.layout.as_ref().is_none_or(|l| l.width != width) {
+        let mut layout = Layout {
+            width,
+            heights: Vec::new(),
+            lines: HashMap::new(),
+        };
+        measure(ui, root, width, &mut layout);
+        state.layout = Some(layout);
+    }
     let ViewState {
         scroll,
         fields,
         toggles,
         picked,
+        layout,
     } = state;
+    let Some(layout) = layout.as_ref() else {
+        return Ok(done);
+    };
+    let content = layout.heights.first().copied().unwrap_or(0.0);
     let mut kept = Kept {
         fields,
         toggles,
@@ -89,8 +169,10 @@ pub fn show(
         inner,
         |ui, at, sight| {
             let mut part = 0u16;
-            let at = Rect::new(at.x, at.y, at.width, content);
-            node(ui, view, root, at, sight, &mut part, &mut kept, &mut done)
+            let at = Rect::new(at.x, at.y, width, content);
+            node(
+                ui, view, root, at, sight, &mut part, layout, &mut kept, &mut done,
+            )
         },
     )?;
     Ok(done)
@@ -110,6 +192,7 @@ fn node(
     at: Rect,
     sight: Rect,
     part: &mut u16,
+    layout: &Layout,
     kept: &mut Kept<'_>,
     done: &mut Done,
 ) -> AureaResult<()> {
@@ -119,21 +202,21 @@ fn node(
     let id = Id::ExtView(view, me);
     if let Node::Column(children) | Node::Row(children) = n {
         let row = matches!(n, Node::Row(_));
-        let share = if children.is_empty() {
-            0.0
-        } else {
-            (at.width - GAP * (children.len() - 1) as f32) / children.len() as f32
-        };
+        let share = share(at.width, children.len());
         let mut x = at.x;
         let mut y = at.y;
         for child in children {
-            let h = height(child);
+            let h = layout
+                .heights
+                .get(usize::from(*part))
+                .copied()
+                .unwrap_or(0.0);
             let child_at = if row {
-                Rect::new(x, at.y, share.max(0.0), h)
+                Rect::new(x, at.y, share, h)
             } else {
                 Rect::new(at.x, y, at.width, h)
             };
-            node(ui, view, child, child_at, sight, part, kept, done)?;
+            node(ui, view, child, child_at, sight, part, layout, kept, done)?;
             x += share + GAP;
             y += h + GAP;
         }
@@ -153,7 +236,15 @@ fn node(
         }
         Node::Text { text, tone: t } => {
             let colour = tone(&palette, t);
-            for (i, line) in text.lines().enumerate() {
+            let fallback: Vec<String>;
+            let lines = match layout.lines.get(&me) {
+                Some(lines) => lines,
+                None => {
+                    fallback = text.lines().map(str::to_owned).collect();
+                    &fallback
+                }
+            };
+            for (i, line) in lines.iter().enumerate() {
                 let line_at = Rect::new(at.x, at.y + i as f32 * LINE, at.width, LINE);
                 ui.text_clipped(line, line_at, &small, colour, Align::Start)?;
             }
@@ -296,23 +387,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heights_add_up() {
-        let tree = Node::Column(vec![
-            Node::Heading("h".into()),
-            Node::Row(vec![
-                Node::Separator,
-                Node::Button {
-                    id: "b".into(),
-                    label: "B".into(),
-                    command: None,
-                },
-            ]),
-            Node::Text {
-                text: "a\nb".into(),
-                tone: Tone::Dim,
-            },
-        ]);
-        assert_eq!(height(&tree), 24.0 + CONTROL + 2.0 * LINE + 2.0 * GAP);
-        assert_eq!(height(&Node::Column(Vec::new())), 0.0);
+    fn text_wraps_at_spaces_and_keeps_breaks() {
+        let wide = |s: &str| s.chars().count() as f32;
+        assert_eq!(
+            wrap("one two three four", 9.0, wide),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(wrap("a\nb c", 9.0, wide), ["a", "b c"]);
+        assert_eq!(
+            wrap("unbreakableword x", 4.0, wide),
+            ["unbreakableword", "x"]
+        );
+        assert_eq!(wrap("", 4.0, wide), [""]);
+    }
+
+    #[test]
+    fn rows_share_their_width() {
+        assert_eq!(share(100.0, 2), (100.0 - GAP) / 2.0);
+        assert_eq!(share(100.0, 0), 0.0);
+        assert_eq!(share(4.0, 3), 0.0, "never below zero");
     }
 }
