@@ -9,15 +9,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "aurea"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 dependencies = [
  "aurea-animation",
  "aurea-ffi",
@@ -25,16 +19,14 @@ dependencies = [
  "aurea-render",
  "aurea-runtime",
  "jni",
- "libc",
  "log",
  "png",
- "raw-window-handle",
 ]
 
 [[package]]
 name = "aurea-animation"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 dependencies = [
  "aurea-foundation",
 ]
@@ -42,7 +34,7 @@ dependencies = [
 [[package]]
 name = "aurea-ffi"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 dependencies = [
  "cc",
  "pkg-config",
@@ -51,18 +43,16 @@ dependencies = [
 [[package]]
 name = "aurea-foundation"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 
 [[package]]
 name = "aurea-render"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 dependencies = [
  "aurea-foundation",
- "dwrote",
- "fontdb",
- "fontdue",
  "harfrust",
+ "libc",
  "log",
  "skrifa",
  "unicode-bidi",
@@ -73,7 +63,7 @@ dependencies = [
 [[package]]
 name = "aurea-runtime"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/aurea?rev=6448a1e0d32582fc573f26b9b138600a50fab45b#6448a1e0d32582fc573f26b9b138600a50fab45b"
+source = "git+https://github.com/SkuldNorniern/aurea?rev=778862c079108849279266ffceee66e366dd1eff#778862c079108849279266ffceee66e366dd1eff"
 dependencies = [
  "aurea-foundation",
  "log",
@@ -144,35 +134,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "core_maths"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
-dependencies = [
- "libm",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "dwrote"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1b35532432acc8b19ceed096e35dfa088d3ea037fe4f3c085f1f97f33b4d02"
-dependencies = [
- "lazy_static",
- "libc",
- "serde",
- "serde_derive",
- "winapi",
- "wio",
 ]
 
 [[package]]
@@ -209,12 +176,6 @@ dependencies = [
 
 [[package]]
 name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
@@ -226,39 +187,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "fontconfig-parser"
-version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
-dependencies = [
- "roxmltree",
-]
-
-[[package]]
-name = "fontdb"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0299020c3ef3f60f526a4f64ab4a3d4ce116b1acbf24cdd22da0068e5d81dc3"
-dependencies = [
- "fontconfig-parser",
- "log",
- "memmap2",
- "slotmap",
- "tinyvec",
- "ttf-parser 0.20.0",
-]
-
-[[package]]
-name = "fontdue"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e796cb6894e6418daacea84b28dd4f98d3b32c74d5bb452ba1ecfbf5ad8e84ca"
-dependencies = [
- "hashbrown 0.15.5",
- "ttf-parser 0.25.1",
 ]
 
 [[package]]
@@ -275,17 +203,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -297,7 +214,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -351,22 +268,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lazy_static"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
-
-[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libm"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "ligase"
@@ -392,15 +297,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "memmap2"
-version = "0.9.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "miniz_oxide"
@@ -466,19 +362,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "raw-window-handle"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
-
-[[package]]
 name = "read-fonts"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4edc8db0d972de88e53a085b1f01fb3fbdae7bb0cb7a0ce2b2f8285a412fe3ef"
 dependencies = [
  "bytemuck",
- "foldhash 0.2.0",
+ "foldhash",
  "font-types",
  "once_cell",
  "yoke",
@@ -490,12 +380,6 @@ version = "0.1.0"
 dependencies = [
  "unicode-segmentation",
 ]
-
-[[package]]
-name = "roxmltree"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "same-file"
@@ -577,15 +461,6 @@ checksum = "a5213b4825bac3587046330052d61bfac7bd3bd0d203c758d7c2ef726fcea034"
 dependencies = [
  "bytemuck",
  "read-fonts",
-]
-
-[[package]]
-name = "slotmap"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
-dependencies = [
- "version_check",
 ]
 
 [[package]]
@@ -716,12 +591,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tinyvec"
-version = "1.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
-
-[[package]]
 name = "toml"
 version = "1.1.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -761,21 +630,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
-name = "ttf-parser"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f77d76d837a7830fe1d4f12b7b4ba4192c1888001c7164257e4bc6d21d96b4"
-
-[[package]]
-name = "ttf-parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
-dependencies = [
- "core_maths",
-]
-
-[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,12 +656,6 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 [[package]]
 name = "vanta"
 version = "0.1.0"
-
-[[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walkdir"
@@ -936,15 +784,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-
-[[package]]
-name = "wio"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
-dependencies = [
- "winapi",
-]
 
 [[package]]
 name = "yoke"
