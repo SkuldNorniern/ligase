@@ -1,6 +1,8 @@
 //! open documents and the views on them. one document per path, many views
 //! per document; views hold scroll and cursor, never their own text copy.
 
+pub mod watch;
+
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};

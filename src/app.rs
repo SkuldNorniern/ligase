@@ -355,6 +355,9 @@ pub struct App {
     /// diff is out.
     diffs: HashMap<DocumentId, (Option<Revision>, bool, Vec<crate::git::DiffLine>)>,
     diff_shown: HashMap<DocumentId, crate::git::diff::Shown>,
+    /// stats the open files now and then, so outside edits show without a
+    /// trip away from the window.
+    watcher: document::watch::Watcher,
     /// when the message was said; it goes after a while.
     status_at: Instant,
     /// the editor view with the keyboard, from the last frame.
@@ -435,6 +438,7 @@ impl App {
             scm: crate::git::view::Scm::default(),
             diffs: HashMap::new(),
             diff_shown: HashMap::new(),
+            watcher: document::watch::Watcher::default(),
             status_at: Instant::now(),
             focus: None,
             layout_dirty: false,
@@ -523,6 +527,7 @@ impl App {
     pub fn set_canvas(&mut self, id: CanvasId) {
         self.jobs.set_canvas(id);
         self.syntax.set_canvas(id);
+        self.watcher.set_canvas(id);
         self.canvas = Some(id);
         // the branch, now that its answer has a canvas to wake
         let root = self.explorer.root().to_path_buf();
@@ -2608,6 +2613,10 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        self.watcher.watch(self.docs.on_disk());
+        if self.watcher.take_changed() {
+            self.check_disk();
+        }
         self.ask_diffs();
         // a server that never answers the format still lets the file save
         if let Some((_, doc, _)) = self.save_after_format {
