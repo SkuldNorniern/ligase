@@ -261,6 +261,7 @@ enum Done {
     GitBase(DocumentId, PathBuf, Option<std::sync::Arc<str>>),
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
     Branch(Option<String>),
+    Recent(Vec<PathBuf>),
     Changes(Option<crate::git::Status>),
     /// stage, unstage or commit came back; a commit says so.
     GitDid(Result<bool, String>),
@@ -351,6 +352,8 @@ pub struct App {
     open_after: Option<(PathBuf, Option<usize>)>,
     /// a folder to open once this window has closed.
     reopen: Option<PathBuf>,
+    /// folders opened before, newest first, this one among them.
+    recent: Vec<PathBuf>,
     /// a save is out and the window closes once it is back.
     closing: bool,
     /// the window should close now; main does it.
@@ -413,6 +416,7 @@ impl App {
             restored: false,
             open_after: None,
             reopen: None,
+            recent: Vec::new(),
             closing: false,
             close_now: false,
         };
@@ -427,6 +431,17 @@ impl App {
                     .run(move || Done::Session(std::fs::read_to_string(path).ok()));
             }
             None => app.restored = true,
+        }
+        // this folder goes first in the recent list
+        if let Some(path) = workbench::recent_path() {
+            let root = root.to_path_buf();
+            app.jobs.run(move || {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let recent = workbench::recent_with(&text, &root);
+                let lines: Vec<String> = recent.iter().map(|p| p.display().to_string()).collect();
+                let _ = workbench::write_session(&path, &(lines.join("\n") + "\n"));
+                Done::Recent(recent)
+            });
         }
         app
     }
@@ -2582,6 +2597,7 @@ impl App {
                     self.docs.set_git_hunks(doc, revision, hunks);
                 }
                 Done::Branch(branch) => self.branch = branch,
+                Done::Recent(recent) => self.recent = recent,
                 Done::Changes(status) => {
                     self.changes = status;
                     self.changes_known = true;
@@ -2783,6 +2799,8 @@ impl App {
             .filter(|d| !d.untitled)
             .map(|d| d.path.clone());
         let keymap = &self.keymap;
+        let recent = &self.recent;
+        let mut recent_pick: Option<PathBuf> = None;
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
@@ -2881,7 +2899,9 @@ impl App {
                     Ok(())
                 }
                 Some(Panel::Welcome) | None => {
-                    welcome_pick = welcome(ui, rect, texts, keymap)?.or(welcome_pick);
+                    let (command, folder) = welcome(ui, rect, texts, keymap, recent)?;
+                    welcome_pick = command.or(welcome_pick);
+                    recent_pick = folder.or(recent_pick.take());
                     Ok(())
                 }
             };
@@ -3007,6 +3027,10 @@ impl App {
         if let Some(command) = welcome_pick {
             self.run(command);
         }
+        if let Some(folder) = recent_pick {
+            self.reopen = Some(folder);
+            self.request_close();
+        }
         if let Some(act) = menu_act {
             self.menu_act(act);
         }
@@ -3115,20 +3139,28 @@ const WELCOME: [(&str, Command); 8] = [
     ("Settings", Command::OpenSettings),
 ];
 
-/// the page with no file open: a few commands and their keys, each one a
-/// button. the command clicked comes back.
+/// the page with no file open: a few commands and their keys, then the
+/// folders opened before, each one a button. what was clicked comes back.
 fn welcome(
     ui: &mut Ui<'_, Id>,
     rect: Rect,
     texts: &Texts,
     keymap: &Keymap<Command>,
-) -> AureaResult<Option<Command>> {
+    recent: &[PathBuf],
+) -> AureaResult<(Option<Command>, Option<PathBuf>)> {
     const ROW: f32 = 30.0;
+    // the folder open now is first in the list; the rest are elsewhere
+    let others: Vec<&PathBuf> = recent.iter().skip(1).take(6).collect();
     let palette = ui.theme.palette;
     let title_font = ui.theme.font(22.0);
     let font = ui.theme.font(13.0);
     let width = 340.0_f32.min(rect.width - 32.0).max(0.0);
-    let height = 44.0 + 28.0 + WELCOME.len() as f32 * ROW;
+    let recent_h = if others.is_empty() {
+        0.0
+    } else {
+        36.0 + others.len() as f32 * ROW
+    };
+    let height = 44.0 + 28.0 + WELCOME.len() as f32 * ROW + recent_h;
     let x = rect.x + (rect.width - width) / 2.0;
     let mut y = rect.y + ((rect.height - height) / 2.0).max(16.0);
     let title = Rect::new(x + 10.0, y, width, 36.0);
@@ -3161,7 +3193,40 @@ fn welcome(
             picked = Some(*command);
         }
     }
-    Ok(picked)
+    let mut folder = None;
+    if !others.is_empty() {
+        let mut y = y + WELCOME.len() as f32 * ROW + 12.0;
+        let head = Rect::new(x + 10.0, y, width, 24.0);
+        ui.text(texts.tr("Recent"), head, &font, palette.dim, Align::Start)?;
+        y += 24.0;
+        for (i, path) in others.iter().enumerate() {
+            let row = Rect::new(x, y + i as f32 * ROW, width, ROW - 2.0);
+            let part = (WELCOME.len() + i) as u16;
+            let input = ui.interact(Id::Welcome, part, row, Sense::Click, true);
+            if input.hovered {
+                ui.round(row, 5.0, palette.hover)?;
+                ui.set_cursor(CursorIcon::Pointer);
+            }
+            let inner = row.inset_xy(10.0, 0.0);
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let name_w = ui.text_width(&name, &font).min(inner.width);
+            let (name_at, rest) = inner.split_left(name_w, 10.0);
+            ui.text_clipped(&name, name_at, &font, palette.accent, Align::Start)?;
+            let parent = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let small = ui.theme.font(12.0);
+            ui.text_clipped(&parent, rest, &small, palette.dim, Align::Start)?;
+            if input.clicked {
+                folder = Some((*path).clone());
+            }
+        }
+    }
+    Ok((picked, folder))
 }
 
 /// how long a status message stays.

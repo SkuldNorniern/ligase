@@ -385,6 +385,27 @@ pub fn session_path(root: &Path) -> Option<PathBuf> {
     aurea::config_dir("Ligase").map(|dir| dir.join("sessions").join(format!("{hash:016x}.toml")))
 }
 
+/// folders kept in the recent list.
+const MAX_RECENT: usize = 10;
+
+/// the recent folders file, beside the sessions.
+pub fn recent_path() -> Option<PathBuf> {
+    aurea::config_dir("Ligase").map(|dir| dir.join("recent.txt"))
+}
+
+/// puts `root` first in the recent list `text` (one folder a line) and
+/// gives the new list, at most a few long. runs on the worker.
+pub fn recent_with(text: &str, root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.to_path_buf()];
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let path = PathBuf::from(line);
+        if !out.contains(&path) && out.len() < MAX_RECENT {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// writes the session file through a temp file, so a crash mid-write
 /// never leaves half a file. runs on the worker.
 pub fn write_session(path: &Path, text: &str) -> Result<(), String> {
@@ -399,6 +420,15 @@ pub fn write_session(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_puts_the_open_folder_first_once() {
+        let text = "C:\\a\nC:\\b\n\nC:\\a\n";
+        let got = recent_with(text, Path::new("C:\\b"));
+        assert_eq!(got, [PathBuf::from("C:\\b"), PathBuf::from("C:\\a")]);
+        let many: String = (0..30).map(|i| format!("C:\\{i}\n")).collect();
+        assert_eq!(recent_with(&many, Path::new("x")).len(), MAX_RECENT);
+    }
 
     fn in_tree(bench: &Workbench, panel: Panel) -> bool {
         bench
