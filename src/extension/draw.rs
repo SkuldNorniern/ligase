@@ -176,7 +176,7 @@ fn node(
             on,
         } => {
             let value = kept.toggles.entry(name.clone()).or_insert(*on);
-            let (label_at, switch) = at.split_right(42.0, 8.0);
+            let (switch, label_at) = at.split_right(42.0, 8.0);
             let switch = Rect::new(switch.x, switch.y + 2.0, switch.width, switch.height - 4.0);
             ui.text_clipped(label, label_at, &font, palette.text, Align::Start)?;
             if Toggle::new(value).show(ui, id, switch)?.changed {

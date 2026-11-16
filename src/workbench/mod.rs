@@ -255,13 +255,17 @@ impl Workbench {
         let pane = self.panels.pane(panel);
         if !self.dock.tree.contains(pane) {
             // the bottom ones share a spot
-            let sibling = match panel {
-                Panel::Terminal | Panel::BottomView(_) => Some(Panel::Problems),
-                Panel::Problems => Some(Panel::Terminal),
-                _ => None,
-            }
-            .and_then(|p| self.panels.find(p))
-            .filter(|id| self.dock.tree.contains(*id));
+            // the first of these in sight takes it as a tab
+            let near: &[Panel] = match panel {
+                Panel::Terminal => &[Panel::Problems],
+                Panel::Problems => &[Panel::Terminal],
+                Panel::BottomView(_) => &[Panel::Terminal, Panel::Problems],
+                _ => &[],
+            };
+            let sibling = near
+                .iter()
+                .filter_map(|p| self.panels.find(*p))
+                .find(|id| self.dock.tree.contains(*id));
             match sibling {
                 Some(beside) => {
                     self.tree().insert(pane, beside, DockSide::Center);
@@ -692,6 +696,25 @@ mod tests {
         assert!(bench.shows(Panel::Search), "comes back with the last one");
         bench.toggle(Panel::Git);
         assert!(bench.shows(Panel::Git));
+    }
+
+    #[test]
+    fn bottom_views_join_the_terminal_and_go_on_drop() {
+        let mut bench = Workbench::default();
+        bench.show(Panel::BottomView(0));
+        let view = bench.panels.find(Panel::BottomView(0)).unwrap();
+        let terminal = bench.panels.find(Panel::Terminal).unwrap();
+        assert_eq!(
+            bench.dock.tree.group_of(&view),
+            bench.dock.tree.group_of(&terminal),
+            "a tab beside the terminal"
+        );
+        bench.show(Panel::SideView(1));
+        assert!(bench.shows(Panel::SideView(1)));
+        bench.drop_views();
+        assert!(!in_tree(&bench, Panel::BottomView(0)));
+        assert_eq!(bench.side.shown, None);
+        assert!(bench.panels.find(Panel::BottomView(0)).is_none());
     }
 
     #[test]
