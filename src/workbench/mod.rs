@@ -247,16 +247,8 @@ impl Workbench {
                         editors.push(path);
                         format!("editor{}", editors.len() - 1)
                     }
-                    // a diff comes back as its file
-                    Panel::Diff(doc) => {
-                        let path = docs
-                            .doc(doc)
-                            .filter(|d| !d.untitled)
-                            .map(|d| d.path.display().to_string())
-                            .unwrap_or_default();
-                        editors.push(path);
-                        format!("editor{}", editors.len() - 1)
-                    }
+                    // a diff left in the layout stands for the editor area
+                    Panel::Diff(_) => "welcome".to_owned(),
                 };
                 (id, name)
             })
@@ -267,9 +259,25 @@ impl Workbench {
                 .find(|(id, _)| *id == pane)
                 .map_or_else(|| "welcome".to_owned(), |(_, n)| n.clone())
         };
-        let layout = self
-            .dock
-            .tree
+        // diffs aren't kept: their file's editor is. one alone in the editor
+        // area stays, as the welcome tab, so the area comes back
+        let mut tree = self.dock.tree.clone();
+        let diffs: Vec<PaneId> = self
+            .panels
+            .iter()
+            .filter(|(id, p)| matches!(p, Panel::Diff(_)) && tree.contains(*id))
+            .map(|(id, _)| id)
+            .collect();
+        let others = self
+            .panels
+            .iter()
+            .any(|(id, p)| matches!(p, Panel::Welcome | Panel::Editor(_)) && tree.contains(id));
+        for (i, pane) in diffs.into_iter().enumerate() {
+            if others || i > 0 {
+                tree.remove(pane);
+            }
+        }
+        let layout = tree
             .plan()
             .map(|plan| plan.to_text(name))
             .unwrap_or_default();

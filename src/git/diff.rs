@@ -30,7 +30,8 @@ pub fn show(
     ui: &mut Ui<'_, Id>,
     doc: DocumentId,
     name: &str,
-    rows: Option<&[DiffLine]>,
+    // the rows when worked out, and whether git has the file at all
+    (rows, tracked): (Option<&[DiffLine]>, bool),
     shown: &mut Shown,
     rect: Rect,
     (texts, mono): (&Texts, &Font),
@@ -55,13 +56,9 @@ pub fn show(
         ask = Some(Ask::Open(0));
     }
     let Some(rows) = rows else {
-        ui.text(
-            texts.tr("loading"),
-            list,
-            &small,
-            palette.dim,
-            Align::Center,
-        )?;
+        // a file git doesn't have never gets rows
+        let note = if tracked { "loading" } else { "not in git" };
+        ui.text(texts.tr(note), list, &small, palette.dim, Align::Center)?;
         return Ok(ask);
     };
     if rows.is_empty() {

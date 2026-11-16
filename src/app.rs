@@ -2443,6 +2443,18 @@ impl App {
                 _ => None,
             })
             .collect();
+        // a diff whose file closed goes with it
+        let gone: Vec<PaneId> = self
+            .bench
+            .panels
+            .iter()
+            .filter(|(_, p)| matches!(p, Panel::Diff(doc) if self.docs.doc(*doc).is_none()))
+            .map(|(id, _)| id)
+            .collect();
+        for pane in gone {
+            let _ = self.bench.close(pane, &mut self.docs);
+            self.layout_dirty = true;
+        }
         self.diffs.retain(|doc, _| open.contains(doc));
         self.diff_shown.retain(|doc, _| open.contains(doc));
         for doc in open {
@@ -3113,9 +3125,17 @@ impl App {
                         .get(&doc)
                         .filter(|d| d.0.is_some())
                         .map(|d| d.2.as_slice());
+                    let tracked = docs.doc(doc).is_some_and(|d| d.git.base.is_some());
                     let shown = diff_shown.entry(doc).or_default();
-                    let ask =
-                        crate::git::diff::show(ui, doc, &name, rows, shown, rect, (texts, &mono))?;
+                    let ask = crate::git::diff::show(
+                        ui,
+                        doc,
+                        &name,
+                        (rows, tracked),
+                        shown,
+                        rect,
+                        (texts, &mono),
+                    )?;
                     if let Some(ask) = ask {
                         diff_asked = Some((doc, ask));
                     }
