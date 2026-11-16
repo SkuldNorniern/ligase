@@ -98,6 +98,7 @@ pub enum Command {
     ZoomReset,
     NewFile,
     OpenFile,
+    OpenFolder,
     SaveAs,
     SaveAll,
     QuickOpen,
@@ -116,6 +117,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Quick Open", Command::QuickOpen),
     ("New File", Command::NewFile),
     ("Open File", Command::OpenFile),
+    ("Open Folder", Command::OpenFolder),
     ("Save", Command::Save),
     ("Save As", Command::SaveAs),
     ("Save All", Command::SaveAll),
@@ -174,6 +176,8 @@ const COMMANDS: &[(&str, Command)] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialog {
     Open,
+    /// a folder to open as the workspace instead.
+    OpenFolder,
     SaveAs(ViewId),
     /// unsaved edits would go: the window closing (none) or one tab.
     Unsaved(Option<PaneId>),
@@ -345,6 +349,8 @@ pub struct App {
     restored: bool,
     /// a file named on the command line, opened once the layout is back.
     open_after: Option<(PathBuf, Option<usize>)>,
+    /// a folder to open once this window has closed.
+    reopen: Option<PathBuf>,
     /// a save is out and the window closes once it is back.
     closing: bool,
     /// the window should close now; main does it.
@@ -406,6 +412,7 @@ impl App {
             layout_dirty: false,
             restored: false,
             open_after: None,
+            reopen: None,
             closing: false,
             close_now: false,
         };
@@ -422,6 +429,11 @@ impl App {
             None => app.restored = true,
         }
         app
+    }
+
+    /// the folder to start again on, once the window is closed.
+    pub fn take_reopen(&mut self) -> Option<PathBuf> {
+        self.reopen.take()
     }
 
     /// opens `path` in an editor, at `line` (from 0) when given, after the
@@ -711,6 +723,10 @@ impl App {
             }
             Command::OpenFile => {
                 self.dialog = Some(Dialog::Open);
+                return;
+            }
+            Command::OpenFolder => {
+                self.dialog = Some(Dialog::OpenFolder);
                 return;
             }
             Command::Undo | Command::Redo => {
@@ -1584,6 +1600,10 @@ impl App {
                 DialogStart::File(name, folder)
             }
             Dialog::Open => DialogStart::File(String::new(), self.root().to_path_buf()),
+            Dialog::OpenFolder => {
+                let up = self.root().parent().unwrap_or(self.root());
+                DialogStart::File(String::new(), up.to_path_buf())
+            }
             Dialog::ConfirmDelete => {
                 let name = self
                     .delete_path
@@ -1665,6 +1685,8 @@ impl App {
                 }
             }
             (Some(_), MessageChoice::Cancel) => self.close_queue.clear(),
+            // staying: the folder asked for isn't opened either
+            (None, MessageChoice::Cancel) => self.reopen = None,
             (Some(pane), MessageChoice::Discard)
                 if self.bench.close_discarding(pane, &mut self.docs).is_ok() =>
             {
@@ -2152,6 +2174,16 @@ impl App {
                     let view = self.open_file(&path);
                     self.ui.focus(Id::Editor(view), 1);
                     self.last_editor = Some(view);
+                }
+            }
+            Dialog::OpenFolder => {
+                // the window closes the usual way (unsaved files asked about,
+                // the layout written) and main starts again on the folder
+                if let Some(folder) = picked.into_iter().next()
+                    && folder != self.root()
+                {
+                    self.reopen = Some(folder);
+                    self.request_close();
                 }
             }
             Dialog::SaveAs(view) => {
@@ -3072,11 +3104,12 @@ fn settings_file(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// what the welcome page offers, with the label its menu item has.
-const WELCOME: [(&str, Command); 7] = [
+const WELCOME: [(&str, Command); 8] = [
     ("Quick Open", Command::QuickOpen),
     ("Command Palette", Command::Commands),
     ("New File", Command::NewFile),
     ("Open File", Command::OpenFile),
+    ("Open Folder", Command::OpenFolder),
     ("Find in Files", Command::FindInFiles),
     ("Terminal", Command::ToggleTerminal),
     ("Settings", Command::OpenSettings),

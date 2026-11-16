@@ -148,7 +148,16 @@ fn run() -> AureaResult<()> {
         }
     });
     window.show();
-    window.run()
+    let ran = window.run();
+    // open folder: this window closed, the same program starts on the folder
+    let reopen = app.borrow_mut().take_reopen();
+    if let Some(folder) = reopen
+        && let Ok(exe) = std::env::current_exe()
+        && let Err(e) = std::process::Command::new(exe).arg(&folder).spawn()
+    {
+        eprintln!("ligase: can't open {}: {e}", folder.display());
+    }
+    ran
 }
 
 /// shows a native file dialog once this frame is over, outside the app
@@ -196,6 +205,13 @@ fn show_dialog(
                 .directory(&folder)
                 .file_name(&name)
                 .save(&window)
+                .ok()
+                .flatten()
+                .into_iter()
+                .collect(),
+            Dialog::OpenFolder => FileDialog::new()
+                .directory(&folder)
+                .pick_folder(&window)
                 .ok()
                 .flatten()
                 .into_iter()
@@ -249,6 +265,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     let mut file = bar.add_submenu(a.texts.tr("File"))?;
     add(&mut file, "New File", Command::NewFile)?;
     add(&mut file, "Open File", Command::OpenFile)?;
+    add(&mut file, "Open Folder", Command::OpenFolder)?;
     add(&mut file, "Quick Open", Command::QuickOpen)?;
     file.add_separator()?;
     add(&mut file, "Save", Command::Save)?;
