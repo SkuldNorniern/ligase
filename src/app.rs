@@ -375,7 +375,7 @@ enum Done {
     /// the settings file to open, made with every key shown when missing.
     SettingsFile(Result<PathBuf, String>),
     /// the extensions folder read: its packages, and notes on the scan.
-    Extensions(Vec<extension::Package>, Vec<String>),
+    Extensions(Vec<extension::Package>, Vec<String>, Option<String>),
     /// the settings sheet's changes went in; the file's text now.
     SettingsWrote(Result<String, String>),
     /// a file's text at HEAD; none when git doesn't track it.
@@ -872,7 +872,7 @@ impl App {
 
     /// starts a language server on the worker, in the workspace folder.
     fn start_server(&mut self, language: &'static str) {
-        let Some((command, args, _)) = lsp::server_for(language) else {
+        let Some(spec) = self.lsp.server_for(language) else {
             return;
         };
         let root = self.explorer.root().to_path_buf();
@@ -883,9 +883,10 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
+            let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
             Done::Server(
                 language,
-                lsp::server::Server::spawn(command, args, &root, wake),
+                lsp::server::Server::spawn(&spec.command, &args, &root, wake),
             )
         };
         if !self.jobs.run(job) {
@@ -3115,7 +3116,9 @@ impl App {
                         }
                     }
                 }
-                Done::Extensions(packages, notes) => self.take_extensions(packages, notes),
+                Done::Extensions(packages, notes, trust) => {
+                    self.take_extensions(packages, notes, trust);
+                }
                 Done::SettingsWrote(result) => {
                     self.settings_writing = false;
                     match result {
@@ -3621,6 +3624,10 @@ impl App {
         }
         match ext_asked {
             Some(extension::view::Ask::Reload) => self.scan_extensions(),
+            Some(extension::view::Ask::Allow(i) | extension::view::Ask::Revoke(i)) => {
+                let allow = matches!(ext_asked, Some(extension::view::Ask::Allow(_)));
+                self.trust_package(i, allow);
+            }
             Some(extension::view::Ask::OpenFolder) => {
                 if let Some(dir) = extension::folder() {
                     self.jobs.run(move || {
@@ -3762,15 +3769,27 @@ impl App {
         let Some(dir) = extension::folder() else {
             return;
         };
+        let trust = extension::trust::path();
         self.jobs.run(move || {
             let (packages, notes) = extension::scan(&dir);
-            Done::Extensions(packages, notes)
+            let trust = trust.and_then(|p| std::fs::read_to_string(p).ok());
+            Done::Extensions(packages, notes, trust)
         });
     }
 
     /// a scan came back: the packages go in and open files pick up the
     /// file types they add.
-    fn take_extensions(&mut self, packages: Vec<extension::Package>, mut notes: Vec<String>) {
+    fn take_extensions(
+        &mut self,
+        packages: Vec<extension::Package>,
+        mut notes: Vec<String>,
+        trust: Option<String>,
+    ) {
+        if let Some(text) = trust {
+            let (trust, why) = extension::trust::Trust::read(&text);
+            self.extensions.trust = trust;
+            notes.extend(why.into_iter().map(|w| format!("trust.toml: {w}")));
+        }
         self.bench.drop_views();
         self.view_states.clear();
         self.extensions.packages = packages;
@@ -3789,12 +3808,43 @@ impl App {
         self.docs.set_associations(associations);
         let names: Vec<&str> = grammars.iter().map(|(n, _)| n.as_str()).collect();
         self.docs.recolour(&names);
+        self.lsp.set_extra(self.extensions.servers());
         let broken = self.extensions.broken();
         if broken > 0 {
             self.say(format!(
                 "{} {broken}",
                 self.texts.tr("extensions that could not load:")
             ));
+        }
+    }
+
+    /// lets the package at `i` start the servers it declares, or takes that
+    /// back, and saves the choice. a running server keeps running until
+    /// ligase starts again.
+    fn trust_package(&mut self, i: usize, allow: bool) {
+        let Some(extension::Package {
+            state: extension::State::Ready(m),
+            ..
+        }) = self.extensions.packages.get(i)
+        else {
+            return;
+        };
+        let (id, lines) = (m.id.clone(), extension::lines(m));
+        if allow {
+            self.extensions.trust.allow(&id, lines);
+        } else {
+            self.extensions.trust.revoke(&id);
+        }
+        self.lsp.set_extra(self.extensions.servers());
+        let text = self.extensions.trust.write();
+        if let Some(path) = extension::trust::path() {
+            self.jobs.run(move || {
+                Done::Note(
+                    workbench::write_session(&path, &text)
+                        .err()
+                        .map(|e| format!("can't save trust.toml: {e}")),
+                )
+            });
         }
     }
 

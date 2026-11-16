@@ -27,15 +27,38 @@ const KEEP_VERSIONS: usize = 8;
 /// a completion request not answered by then no longer holds up the next.
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// the server for a sylven language: command, args, lsp language id.
-pub fn server_for(language: &str) -> Option<(&'static str, &'static [&'static str], &'static str)> {
-    Some(match language {
-        "rust" => ("rust-analyzer", &[], "rust"),
-        "python" => ("pyright-langserver", &["--stdio"], "python"),
-        "c" => ("clangd", &[], "c"),
-        "toml" => ("taplo", &["lsp", "stdio"], "toml"),
-        _ => return None,
-    })
+/// how to start the server for a language's files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerSpec {
+    /// the sylven language whose files it serves.
+    pub language: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// the language id sent with each file.
+    pub language_id: String,
+    /// the package that declared it; none for the ones ligase knows.
+    pub package: Option<String>,
+}
+
+/// servers ligase knows: sylven language, program, args, lsp language id.
+const BUILT_IN: &[(&str, &str, &[&str], &str)] = &[
+    ("rust", "rust-analyzer", &[], "rust"),
+    ("python", "pyright-langserver", &["--stdio"], "python"),
+    ("c", "clangd", &[], "c"),
+    ("toml", "taplo", &["lsp", "stdio"], "toml"),
+];
+
+fn built_in(language: &str) -> Option<ServerSpec> {
+    BUILT_IN
+        .iter()
+        .find(|(l, ..)| *l == language)
+        .map(|(l, command, args, id)| ServerSpec {
+            language: (*l).to_owned(),
+            command: (*command).to_owned(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            language_id: (*id).to_owned(),
+            package: None,
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -121,9 +144,30 @@ pub struct Lsp {
     completing: Option<((&'static str, i64), Instant)>,
     /// asked again while one was out: ask once that one is back.
     again: Option<ViewId>,
+    /// servers packages declared and the user allowed.
+    extra: Vec<ServerSpec>,
 }
 
 impl Lsp {
+    /// the server for files in `language`: a built-in one first, then one a
+    /// package brings.
+    pub fn server_for(&self, language: &str) -> Option<ServerSpec> {
+        built_in(language).or_else(|| self.extra.iter().find(|s| s.language == language).cloned())
+    }
+
+    /// takes the servers packages bring now. a language that had none and
+    /// failed to start gets another try with the new one.
+    pub fn set_extra(&mut self, specs: Vec<ServerSpec>) {
+        for spec in &specs {
+            if matches!(self.servers.get(spec.language.as_str()), Some(Slot::Failed))
+                && !self.extra.contains(spec)
+            {
+                self.servers.remove(spec.language.as_str());
+            }
+        }
+        self.extra = specs;
+    }
+
     /// languages that want a server and have none yet. marks them starting.
     pub fn wanted(&mut self, docs: &Documents) -> Vec<&'static str> {
         let mut out = Vec::new();
@@ -131,7 +175,7 @@ impl Lsp {
             let Some(language) = doc.language else {
                 continue;
             };
-            if doc.load != Load::Ready || server_for(language).is_none() {
+            if doc.load != Load::Ready || self.server_for(language).is_none() {
                 continue;
             }
             if !self.servers.contains_key(language) {
@@ -197,9 +241,10 @@ impl Lsp {
             let Some(language) = doc.language else {
                 continue;
             };
-            let Some((_, _, language_id)) = server_for(language) else {
+            let Some(spec) = self.server_for(language) else {
                 continue;
             };
+            let language_id = spec.language_id;
             if doc.load != Load::Ready || doc.buffer.len() > MAX_SYNCED {
                 continue;
             }

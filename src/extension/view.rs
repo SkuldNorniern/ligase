@@ -21,6 +21,17 @@ pub enum Ask {
     /// the folder in the system's file manager, made when missing.
     OpenFolder,
     Reload,
+    /// let the package at this place in the list start what it declares.
+    Allow(usize),
+    /// take that back.
+    Revoke(usize),
+}
+
+const CONTROL: f32 = 28.0;
+
+/// a card has an allow button when its package declares servers.
+fn asks_to_run(p: &Package) -> bool {
+    matches!(&p.state, State::Ready(m) if !m.servers.is_empty())
 }
 
 /// the lines a card has under its title.
@@ -61,6 +72,12 @@ fn lines(p: &Package) -> Vec<(String, Tone)> {
             if !asks.is_empty() {
                 out.push((format!("asks to: {}", asks.join(", ")), Tone::Warn));
             }
+            for s in &m.servers {
+                out.push((
+                    format!("starts for {}: {}", s.language, s.line().join(" ")),
+                    Tone::Warn,
+                ));
+            }
             for w in m.warnings.iter().take(MAX_SHOWN) {
                 out.push((w.clone(), Tone::Dim));
             }
@@ -99,7 +116,8 @@ enum Tone {
 }
 
 fn height(p: &Package) -> f32 {
-    LINE * 2.0 + 14.0 + lines(p).len() as f32 * LINE
+    let button = if asks_to_run(p) { CONTROL + 6.0 } else { 0.0 };
+    LINE * 2.0 + 14.0 + lines(p).len() as f32 * LINE + button
 }
 
 pub fn show(
@@ -138,8 +156,14 @@ pub fn show(
     }
     let heights: Vec<f32> = ext.packages.iter().map(height).collect();
     let content: f32 = heights.iter().map(|h| h + 8.0).sum::<f32>() + ext.notes.len() as f32 * LINE;
+    let allowed: Vec<bool> = ext
+        .packages
+        .iter()
+        .map(|p| matches!(&p.state, State::Ready(m) if ext.allowed(m)))
+        .collect();
     let packages = &ext.packages;
     let notes = &ext.notes;
+    let mut card_ask = None;
     ScrollArea::new(&mut ext.scroll, content).show(
         ui,
         Id::ExtensionList,
@@ -151,7 +175,7 @@ pub fn show(
                 ui.text_clipped(note, at, &small, palette.warning, Align::Start)?;
                 y += LINE;
             }
-            for (p, h) in packages.iter().zip(&heights) {
+            for (i, (p, h)) in packages.iter().zip(&heights).enumerate() {
                 let card = Rect::new(content.x, y, content.width, *h);
                 y += h + 8.0;
                 if card.bottom() < view.y || card.y > view.bottom() {
@@ -219,9 +243,24 @@ pub fn show(
                     )?;
                     line_y += LINE;
                 }
+                if asks_to_run(p) {
+                    let at = Rect::new(rest.x, line_y + 4.0, rest.width.min(220.0), CONTROL);
+                    let on = allowed.get(i).copied().unwrap_or(false);
+                    let label = if on {
+                        texts.tr("Allowed: take it back")
+                    } else {
+                        texts.tr("Allow it to start these")
+                    };
+                    let part = u16::try_from(i + 2).unwrap_or(u16::MAX);
+                    let button = Button::new(label);
+                    let button = if on { button.quiet() } else { button };
+                    if button.show(ui, Id::ExtensionButton(part), at)?.clicked {
+                        card_ask = Some(if on { Ask::Revoke(i) } else { Ask::Allow(i) });
+                    }
+                }
             }
             Ok(())
         },
     )?;
-    Ok(ask)
+    Ok(card_ask.or(ask))
 }

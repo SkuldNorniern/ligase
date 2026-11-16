@@ -233,3 +233,5 @@
 "no extensions yet: put a folder with an extension.toml in the extensions folder" = "확장 없음: extension.toml이 든 폴더를 확장 폴더에 넣으세요"
 "snippet" = "스니펫"
 "no such command" = "없는 명령"
+"Allowed: take it back" = "허용됨: 취소"
+"Allow it to start these" = "실행 허용"

@@ -4,6 +4,7 @@
 
 pub mod draw;
 pub mod manifest;
+pub mod trust;
 pub mod ui;
 pub mod view;
 
@@ -59,6 +60,8 @@ pub struct Extensions {
     /// said once per scan: unknown syntax names, packages past the cap.
     pub notes: Vec<String>,
     pub scroll: f32,
+    /// which packages may start the programs they declare.
+    pub trust: trust::Trust,
     /// grammar names kept for the life of the app, one copy per name.
     names: HashSet<&'static str>,
 }
@@ -119,6 +122,11 @@ pub fn scan(root: &Path) -> (Vec<Package>, Vec<String>) {
         })
         .collect();
     (packages, notes)
+}
+
+/// every command line `m` would start, as a grant records them.
+pub fn lines(m: &Manifest) -> Vec<Vec<String>> {
+    m.servers.iter().map(manifest::Server::line).collect()
 }
 
 /// a grammar file from a package: read with a size cap, parsed under a
@@ -202,6 +210,27 @@ impl Extensions {
         self.views()
             .find(|(i, _, _)| *i == n)
             .map(|(_, m, v)| (m, v))
+    }
+
+    /// true when `m` declares servers and the user allowed exactly those.
+    pub fn allowed(&self, m: &Manifest) -> bool {
+        !m.servers.is_empty() && self.trust.allows(&m.id, &lines(m))
+    }
+
+    /// the servers of allowed packages, for the language client.
+    pub fn servers(&self) -> Vec<crate::lsp::ServerSpec> {
+        self.ready()
+            .filter(|m| self.allowed(m))
+            .flat_map(|m| {
+                m.servers.iter().map(|s| crate::lsp::ServerSpec {
+                    language: s.language.clone(),
+                    command: s.command.clone(),
+                    args: s.args.clone(),
+                    language_id: s.language_id.clone(),
+                    package: Some(m.id.clone()),
+                })
+            })
+            .collect()
     }
 
     /// packages that are off: broken or a second copy.

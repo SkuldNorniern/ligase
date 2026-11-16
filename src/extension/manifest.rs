@@ -31,6 +31,9 @@ const MAX_BODY: usize = 4096;
 const MAX_SNIPPET_DESCRIPTION: usize = 120;
 const MAX_VIEWS: usize = 20;
 const MAX_SYNTAXES: usize = 10;
+const MAX_SERVERS: usize = 5;
+const MAX_ARGS: usize = 20;
+const MAX_ARG: usize = 200;
 const MAX_PATH: usize = 200;
 const MAX_VIEW_ID: usize = 64;
 const MAX_TITLE: usize = 40;
@@ -50,6 +53,8 @@ pub struct Manifest {
     pub views: Vec<View>,
     /// grammar files in the package, relative paths with `/`.
     pub syntaxes: Vec<String>,
+    /// language servers to start, once the user allows it.
+    pub servers: Vec<Server>,
     /// things skipped but not fatal, e.g. unknown keys.
     pub warnings: Vec<String>,
 }
@@ -96,6 +101,27 @@ pub struct View {
     /// a bundled icon name for its rail button.
     pub icon: String,
     pub body: Node,
+}
+
+/// a language server a package starts for a language's files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Server {
+    /// the language (a grammar or bundled syntax name) it serves.
+    pub language: String,
+    /// a program on the path; never a path itself.
+    pub command: String,
+    pub args: Vec<String>,
+    /// the id sent with each file; the language when not given.
+    pub language_id: String,
+}
+
+impl Server {
+    /// program then args, the way a grant records it.
+    pub fn line(&self) -> Vec<String> {
+        std::iter::once(self.command.clone())
+            .chain(self.args.iter().cloned())
+            .collect()
+    }
 }
 
 /// where a view sits.
@@ -281,9 +307,35 @@ fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
     check_keys(
         table,
         "contributions",
-        &["languages", "snippets", "views", "syntaxes"],
+        &["languages", "snippets", "views", "syntaxes", "servers"],
         report,
     );
+
+    if let Some(items) = list(table, "contributions", "servers", MAX_SERVERS, report) {
+        if !items.is_empty() && !out.permissions.spawn_process {
+            report.error(
+                "contributions.servers",
+                "starting a server needs [permissions] spawn_process = true",
+            );
+        }
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.servers[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            let Some(server) = parse_server(t, &path, report) else {
+                continue;
+            };
+            if out.servers.iter().any(|s| s.language == server.language) {
+                report.error(
+                    &join(&path, "language"),
+                    &format!("a second server for {}", shown(&server.language)),
+                );
+            } else {
+                out.servers.push(server);
+            }
+        }
+    }
 
     if let Some(items) = list(table, "contributions", "syntaxes", MAX_SYNTAXES, report) {
         for (i, item) in items.iter().enumerate() {
@@ -745,6 +797,70 @@ fn item_table<'a>(value: &'a Value, path: &str, report: &mut Report) -> Option<&
     }
 }
 
+fn parse_server(table: &Table, path: &str, report: &mut Report) -> Option<Server> {
+    check_keys(
+        table,
+        path,
+        &["language", "command", "args", "language_id"],
+        report,
+    );
+    let mut ok = true;
+    let mut word = |key: &str, required: bool, report: &mut Report| -> Option<String> {
+        let value = if required {
+            required_string(table, path, key, report)
+        } else {
+            string(table, path, key, report)
+        }?;
+        if !lang_id_ok(value) {
+            report.error(&join(path, key), LANG_ID_RULE);
+            ok = false;
+            return None;
+        }
+        Some(value.to_owned())
+    };
+    let language = word("language", true, report);
+    let language_id = word("language_id", false, report);
+    let command = required_string(table, path, "command", report).and_then(|c| {
+        let fine = !c.is_empty()
+            && c.len() <= 64
+            && c.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !fine {
+            report.error(
+                &join(path, "command"),
+                "must be a program name, 1-64 of a-z A-Z 0-9 _ . -, no path",
+            );
+        }
+        fine.then(|| c.to_owned())
+    });
+    let mut args = Vec::new();
+    if let Some(items) = list(table, path, "args", MAX_ARGS, report) {
+        for (i, item) in items.iter().enumerate() {
+            let at = format!("{path}.args[{i}]");
+            let Some(arg) = item_string(item, &at, report) else {
+                ok = false;
+                continue;
+            };
+            if arg.is_empty() || arg.len() > MAX_ARG || has_control(arg) {
+                report.error(&at, &format!("must be 1-{MAX_ARG} bytes, no control chars"));
+                ok = false;
+            } else {
+                args.push(arg.to_owned());
+            }
+        }
+    }
+    let language = language?;
+    if !ok {
+        return None;
+    }
+    Some(Server {
+        language_id: language_id.unwrap_or_else(|| language.clone()),
+        language,
+        command: command?,
+        args,
+    })
+}
+
 /// a relative path that stays in the package: no root, no `..`, plain parts.
 fn package_path_ok(s: &str) -> bool {
     !s.is_empty()
@@ -889,6 +1005,7 @@ description = "a theorem"
         let expected = Manifest {
             views: Vec::new(),
             syntaxes: Vec::new(),
+            servers: Vec::new(),
             id: "org.example.lean".into(),
             name: "Lean Support".into(),
             version: (0, 1, 0),
@@ -1172,5 +1289,28 @@ description = "a theorem"
                 "{field}: {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn servers_need_the_permission_and_plain_programs() {
+        let server = "[[contributions.servers]]\nlanguage = \"lean4\"\ncommand = \"lake\"\nargs = [\"serve\"]\n";
+        let m = ok(&format!(
+            "{PACKAGE}[permissions]\nspawn_process = true\n{server}"
+        ));
+        assert_eq!(m.servers.len(), 1);
+        assert_eq!(m.servers[0].line(), ["lake", "serve"]);
+        assert_eq!(m.servers[0].language_id, "lean4");
+        let e = errs(&format!("{PACKAGE}{server}"));
+        assert!(has(&e, "spawn_process"), "{e:?}");
+        for bad in ["../lake", "C:\\\\x\\\\lake.exe", "lake serve", ""] {
+            let text = format!(
+                "{PACKAGE}[permissions]\nspawn_process = true\n[[contributions.servers]]\nlanguage = \"lean4\"\ncommand = \"{bad}\"\n"
+            );
+            assert!(manifest_err(&text), "{bad}");
+        }
+    }
+
+    fn manifest_err(text: &str) -> bool {
+        parse(text).is_err()
     }
 }
