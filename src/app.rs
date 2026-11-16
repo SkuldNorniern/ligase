@@ -59,6 +59,8 @@ pub enum Id {
     ScmCommit,
     ScmList,
     ScmRow(u16),
+    ReplaceInFiles,
+    ReplaceAllButton,
     DiffOpen(DocumentId),
     DiffList(DocumentId),
     Status,
@@ -325,6 +327,8 @@ pub struct App {
     settings: Settings,
     /// server edits for files still being read, put in once they are.
     waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
+    /// replace all waiting on files to load: the query and what replaces it.
+    waiting_replace: Vec<(DocumentId, String, String)>,
     /// files of tabs closed lately, newest last, for reopen.
     closed: Vec<PathBuf>,
     /// the theme in force is dark.
@@ -423,6 +427,7 @@ impl App {
             settings: Settings::default(),
             closed: Vec::new(),
             waiting_edits: Vec::new(),
+            waiting_replace: Vec::new(),
             dark: true,
             edit_opts: editor::EditOpts::default(),
             close_after_save: false,
@@ -2423,6 +2428,77 @@ impl App {
             .run(move || Done::Changes(crate::git::status(&root)));
     }
 
+    /// replaces every hit of the search in its file. each file opens as a
+    /// tab and takes the change as one undoable edit, unsaved: a look before
+    /// saving, never a silent write. the matches are found again in the text
+    /// as it is, so a file changed since the search is still right.
+    fn replace_all(&mut self) {
+        let query = self.finder.query.clone();
+        let with = self.finder.replace.clone();
+        let mut paths: Vec<PathBuf> = self.finder.hits.iter().map(|h| h.path.clone()).collect();
+        paths.dedup();
+        if paths.len() > MAX_OPENED_BY_EDIT {
+            self.say(format!(
+                "{} ({})",
+                self.texts.tr("too many files to change here"),
+                paths.len()
+            ));
+            return;
+        }
+        for path in paths {
+            let view = self.open_file(&path);
+            if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
+                self.waiting_replace
+                    .push((doc, query.clone(), with.clone()));
+                self.replace_waiting(doc);
+            }
+        }
+    }
+
+    /// the replace waiting on `doc`, once its text is in.
+    fn replace_waiting(&mut self, doc: DocumentId) {
+        let ready = self
+            .docs
+            .doc(doc)
+            .is_some_and(|d| d.load == document::Load::Ready);
+        if !ready {
+            return;
+        }
+        let waiting: Vec<_> = self
+            .waiting_replace
+            .iter()
+            .filter(|w| w.0 == doc)
+            .cloned()
+            .collect();
+        self.waiting_replace.retain(|w| w.0 != doc);
+        for (_, query, with) in waiting {
+            let Some(view) = self
+                .docs
+                .doc(doc)
+                .map(|d| d.path.clone())
+                .and_then(|p| self.view_of_path(&p))
+            else {
+                continue;
+            };
+            let Some(text) = self.docs.doc(doc).map(|d| d.buffer.snapshot()) else {
+                continue;
+            };
+            let ranges: Vec<(Range<usize>, String)> = editor::find::find_all(&text, &query)
+                .into_iter()
+                .map(|r| (r, with.clone()))
+                .collect();
+            let count = ranges.len();
+            if count > 0 && self.commit_server_edits(view, ranges) {
+                let name = self
+                    .docs
+                    .doc(doc)
+                    .map(document::Document::name)
+                    .unwrap_or_default();
+                self.say(format!("{} {count}: {name}", self.texts.tr("replaced")));
+            }
+        }
+    }
+
     /// opens `view`'s file against HEAD, in a tab beside it.
     fn show_diff(&mut self, view: ViewId) {
         let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
@@ -2701,6 +2777,7 @@ impl App {
                     self.docs.loaded(doc, result);
                     self.docs.set_disk(doc, disk);
                     self.ask_git_base(doc);
+                    self.replace_waiting(doc);
                     let waiting: Vec<_> = self
                         .waiting_edits
                         .iter()
@@ -3235,6 +3312,7 @@ impl App {
                 let root = self.explorer.root().to_path_buf();
                 self.finder.start(&root, self.canvas);
             }
+            Some(search::view::Ask::ReplaceAll) => self.replace_all(),
             Some(search::view::Ask::Open(hit)) => {
                 let view = self.open_file(&hit.path);
                 if let Some(v) = self.docs.view_mut(view) {
@@ -3686,6 +3764,45 @@ mod tests {
         app.docs.edit(view, vec![(0..0, "x".to_owned())], false);
         app.bench.show_editor(view);
         view
+    }
+
+    #[test]
+    fn replace_all_changes_every_file_in_its_tab_and_writes_none() {
+        let dir = std::env::temp_dir().join(format!("ligase-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, "old one\nold two\n").unwrap();
+        std::fs::write(&b, "keep old\n").unwrap();
+        let mut app = App::new(&dir, Lang::En, false);
+        app.finder.query = "old".to_owned();
+        app.finder.replace = "new".to_owned();
+        let hit = |path: &Path, line| search::Hit {
+            path: path.to_path_buf(),
+            line,
+            column: 0,
+            len: 3,
+            preview: String::new(),
+        };
+        app.finder.hits = vec![hit(&a, 0), hit(&a, 1), hit(&b, 0)];
+        app.replace_all();
+        // the files load on the worker; take what it sends until both are in
+        let start = std::time::Instant::now();
+        while !app.waiting_replace.is_empty() && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            app.poll();
+        }
+        let text = |path: &Path| {
+            let view = app.view_of_path(path).unwrap();
+            String::from(app.docs.doc_of(view).unwrap().buffer.text())
+        };
+        assert_eq!(text(&a), "new one\nnew two\n");
+        assert_eq!(text(&b), "keep new\n");
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "old one\nold two\n",
+            "not written"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -51,6 +51,8 @@ impl Drop for Search {
 #[derive(Default)]
 pub struct Finder {
     pub query: String,
+    /// what replace all puts in place of each hit.
+    pub replace: String,
     pub hits: Vec<Hit>,
     running: Option<Search>,
     /// files looked at and whether the hit cap was reached, once done.

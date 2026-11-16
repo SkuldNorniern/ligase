@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use aurea::render::Rect;
-use aurea::ui::{Align, ListView, TextField, Ui};
+use aurea::ui::{Align, Button, ListView, TextField, Ui};
 use aurea::{AureaResult, KeyCode};
 
 use super::{Finder, Hit};
@@ -17,6 +17,8 @@ const PAD: f32 = 8.0;
 pub enum Ask {
     Search,
     Open(Hit),
+    /// every hit's file opened, the hits replaced there, left unsaved.
+    ReplaceAll,
 }
 
 pub fn show(
@@ -31,6 +33,7 @@ pub fn show(
     let small = ui.theme.font(12.0);
     let inner = rect.inset(PAD);
     let (field, rest) = inner.split_top(FIELD, 6.0);
+    let (replace_row, rest) = rest.split_top(FIELD, 6.0);
     let (note, list) = rest.split_top(NOTE, 2.0);
 
     let mut ask = None;
@@ -40,6 +43,20 @@ pub fn show(
         .show(ui, Id::SearchField, field)?;
     if typed.submitted {
         ask = Some(Ask::Search);
+    }
+    let (button, replace_field) = replace_row.split_right(86.0, 6.0);
+    TextField::new(&mut finder.replace)
+        .placeholder(texts.tr("replace with"))
+        .max_chars(500)
+        .show(ui, Id::ReplaceInFiles, replace_field)?;
+    let can_replace = !finder.hits.is_empty() && !finder.searching();
+    if Button::new(texts.tr("Replace All"))
+        .enabled(can_replace)
+        .show(ui, Id::ReplaceAllButton, button)?
+        .clicked
+        && can_replace
+    {
+        ask = Some(Ask::ReplaceAll);
     }
 
     let status = if finder.searching() {
