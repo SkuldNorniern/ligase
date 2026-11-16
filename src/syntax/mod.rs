@@ -83,6 +83,9 @@ pub fn colour_on(kind: HighlightKind, dark: bool) -> Color {
         HighlightKind::Macro => Color::rgb(0x0e, 0x7c, 0x86),
         HighlightKind::Lifetime => Color::rgb(0xb3, 0x38, 0x38),
         HighlightKind::SectionHeader => Color::rgb(0x1f, 0x5f, 0xc0),
+        HighlightKind::Constant => Color::rgb(0x00, 0x6a, 0xb0),
+        HighlightKind::Property => Color::rgb(0x2a, 0x55, 0x80),
+        HighlightKind::Namespace => Color::rgb(0x2b, 0x7a, 0x70),
     }
 }
 
@@ -101,6 +104,9 @@ pub fn colour(kind: HighlightKind) -> Color {
         HighlightKind::Macro => Color::rgb(0x56, 0xd4, 0xc8),
         HighlightKind::Lifetime => Color::rgb(0xe8, 0x8a, 0x8a),
         HighlightKind::SectionHeader => Color::rgb(0x6c, 0xb6, 0xff),
+        HighlightKind::Constant => Color::rgb(0x4f, 0xc1, 0xff),
+        HighlightKind::Property => Color::rgb(0xb8, 0xd7, 0xee),
+        HighlightKind::Namespace => Color::rgb(0x8f, 0xc8, 0xbf),
     }
 }
 
