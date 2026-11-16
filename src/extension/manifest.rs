@@ -1,0 +1,971 @@
+//! extension.toml parsing. the file is untrusted: sizes are capped, every
+//! value is checked, and bad input comes back as messages, never panics.
+
+use std::collections::HashSet;
+
+use toml::{Table, Value};
+
+/// largest manifest read, in bytes. bigger text is refused before parsing.
+pub const MAX_BYTES: usize = 256 * 1024;
+
+/// the extension api this build of ligase speaks.
+pub const API: &str = "1";
+
+const MAX_ID: usize = 100;
+const MAX_NAME: usize = 80;
+const MAX_DESCRIPTION: usize = 300;
+const MAX_EVENTS: usize = 50;
+const MAX_LANGUAGES: usize = 100;
+const MAX_LANG_ID: usize = 40;
+const MAX_LANG_NAME: usize = 40;
+const MAX_EXTENSIONS: usize = 20;
+const MAX_EXTENSION: usize = 16;
+const MAX_FILES: usize = 20;
+const MAX_FILE: usize = 64;
+const MAX_COMMENT: usize = 8;
+const MAX_SNIPPETS: usize = 500;
+const MAX_PREFIX: usize = 40;
+const MAX_BODY: usize = 4096;
+const MAX_SNIPPET_DESCRIPTION: usize = 120;
+
+const LANG_ID_RULE: &str = "1-40 of a-z 0-9 _ + -, starting with a letter";
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Manifest {
+    pub id: String,
+    pub name: String,
+    pub version: (u32, u32, u32),
+    pub description: String,
+    pub activation: Vec<Activation>,
+    pub permissions: Permissions,
+    pub languages: Vec<Language>,
+    pub snippets: Vec<Snippet>,
+    /// things skipped but not fatal, e.g. unknown keys.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Startup,
+    Language(String),
+    Command(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Permissions {
+    pub read_workspace: bool,
+    pub write_documents: bool,
+    pub spawn_process: bool,
+    pub network: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Language {
+    pub id: String,
+    pub name: String,
+    pub extensions: Vec<String>,
+    pub files: Vec<String>,
+    pub comment: Option<String>,
+    pub syntax: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Snippet {
+    pub language: String,
+    pub prefix: String,
+    pub body: String,
+    pub description: String,
+}
+
+/// collected while parsing. errors make the parse fail, warnings do not.
+#[derive(Default)]
+struct Report {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl Report {
+    fn error(&mut self, path: &str, msg: &str) {
+        self.errors.push(format!("{path}: {msg}"));
+    }
+}
+
+/// parses an extension.toml. all errors are returned together.
+pub fn parse(text: &str) -> Result<Manifest, Vec<String>> {
+    if text.len() > MAX_BYTES {
+        return Err(vec![format!(
+            "manifest is {} bytes, the limit is {MAX_BYTES}",
+            text.len()
+        )]);
+    }
+    let root: Table = toml::from_str(text).map_err(|e| vec![format!("toml: {e}")])?;
+
+    let mut report = Report::default();
+    check_keys(
+        &root,
+        "",
+        &["package", "activation", "permissions", "contributions"],
+        &mut report,
+    );
+    let mut manifest = Manifest::default();
+
+    let empty = Table::new();
+    let package = subtable(&root, "", "package", &mut report).unwrap_or(&empty);
+    parse_package(package, &mut manifest, &mut report);
+
+    if let Some(t) = subtable(&root, "", "activation", &mut report) {
+        manifest.activation = parse_activation(t, &mut report);
+    }
+    if let Some(t) = subtable(&root, "", "permissions", &mut report) {
+        manifest.permissions = parse_permissions(t, &mut report);
+    }
+    if let Some(t) = subtable(&root, "", "contributions", &mut report) {
+        parse_contributions(t, &mut manifest, &mut report);
+    }
+
+    if report.errors.is_empty() {
+        manifest.warnings = report.warnings;
+        Ok(manifest)
+    } else {
+        Err(report.errors)
+    }
+}
+
+fn parse_package(table: &Table, out: &mut Manifest, report: &mut Report) {
+    check_keys(
+        table,
+        "package",
+        &["id", "name", "version", "api", "description"],
+        report,
+    );
+
+    if let Some(id) = required_string(table, "package", "id", report) {
+        if dotted_id_ok(id) {
+            out.id = id.to_owned();
+        } else {
+            report.error(
+                "package.id",
+                "must be 2-100 bytes, dot-separated parts of a-z 0-9 and -, at least two parts, no leading or trailing -",
+            );
+        }
+    }
+
+    if let Some(name) = required_string(table, "package", "name", report) {
+        if name_ok(name) {
+            out.name = name.to_owned();
+        } else {
+            report.error("package.name", "must be 1-80 chars, no control chars");
+        }
+    }
+
+    if let Some(version) = required_string(table, "package", "version", report) {
+        match parse_version(version) {
+            Some(v) => out.version = v,
+            None => report.error(
+                "package.version",
+                "must be three dot-separated numbers, like 0.1.0",
+            ),
+        }
+    }
+
+    if let Some(api) = required_string(table, "package", "api", report)
+        && api != API
+    {
+        report.error(
+            "package.api",
+            &format!("needs api {}, this ligase has {API}", shown(api)),
+        );
+    }
+
+    if let Some(desc) = string(table, "package", "description", report) {
+        if desc.chars().count() <= MAX_DESCRIPTION && !has_control(desc) {
+            out.description = desc.to_owned();
+        } else {
+            report.error(
+                "package.description",
+                "must be at most 300 chars, no control chars",
+            );
+        }
+    }
+}
+
+fn parse_activation(table: &Table, report: &mut Report) -> Vec<Activation> {
+    check_keys(table, "activation", &["events"], report);
+    let Some(items) = list(table, "activation", "events", MAX_EVENTS, report) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let path = format!("activation.events[{i}]");
+        let Some(text) = item_string(item, &path, report) else {
+            continue;
+        };
+        match parse_event(text) {
+            Some(event) => out.push(event),
+            None => report.error(
+                &path,
+                &format!(
+                    "bad event {}, use startup, language:<id> or command:<id>",
+                    shown(text)
+                ),
+            ),
+        }
+    }
+    out
+}
+
+fn parse_event(text: &str) -> Option<Activation> {
+    if text == "startup" {
+        return Some(Activation::Startup);
+    }
+    if let Some(id) = text.strip_prefix("language:") {
+        return lang_id_ok(id).then(|| Activation::Language(id.to_owned()));
+    }
+    if let Some(id) = text.strip_prefix("command:") {
+        return dotted_id_ok(id).then(|| Activation::Command(id.to_owned()));
+    }
+    None
+}
+
+fn parse_permissions(table: &Table, report: &mut Report) -> Permissions {
+    check_keys(
+        table,
+        "permissions",
+        &[
+            "read_workspace",
+            "write_documents",
+            "spawn_process",
+            "network",
+        ],
+        report,
+    );
+    Permissions {
+        read_workspace: boolean(table, "permissions", "read_workspace", report).unwrap_or(false),
+        write_documents: boolean(table, "permissions", "write_documents", report).unwrap_or(false),
+        spawn_process: boolean(table, "permissions", "spawn_process", report).unwrap_or(false),
+        network: boolean(table, "permissions", "network", report).unwrap_or(false),
+    }
+}
+
+fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
+    check_keys(table, "contributions", &["languages", "snippets"], report);
+
+    if let Some(items) = list(table, "contributions", "languages", MAX_LANGUAGES, report) {
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.languages[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            let Some(lang) = parse_language(t, &path, report) else {
+                continue;
+            };
+            if out.languages.iter().any(|other| other.id == lang.id) {
+                report.error(
+                    &join(&path, "id"),
+                    &format!("duplicate language {}", shown(&lang.id)),
+                );
+            } else {
+                out.languages.push(lang);
+            }
+        }
+    }
+
+    if let Some(items) = list(table, "contributions", "snippets", MAX_SNIPPETS, report) {
+        let mut seen = HashSet::new();
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.snippets[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            let Some(snippet) = parse_snippet(t, &path, report) else {
+                continue;
+            };
+            if seen.insert((snippet.language.clone(), snippet.prefix.clone())) {
+                out.snippets.push(snippet);
+            } else {
+                report.error(
+                    &join(&path, "prefix"),
+                    &format!(
+                        "duplicate prefix {} for language {}",
+                        shown(&snippet.prefix),
+                        shown(&snippet.language)
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn parse_language(table: &Table, path: &str, report: &mut Report) -> Option<Language> {
+    check_keys(
+        table,
+        path,
+        &["id", "name", "extensions", "files", "comment", "syntax"],
+        report,
+    );
+
+    let id = match required_string(table, path, "id", report) {
+        Some(id) if lang_id_ok(id) => Some(id.to_owned()),
+        Some(_) => {
+            report.error(&join(path, "id"), LANG_ID_RULE);
+            None
+        }
+        None => None,
+    };
+
+    let name = match string(table, path, "name", report) {
+        Some(n) if n.chars().count() <= MAX_LANG_NAME => n.to_owned(),
+        Some(_) => {
+            report.error(&join(path, "name"), "must be at most 40 chars");
+            String::new()
+        }
+        None => String::new(),
+    };
+
+    let mut extensions = Vec::new();
+    if let Some(items) = list(table, path, "extensions", MAX_EXTENSIONS, report) {
+        for (i, item) in items.iter().enumerate() {
+            let p = format!("{path}.extensions[{i}]");
+            if let Some(ext) = item_string(item, &p, report) {
+                let lower = ext.to_ascii_lowercase();
+                if extension_ok(&lower) {
+                    extensions.push(lower);
+                } else {
+                    report.error(&p, "must be 1-16 of a-z 0-9 _ + - (no dot)");
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    if let Some(items) = list(table, path, "files", MAX_FILES, report) {
+        for (i, item) in items.iter().enumerate() {
+            let p = format!("{path}.files[{i}]");
+            if let Some(file) = item_string(item, &p, report) {
+                if file_ok(file) {
+                    files.push(file.to_owned());
+                } else {
+                    report.error(&p, "must be 1-64 chars, no / \\ or control chars");
+                }
+            }
+        }
+    }
+
+    let comment = match string(table, path, "comment", report) {
+        Some(c) if (1..=MAX_COMMENT).contains(&c.chars().count()) && !has_space(c) => {
+            Some(c.to_owned())
+        }
+        Some(_) => {
+            report.error(&join(path, "comment"), "must be 1-8 chars, no whitespace");
+            None
+        }
+        None => None,
+    };
+
+    let syntax = match string(table, path, "syntax", report) {
+        Some(s) if lang_id_ok(s) => Some(s.to_owned()),
+        Some(_) => {
+            report.error(&join(path, "syntax"), LANG_ID_RULE);
+            None
+        }
+        None => None,
+    };
+
+    let id = id?;
+    let name = if name.is_empty() { id.clone() } else { name };
+    Some(Language {
+        id,
+        name,
+        extensions,
+        files,
+        comment,
+        syntax,
+    })
+}
+
+fn parse_snippet(table: &Table, path: &str, report: &mut Report) -> Option<Snippet> {
+    check_keys(
+        table,
+        path,
+        &["language", "prefix", "body", "description"],
+        report,
+    );
+
+    let language = match required_string(table, path, "language", report) {
+        Some(l) if lang_id_ok(l) => Some(l.to_owned()),
+        Some(_) => {
+            report.error(&join(path, "language"), LANG_ID_RULE);
+            None
+        }
+        None => None,
+    };
+
+    let prefix = match required_string(table, path, "prefix", report) {
+        Some(p) if (1..=MAX_PREFIX).contains(&p.chars().count()) && !has_space(p) => {
+            Some(p.to_owned())
+        }
+        Some(_) => {
+            report.error(&join(path, "prefix"), "must be 1-40 chars, no whitespace");
+            None
+        }
+        None => None,
+    };
+
+    let body = match required_string(table, path, "body", report) {
+        Some(b) if (1..=MAX_BODY).contains(&b.len()) => Some(b.to_owned()),
+        Some(_) => {
+            report.error(&join(path, "body"), "must be 1-4096 bytes");
+            None
+        }
+        None => None,
+    };
+
+    let description = match string(table, path, "description", report) {
+        Some(d) if d.chars().count() <= MAX_SNIPPET_DESCRIPTION => d.to_owned(),
+        Some(_) => {
+            report.error(&join(path, "description"), "must be at most 120 chars");
+            String::new()
+        }
+        None => String::new(),
+    };
+
+    Some(Snippet {
+        language: language?,
+        prefix: prefix?,
+        body: body?,
+        description,
+    })
+}
+
+/// key path for a field: `path.key`, or just `key` at the root.
+fn join(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+/// a value echoed back in a message. cut short and escaped, since it came from outside.
+fn shown(s: &str) -> String {
+    s.chars().take(40).flat_map(char::escape_debug).collect()
+}
+
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "a string",
+        Value::Integer(_) => "an integer",
+        Value::Float(_) => "a float",
+        Value::Boolean(_) => "a bool",
+        Value::Datetime(_) => "a datetime",
+        Value::Array(_) => "an array",
+        Value::Table(_) => "a table",
+    }
+}
+
+/// adds a warning for every key that is not in `known`.
+fn check_keys(table: &Table, path: &str, known: &[&str], report: &mut Report) {
+    for key in table.keys() {
+        if !known.contains(&key.as_str()) {
+            report
+                .warnings
+                .push(format!("unknown key: {}", join(path, key)));
+        }
+    }
+}
+
+/// a string field. `None` when absent or not a string (the latter is reported).
+fn string<'a>(table: &'a Table, path: &str, key: &str, report: &mut Report) -> Option<&'a str> {
+    let value = table.get(key)?;
+    match value {
+        Value::String(s) => Some(s.as_str()),
+        other => {
+            report.error(
+                &join(path, key),
+                &format!("expected a string, got {}", kind(other)),
+            );
+            None
+        }
+    }
+}
+
+/// a string field that must be there.
+fn required_string<'a>(
+    table: &'a Table,
+    path: &str,
+    key: &str,
+    report: &mut Report,
+) -> Option<&'a str> {
+    if table.contains_key(key) {
+        string(table, path, key, report)
+    } else {
+        report.error(&join(path, key), "missing required field");
+        None
+    }
+}
+
+fn boolean(table: &Table, path: &str, key: &str, report: &mut Report) -> Option<bool> {
+    let value = table.get(key)?;
+    match value {
+        Value::Boolean(b) => Some(*b),
+        other => {
+            report.error(
+                &join(path, key),
+                &format!("expected a bool, got {}", kind(other)),
+            );
+            None
+        }
+    }
+}
+
+fn subtable<'a>(table: &'a Table, path: &str, key: &str, report: &mut Report) -> Option<&'a Table> {
+    let value = table.get(key)?;
+    match value {
+        Value::Table(t) => Some(t),
+        other => {
+            report.error(
+                &join(path, key),
+                &format!("expected a table, got {}", kind(other)),
+            );
+            None
+        }
+    }
+}
+
+/// an array field with at most `max` entries. over the cap it is reported and skipped.
+fn list<'a>(
+    table: &'a Table,
+    path: &str,
+    key: &str,
+    max: usize,
+    report: &mut Report,
+) -> Option<&'a [Value]> {
+    let value = table.get(key)?;
+    let Value::Array(items) = value else {
+        report.error(
+            &join(path, key),
+            &format!("expected an array, got {}", kind(value)),
+        );
+        return None;
+    };
+    if items.len() > max {
+        report.error(
+            &join(path, key),
+            &format!("at most {max} entries, got {}", items.len()),
+        );
+        return None;
+    }
+    Some(items.as_slice())
+}
+
+fn item_string<'a>(value: &'a Value, path: &str, report: &mut Report) -> Option<&'a str> {
+    match value {
+        Value::String(s) => Some(s.as_str()),
+        other => {
+            report.error(path, &format!("expected a string, got {}", kind(other)));
+            None
+        }
+    }
+}
+
+fn item_table<'a>(value: &'a Value, path: &str, report: &mut Report) -> Option<&'a Table> {
+    match value {
+        Value::Table(t) => Some(t),
+        other => {
+            report.error(path, &format!("expected a table, got {}", kind(other)));
+            None
+        }
+    }
+}
+
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'+' | b'-')
+}
+
+fn has_control(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
+fn has_space(s: &str) -> bool {
+    s.chars().any(char::is_whitespace)
+}
+
+/// 2-100 bytes, at least two dot-separated parts, each a-z 0-9 - and not
+/// starting or ending with '-'.
+fn dotted_id_ok(s: &str) -> bool {
+    if !(2..=MAX_ID).contains(&s.len()) {
+        return false;
+    }
+    let mut parts = 0;
+    for part in s.split('.') {
+        parts += 1;
+        let b = part.as_bytes();
+        let ok = !b.is_empty()
+            && b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+            && b.first() != Some(&b'-')
+            && b.last() != Some(&b'-');
+        if !ok {
+            return false;
+        }
+    }
+    parts >= 2
+}
+
+/// 1-40 of a-z 0-9 _ + -, starting with a letter.
+fn lang_id_ok(s: &str) -> bool {
+    (1..=MAX_LANG_ID).contains(&s.len())
+        && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && s.bytes().all(word_byte)
+}
+
+/// 1-16 of a-z 0-9 _ + - with no dot. callers lowercase first.
+fn extension_ok(s: &str) -> bool {
+    (1..=MAX_EXTENSION).contains(&s.len()) && s.bytes().all(word_byte)
+}
+
+fn file_ok(s: &str) -> bool {
+    let n = s.chars().count();
+    (1..=MAX_FILE).contains(&n) && !s.chars().any(|c| matches!(c, '/' | '\\') || c.is_control())
+}
+
+fn name_ok(s: &str) -> bool {
+    (1..=MAX_NAME).contains(&s.chars().count()) && !has_control(s)
+}
+
+/// exactly three dot-separated u32 numbers.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut nums = [0u32; 3];
+    let mut count = 0;
+    for part in s.split('.') {
+        if count == 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        nums[count] = part.parse().ok()?;
+        count += 1;
+    }
+    (count == 3).then_some((nums[0], nums[1], nums[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXAMPLE: &str = r#"[package]
+id = "org.example.lean"
+name = "Lean Support"
+version = "0.1.0"
+api = "1"
+description = "Lean 4 language support."
+
+[activation]
+events = ["language:lean", "command:org.example.lean.goals", "startup"]
+
+[permissions]
+read_workspace = true
+write_documents = false
+spawn_process = true
+network = false
+
+[[contributions.languages]]
+id = "lean"
+name = "Lean"
+extensions = ["lean"]
+files = ["Leanfile"]
+comment = "--"
+syntax = "rust"
+
+[[contributions.snippets]]
+language = "lean"
+prefix = "thm"
+body = "theorem $1 : $2 := by\n  $0"
+description = "a theorem"
+"#;
+
+    const PACKAGE: &str = "[package]\nid = \"org.example.lean\"\nname = \"Lean Support\"\nversion = \"0.1.0\"\napi = \"1\"\n";
+
+    fn ok(text: &str) -> Manifest {
+        match parse(text) {
+            Ok(m) => m,
+            Err(e) => panic!("expected ok, got {e:?}"),
+        }
+    }
+
+    fn errs(text: &str) -> Vec<String> {
+        match parse(text) {
+            Ok(m) => panic!("expected errors, got {m:?}"),
+            Err(e) => e,
+        }
+    }
+
+    fn has(list: &[String], needle: &str) -> bool {
+        list.iter().any(|m| m.contains(needle))
+    }
+
+    #[test]
+    fn full_example_parses() {
+        let m = ok(EXAMPLE);
+        let expected = Manifest {
+            id: "org.example.lean".into(),
+            name: "Lean Support".into(),
+            version: (0, 1, 0),
+            description: "Lean 4 language support.".into(),
+            activation: vec![
+                Activation::Language("lean".into()),
+                Activation::Command("org.example.lean.goals".into()),
+                Activation::Startup,
+            ],
+            permissions: Permissions {
+                read_workspace: true,
+                write_documents: false,
+                spawn_process: true,
+                network: false,
+            },
+            languages: vec![Language {
+                id: "lean".into(),
+                name: "Lean".into(),
+                extensions: vec!["lean".into()],
+                files: vec!["Leanfile".into()],
+                comment: Some("--".into()),
+                syntax: Some("rust".into()),
+            }],
+            snippets: vec![Snippet {
+                language: "lean".into(),
+                prefix: "thm".into(),
+                body: "theorem $1 : $2 := by\n  $0".into(),
+                description: "a theorem".into(),
+            }],
+            warnings: Vec::new(),
+        };
+        assert_eq!(m, expected);
+    }
+
+    #[test]
+    fn minimal_manifest_parses() {
+        let m = ok(PACKAGE);
+        assert_eq!(m.id, "org.example.lean");
+        assert_eq!(m.name, "Lean Support");
+        assert_eq!(m.version, (0, 1, 0));
+        assert_eq!(m.description, "");
+        assert!(m.activation.is_empty());
+        assert_eq!(m.permissions, Permissions::default());
+        assert!(m.languages.is_empty());
+        assert!(m.snippets.is_empty());
+        assert!(m.warnings.is_empty());
+    }
+
+    #[test]
+    fn language_name_defaults_to_id_and_extensions_lowercase() {
+        let text = format!(
+            "{PACKAGE}\n[[contributions.languages]]\nid = \"lean\"\nextensions = [\"LEAN\"]\n"
+        );
+        let m = ok(&text);
+        assert_eq!(m.languages[0].name, "lean");
+        assert_eq!(m.languages[0].extensions, ["lean"]);
+    }
+
+    #[test]
+    fn missing_required_fields_are_named() {
+        let fields = [
+            ("id", "id = \"org.example.lean\""),
+            ("name", "name = \"Lean Support\""),
+            ("version", "version = \"0.1.0\""),
+            ("api", "api = \"1\""),
+        ];
+        for (key, _) in fields {
+            let mut text = String::from("[package]\n");
+            for (k, line) in fields {
+                if k != key {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+            let e = errs(&text);
+            assert!(has(&e, &format!("package.{key}: missing")), "{key}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn bad_ids_are_rejected() {
+        let long = format!("a.{}", "b".repeat(99));
+        assert_eq!(long.len(), 101);
+        let bad = ["Org.x", "x", "a..b", "-a.b", "a.b-", long.as_str()];
+        for id in bad {
+            let text = format!(
+                "[package]\nid = \"{id}\"\nname = \"n\"\nversion = \"0.1.0\"\napi = \"1\"\n"
+            );
+            let e = errs(&text);
+            assert!(has(&e, "package.id:"), "{id}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn bad_versions_are_rejected() {
+        for v in ["1.0", "1.0.x", "1.0.0.0"] {
+            let text = format!(
+                "[package]\nid = \"org.x\"\nname = \"n\"\nversion = \"{v}\"\napi = \"1\"\n"
+            );
+            let e = errs(&text);
+            assert!(has(&e, "package.version:"), "{v}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_api_is_rejected() {
+        let text = "[package]\nid = \"org.x\"\nname = \"n\"\nversion = \"0.1.0\"\napi = \"2\"\n";
+        let e = errs(text);
+        assert!(has(&e, "needs api 2, this ligase has 1"), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_keys_are_warnings() {
+        let text = format!(
+            "{PACKAGE}foo = 1\n[bogus]\nx = 2\n[permissions]\nfs = true\n[contributions.themes]\nid = \"t\"\n"
+        );
+        let m = ok(&text);
+        assert!(
+            has(&m.warnings, "unknown key: package.foo"),
+            "{:?}",
+            m.warnings
+        );
+        assert!(has(&m.warnings, "unknown key: bogus"), "{:?}", m.warnings);
+        assert!(
+            has(&m.warnings, "unknown key: permissions.fs"),
+            "{:?}",
+            m.warnings
+        );
+        assert!(
+            has(&m.warnings, "unknown key: contributions.themes"),
+            "{:?}",
+            m.warnings
+        );
+        assert_eq!(m.permissions, Permissions::default());
+    }
+
+    #[test]
+    fn wrong_types_are_errors() {
+        let text = format!(
+            "{PACKAGE}\n[permissions]\nnetwork = \"yes\"\n[[contributions.languages]]\nid = \"lean\"\nextensions = \"lean\"\n"
+        );
+        let e = errs(&text);
+        assert!(has(&e, "permissions.network: expected a bool"), "{e:?}");
+        assert!(
+            has(
+                &e,
+                "contributions.languages[0].extensions: expected an array"
+            ),
+            "{e:?}"
+        );
+
+        let text = "[package]\nid = \"org.x\"\nname = \"n\"\nversion = 1\napi = \"1\"\n";
+        let e = errs(text);
+        assert!(has(&e, "package.version: expected a string"), "{e:?}");
+    }
+
+    #[test]
+    fn bad_events_are_errors() {
+        let text = format!("{PACKAGE}\n[activation]\nevents = [\"open\", \"language:Lean\"]\n");
+        let e = errs(&text);
+        assert!(has(&e, "activation.events[0]: bad event"), "{e:?}");
+        assert!(has(&e, "activation.events[1]: bad event"), "{e:?}");
+    }
+
+    #[test]
+    fn too_many_languages_are_rejected() {
+        let mut text = String::from(PACKAGE);
+        for i in 0..101 {
+            text.push_str(&format!("\n[[contributions.languages]]\nid = \"l{i}\"\n"));
+        }
+        let e = errs(&text);
+        assert!(
+            has(&e, "contributions.languages: at most 100 entries"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_extensions_are_rejected() {
+        let exts: Vec<String> = (0..21).map(|i| format!("\"e{i}\"")).collect();
+        let text = format!(
+            "{PACKAGE}\n[[contributions.languages]]\nid = \"lean\"\nextensions = [{}]\n",
+            exts.join(", ")
+        );
+        let e = errs(&text);
+        assert!(
+            has(
+                &e,
+                "contributions.languages[0].extensions: at most 20 entries"
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_snippet_body_is_rejected() {
+        let text = format!(
+            "{PACKAGE}\n[[contributions.snippets]]\nlanguage = \"lean\"\nprefix = \"x\"\nbody = \"{}\"\n",
+            "x".repeat(4097)
+        );
+        let e = errs(&text);
+        assert!(
+            has(&e, "contributions.snippets[0].body: must be 1-4096 bytes"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn text_over_max_bytes_is_refused() {
+        let text = " ".repeat(MAX_BYTES + 1);
+        let e = errs(&text);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].contains("bytes"), "{e:?}");
+    }
+
+    #[test]
+    fn duplicate_language_ids_are_rejected() {
+        let text = format!(
+            "{PACKAGE}\n[[contributions.languages]]\nid = \"lean\"\n\n[[contributions.languages]]\nid = \"lean\"\n"
+        );
+        let e = errs(&text);
+        assert!(
+            has(&e, "contributions.languages[1].id: duplicate language"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_snippet_prefixes_are_rejected() {
+        let snippet =
+            "\n[[contributions.snippets]]\nlanguage = \"lean\"\nprefix = \"thm\"\nbody = \"b\"\n";
+        let text = format!("{PACKAGE}{snippet}{snippet}");
+        let e = errs(&text);
+        assert!(
+            has(&e, "contributions.snippets[1].prefix: duplicate prefix"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_toml_is_an_error() {
+        let e = errs("[package\nid =");
+        assert!(has(&e, "toml:"), "{e:?}");
+    }
+
+    #[test]
+    fn truncated_and_mutated_example_never_panics() {
+        for i in 0..=EXAMPLE.len() {
+            if let Some(prefix) = EXAMPLE.get(..i) {
+                let _ = parse(prefix);
+            }
+        }
+        for i in 0..EXAMPLE.len() {
+            if EXAMPLE.as_bytes()[i].is_ascii() {
+                let mut bytes = EXAMPLE.as_bytes().to_vec();
+                bytes[i] = b'"';
+                if let Ok(text) = String::from_utf8(bytes) {
+                    let _ = parse(&text);
+                }
+            }
+        }
+    }
+}

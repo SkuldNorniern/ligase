@@ -287,6 +287,21 @@ pub fn delete(path: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// shows a folder in the system's file manager. returns once it started,
+/// without waiting on it. runs on the worker.
+pub fn reveal(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map(drop)
+}
+
 pub fn scan(path: &Path) -> Result<Vec<(String, bool)>, String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {

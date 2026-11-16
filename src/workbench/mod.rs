@@ -144,7 +144,12 @@ impl Workbench {
                 }
             }
             Some(
-                Panel::Explorer | Panel::Search | Panel::Git | Panel::Terminal | Panel::Problems,
+                Panel::Explorer
+                | Panel::Search
+                | Panel::Git
+                | Panel::Extensions
+                | Panel::Terminal
+                | Panel::Problems,
             ) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
@@ -281,6 +286,7 @@ impl Workbench {
                     Panel::Explorer => "explorer".to_owned(),
                     Panel::Search => "search".to_owned(),
                     Panel::Git => "git".to_owned(),
+                    Panel::Extensions => "extensions".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Problems => "problems".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
@@ -338,6 +344,7 @@ impl Workbench {
         let side_name = |p: Panel| match p {
             Panel::Search => "search",
             Panel::Git => "git",
+            Panel::Extensions => "extensions",
             _ => "explorer",
         };
         let shown = self.side.shown.map_or("", side_name);
@@ -386,7 +393,7 @@ impl Workbench {
             .map(|name| {
                 let panel = match name.as_str() {
                     // side panels moved out of the dock; older files had them in it
-                    "explorer" | "search" | "git" => return None,
+                    "explorer" | "search" | "git" | "extensions" => return None,
                     "terminal" => Panel::Terminal,
                     "problems" => Panel::Problems,
                     "welcome" => Panel::Welcome,
@@ -403,6 +410,7 @@ impl Workbench {
             Some("explorer") => Some(Some(Panel::Explorer)),
             Some("search") => Some(Some(Panel::Search)),
             Some("git") => Some(Some(Panel::Git)),
+            Some("extensions") => Some(Some(Panel::Extensions)),
             Some("") => Some(None),
             _ => None,
         };
@@ -449,7 +457,12 @@ impl Workbench {
 /// the side bar's panels get their panes up front; they never sit in the
 /// dock, so nothing else makes them.
 fn side_panes(panels: &mut Panels) {
-    for panel in [Panel::Explorer, Panel::Search, Panel::Git] {
+    for panel in [
+        Panel::Explorer,
+        Panel::Search,
+        Panel::Git,
+        Panel::Extensions,
+    ] {
         panels.pane(panel);
     }
 }

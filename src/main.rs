@@ -8,6 +8,7 @@ mod context_menu;
 mod document;
 mod editor;
 mod explorer;
+mod extension;
 mod git;
 mod icons;
 mod jobs;

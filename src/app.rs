@@ -21,6 +21,7 @@ use crate::editor::cursor::Selection;
 use crate::editor::find::{self, Bar, Mode};
 use crate::editor::{self, CaretOp, FoldOp, LineOp, input};
 use crate::explorer::{self, Click, Explorer};
+use crate::extension::{self, Extensions};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
 use crate::lsp::{self, Lsp};
@@ -68,6 +69,8 @@ pub enum Id {
     Welcome,
     Rail,
     SideSplit,
+    ExtensionButton(u16),
+    ExtensionList,
     Settings,
     SettingsSearch,
     SettingsFile,
@@ -106,6 +109,7 @@ pub enum Command {
     ToggleSidebar,
     ToggleExplorer,
     ToggleSearch,
+    ToggleExtensions,
     ToggleTerminal,
     ToggleProblems,
     ToggleGit,
@@ -190,6 +194,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Terminal", Command::ToggleTerminal),
     ("Problems", Command::ToggleProblems),
     ("Source Control", Command::ToggleGit),
+    ("Extensions", Command::ToggleExtensions),
     ("Open Changes", Command::OpenChanges),
     ("Split Editor", Command::SplitEditor),
     ("Zoom In", Command::ZoomIn),
@@ -287,6 +292,8 @@ enum Done {
     Settings(Option<String>),
     /// the settings file to open, made with every key shown when missing.
     SettingsFile(Result<PathBuf, String>),
+    /// the extensions folder read: its packages, and notes on the scan.
+    Extensions(Vec<extension::Package>, Vec<String>),
     /// the settings sheet's changes went in; the file's text now.
     SettingsWrote(Result<String, String>),
     /// a file's text at HEAD; none when git doesn't track it.
@@ -350,6 +357,7 @@ pub struct App {
     /// replace all waiting on files to load: the query and what replaces it.
     waiting_replace: Vec<(DocumentId, String, String)>,
     sheet: settings::view::Sheet,
+    extensions: Extensions,
     /// sheet changes not yet written, and whether a write is out.
     settings_writes: Vec<(&'static str, Option<String>)>,
     settings_writing: bool,
@@ -453,6 +461,7 @@ impl App {
             waiting_edits: Vec::new(),
             waiting_replace: Vec::new(),
             sheet: settings::view::Sheet::default(),
+            extensions: Extensions::default(),
             settings_writes: Vec::new(),
             settings_writing: false,
             dark: true,
@@ -485,6 +494,7 @@ impl App {
             close_now: false,
         };
         app.scan_pending();
+        app.scan_extensions();
         if let Some(path) = settings::path() {
             app.jobs
                 .run(move || Done::Settings(std::fs::read_to_string(path).ok()));
@@ -1117,6 +1127,7 @@ impl App {
                 self.refresh_status();
             }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
+            Command::ToggleExtensions => self.bench.toggle(Panel::Extensions),
             Command::ToggleSearch => {
                 self.bench.toggle(Panel::Search);
                 if self.shows(Panel::Search) {
@@ -1607,6 +1618,35 @@ impl App {
         self.typed_at = Instant::now();
     }
 
+    /// extension snippets for `view`'s language, as completion items.
+    fn snippet_items(&self, view: ViewId) -> Vec<crate::lsp::complete::Item> {
+        use crate::lsp::complete::{Item, Kind, plain_snippet};
+        let Some(language) = self.docs.doc_of(view).and_then(|d| d.language) else {
+            return Vec::new();
+        };
+        self.extensions
+            .snippets(language)
+            .map(|s| {
+                let (insert, caret) = plain_snippet(&s.body);
+                let detail = if s.description.is_empty() {
+                    self.texts.tr("snippet").to_owned()
+                } else {
+                    s.description.clone()
+                };
+                Item {
+                    label: s.prefix.clone(),
+                    detail,
+                    kind: Kind::Snippet,
+                    filter: s.prefix.clone(),
+                    sort: s.prefix.clone(),
+                    insert,
+                    caret,
+                    start: None,
+                }
+            })
+            .collect()
+    }
+
     /// new completions from the server; shown when the caret is still on
     /// the word they were asked for.
     fn completed(
@@ -1615,6 +1655,7 @@ impl App {
         revision: Revision,
         mut items: Vec<crate::lsp::complete::Item>,
     ) {
+        items.extend(self.snippet_items(view));
         if items.is_empty()
             || self.complete_for != Some(view)
             || self.focus.or(self.last_editor) != Some(view)
@@ -2830,10 +2871,14 @@ impl App {
         if let Some(view) = self.lsp.take_again() {
             self.want_complete.get_or_insert(view);
         }
-        if let Some(view) = self.want_complete.take()
-            && self.lsp.complete(&self.docs, view)
-        {
+        if let Some(view) = self.want_complete.take() {
             self.complete_for = Some(view);
+            if !self.lsp.complete(&self.docs, view)
+                && let Some(revision) = self.docs.doc_of(view).map(|d| d.buffer.revision())
+            {
+                // no server: extension snippets alone
+                self.completed(view, revision, Vec::new());
+            }
         }
         while let Some(parsed) = self.syntax.take() {
             self.docs.coloured(parsed);
@@ -2976,6 +3021,7 @@ impl App {
                         }
                     }
                 }
+                Done::Extensions(packages, notes) => self.take_extensions(packages, notes),
                 Done::SettingsWrote(result) => {
                     self.settings_writing = false;
                     match result {
@@ -3061,6 +3107,7 @@ impl App {
             .map(|(id, panel)| {
                 let title = match panel {
                     Panel::Explorer => self.texts.tr("Explorer").to_owned(),
+                    Panel::Extensions => self.texts.tr("Extensions").to_owned(),
                     Panel::Search => self.texts.tr("Search").to_owned(),
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
                     Panel::Problems => {
@@ -3113,6 +3160,7 @@ impl App {
                         crate::icons::for_path(&doc.path, false, false)
                     }
                     Panel::Explorer => "folder",
+                    Panel::Extensions => "extensions",
                     Panel::Search => "search",
                     Panel::Git | Panel::Diff(_) => "source-control",
                     Panel::Terminal => "shell",
@@ -3163,6 +3211,7 @@ impl App {
             self.problems.gather(&self.docs);
         }
         let mut problem_picked = None;
+        let mut ext_asked = None;
         let mut scm_asked = None;
         let mut diff_asked: Option<(DocumentId, crate::git::diff::Ask)> = None;
         self.fill_symbols();
@@ -3209,6 +3258,7 @@ impl App {
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
+            let extensions = &mut self.extensions;
             let changes_known = self.changes_known;
             let (diffs, diff_shown) = (&self.diffs, &mut self.diff_shown);
             let mono = aurea::render::Font::new(editor::MONO, (zoom - 1.0).max(10.0));
@@ -3287,6 +3337,10 @@ impl App {
                 }
                 Some(Panel::Problems) => {
                     problem_picked = problems::show(ui, problems, &root, rect, texts)?;
+                    Ok(())
+                }
+                Some(Panel::Extensions) => {
+                    ext_asked = extension::view::show(ui, extensions, rect, texts)?;
                     Ok(())
                 }
                 Some(Panel::Diff(doc)) => {
@@ -3441,6 +3495,21 @@ impl App {
         if let Some(ask) = scm_asked {
             self.scm_ask(ask);
         }
+        match ext_asked {
+            Some(extension::view::Ask::Reload) => self.scan_extensions(),
+            Some(extension::view::Ask::OpenFolder) => {
+                if let Some(dir) = extension::folder() {
+                    self.jobs.run(move || {
+                        let opened = std::fs::create_dir_all(&dir)
+                            .and_then(|()| explorer::reveal(&dir))
+                            .err()
+                            .map(|e| format!("can't open the extensions folder: {e}"));
+                        Done::Note(opened)
+                    });
+                }
+            }
+            None => {}
+        }
         if let Some((doc, crate::git::diff::Ask::Open(line))) = diff_asked
             && let Some(path) = self.docs.doc(doc).map(|d| d.path.clone())
         {
@@ -3564,6 +3633,34 @@ impl App {
 }
 
 impl App {
+    /// reads the extensions folder again, on the worker.
+    fn scan_extensions(&mut self) {
+        let Some(dir) = extension::folder() else {
+            return;
+        };
+        self.jobs.run(move || {
+            let (packages, notes) = extension::scan(&dir);
+            Done::Extensions(packages, notes)
+        });
+    }
+
+    /// a scan came back: the packages go in and open files pick up the
+    /// file types they add.
+    fn take_extensions(&mut self, packages: Vec<extension::Package>, mut notes: Vec<String>) {
+        self.extensions.packages = packages;
+        let (associations, more) = self.extensions.associations();
+        notes.extend(more);
+        self.extensions.notes = notes;
+        self.docs.set_associations(associations);
+        let broken = self.extensions.broken();
+        if broken > 0 {
+            self.say(format!(
+                "{} {broken}",
+                self.texts.tr("extensions that could not load:")
+            ));
+        }
+    }
+
     /// sends the sheet's waiting changes to the file, one write at a time
     /// so none is lost between a read and a write.
     fn write_settings(&mut self) {
@@ -3615,6 +3712,13 @@ impl App {
                 Some(Panel::Git),
                 changes,
             ),
+            item(
+                "extensions",
+                "Extensions",
+                Command::ToggleExtensions,
+                Some(Panel::Extensions),
+                self.extensions.broken(),
+            ),
         ];
         let bottom = vec![
             item(
@@ -3645,6 +3749,7 @@ impl App {
         let title = match panel {
             Panel::Explorer => self.texts.tr("Explorer").to_owned(),
             Panel::Git => self.texts.tr("Source Control").to_owned(),
+            Panel::Extensions => self.texts.tr("Extensions").to_owned(),
             _ => self
                 .bench
                 .panels
@@ -3661,6 +3766,14 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             Panel::Git => self.branch.clone().unwrap_or_default(),
+            Panel::Extensions => {
+                let n = self.extensions.ready().count();
+                if n == 0 {
+                    String::new()
+                } else {
+                    format!("{n} {}", self.texts.tr("loaded"))
+                }
+            }
             _ => String::new(),
         };
         (title, about)

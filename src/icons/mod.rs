@@ -13,8 +13,12 @@ use aurea::ui::{Component, IconMark, Ui};
 use crate::app::Id;
 
 /// every icon by name, its svg text built in.
-const ICONS: [(&str, &str); 51] = [
+const ICONS: [(&str, &str); 52] = [
     ("branch", include_str!("../../assets/icons/branch.svg")),
+    (
+        "extensions",
+        include_str!("../../assets/icons/extensions.svg"),
+    ),
     ("files", include_str!("../../assets/icons/files.svg")),
     ("problems", include_str!("../../assets/icons/problems.svg")),
     ("settings", include_str!("../../assets/icons/settings.svg")),

@@ -12,6 +12,8 @@ pub enum Panel {
     Search,
     /// git: what changed, staging and commits.
     Git,
+    /// packages found in the extensions folder.
+    Extensions,
     Terminal,
     /// diagnostics of every open file.
     Problems,
@@ -30,7 +32,10 @@ impl Panel {
 
     /// panels that live in the side bar, one at a time, never in the dock.
     pub fn is_side(self) -> bool {
-        matches!(self, Panel::Explorer | Panel::Search | Panel::Git)
+        matches!(
+            self,
+            Panel::Explorer | Panel::Search | Panel::Git | Panel::Extensions
+        )
     }
 }
 
