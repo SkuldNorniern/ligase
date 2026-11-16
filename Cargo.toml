@@ -14,3 +14,4 @@ toml = "1"
 serde_json = "1"
 sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "727241883190bc01c5bfc626635a812d14d152fe" }
 sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "727241883190bc01c5bfc626635a812d14d152fe" }
+sylven-dsl = { git = "https://github.com/SkuldNorniern/sylven", rev = "727241883190bc01c5bfc626635a812d14d152fe" }

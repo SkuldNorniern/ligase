@@ -26,11 +26,26 @@ pub const FILE: &str = "extension.toml";
 pub struct Package {
     pub dir: PathBuf,
     pub state: State,
+    /// grammars read from the package, ready to register.
+    pub grammars: Vec<Grammar>,
+    /// what went wrong with parts of a package that still loaded.
+    pub problems: Vec<String>,
 }
+
+/// a sylven grammar a package brings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grammar {
+    /// the language id the spec declares.
+    pub name: String,
+    pub text: String,
+}
+
+/// largest grammar file read.
+pub const MAX_GRAMMAR: u64 = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
-    Ready(Manifest),
+    Ready(Box<Manifest>),
     /// why it could not be read.
     Broken(Vec<String>),
     /// a package read before this one has the same id; this one is off.
@@ -44,6 +59,8 @@ pub struct Extensions {
     /// said once per scan: unknown syntax names, packages past the cap.
     pub notes: Vec<String>,
     pub scroll: f32,
+    /// grammar names kept for the life of the app, one copy per name.
+    names: HashSet<&'static str>,
 }
 
 /// the extensions folder, when there is a config folder.
@@ -80,10 +97,64 @@ pub fn scan(root: &Path) -> (Vec<Package>, Vec<String>) {
                 State::Ready(m) if !seen.insert(m.id.clone()) => State::Duplicate(m.id),
                 state => state,
             };
-            Package { dir, state }
+            let mut grammars = Vec::new();
+            let mut problems = Vec::new();
+            if let State::Ready(m) = &state {
+                for file in &m.syntaxes {
+                    match grammar(&dir, file) {
+                        Ok(g) if grammars.iter().any(|o: &Grammar| o.name == g.name) => {
+                            problems.push(format!("{file}: {} is declared twice", g.name));
+                        }
+                        Ok(g) => grammars.push(g),
+                        Err(why) => problems.push(format!("{file}: {why}")),
+                    }
+                }
+            }
+            Package {
+                dir,
+                state,
+                grammars,
+                problems,
+            }
         })
         .collect();
     (packages, notes)
+}
+
+/// a grammar file from a package: read with a size cap, parsed under a
+/// guard so a spec that trips the parser only loses itself.
+fn grammar(dir: &Path, file: &str) -> Result<Grammar, String> {
+    let path = file
+        .split('/')
+        .fold(dir.to_path_buf(), |p, part| p.join(part));
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_GRAMMAR {
+        return Err(format!("over {} KiB", MAX_GRAMMAR / 1024));
+    }
+    let text = String::from_utf8(std::fs::read(&path).map_err(|e| e.to_string())?)
+        .map_err(|_| "not utf-8".to_owned())?;
+    let parsed = std::panic::catch_unwind(|| sylven_dsl::parse_spec(&text))
+        .map_err(|_| "the grammar parser gave up on it".to_owned())?;
+    let spec = parsed.map_err(|errors| {
+        let first = errors.first().map(|e| format!("{e:?}")).unwrap_or_default();
+        format!("{} grammar errors, first: {first}", errors.len())
+    })?;
+    let name = spec.language.id;
+    let name_ok = !name.is_empty()
+        && name.len() <= 40
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'+')
+        });
+    if !name_ok {
+        return Err(format!(
+            "language id {name:?} is not a plain lowercase name"
+        ));
+    }
+    if syntax::bundled(&name).is_some() {
+        return Err(format!("{name} is a bundled language; pick another id"));
+    }
+    Ok(Grammar { name, text })
 }
 
 /// one manifest, size checked before it is read.
@@ -104,7 +175,7 @@ fn read(path: &Path) -> State {
         Err(e) => return broken(format!("{FILE}: {e}")),
     };
     match manifest::parse(&text) {
-        Ok(m) => State::Ready(m),
+        Ok(m) => State::Ready(Box::new(m)),
         Err(errors) => State::Broken(errors),
     }
 }
@@ -112,7 +183,7 @@ fn read(path: &Path) -> State {
 impl Extensions {
     pub fn ready(&self) -> impl Iterator<Item = &Manifest> {
         self.packages.iter().filter_map(|p| match &p.state {
-            State::Ready(m) => Some(m),
+            State::Ready(m) => Some(m.as_ref()),
             _ => None,
         })
     }
@@ -141,17 +212,49 @@ impl Extensions {
             .count()
     }
 
+    /// a grammar name that lives as long as the app. each name is kept
+    /// once, so reading the packages again adds nothing.
+    fn intern(&mut self, name: &str) -> &'static str {
+        if let Some(kept) = self.names.get(name) {
+            return kept;
+        }
+        let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        self.names.insert(kept);
+        kept
+    }
+
+    /// every grammar the ready packages bring, first one per name.
+    pub fn grammars(&self) -> Vec<&Grammar> {
+        let mut out: Vec<&Grammar> = Vec::new();
+        for p in &self.packages {
+            if matches!(p.state, State::Ready(_)) {
+                for g in &p.grammars {
+                    if !out.iter().any(|o| o.name == g.name) {
+                        out.push(g);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// file types the ready packages add. a language borrows a bundled
     /// syntax by name; one that names none, or one not bundled, gets no
     /// colours yet and a note says so. the first package to claim an
     /// extension keeps it.
-    pub fn associations(&self) -> (Associations, Vec<String>) {
+    pub fn associations(&mut self) -> (Associations, Vec<String>) {
         let mut out = Associations::default();
         let mut notes = Vec::new();
+        let grammars: Vec<String> = self.grammars().iter().map(|g| g.name.clone()).collect();
+        let named: Vec<(String, Option<&'static str>)> = grammars
+            .iter()
+            .map(|n| (n.clone(), Some(self.intern(n))))
+            .collect();
         for m in self.ready() {
             for lang in &m.languages {
                 let Some(name) = &lang.syntax else { continue };
-                let Some(syntax) = syntax::bundled(name) else {
+                let package = named.iter().find(|(n, _)| n == name).and_then(|(_, s)| *s);
+                let Some(syntax) = syntax::bundled(name).or(package) else {
                     notes.push(format!("{}: no bundled syntax {name}", m.id));
                     continue;
                 };
@@ -234,6 +337,67 @@ body = "theorem $1 := by\n  $0"
     }
 
     #[test]
+    fn grammars_load_and_bad_ones_are_named() {
+        let root = std::env::temp_dir().join(format!("ligase-ext-gram-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let head =
+            "[package]\nid = \"org.example.g\"\nname = \"G\"\nversion = \"0.1.0\"\napi = \"1\"\n";
+        let files = "[[contributions.syntaxes]]\nfile = \"syntax/good.sylven\"\n\
+                     [[contributions.syntaxes]]\nfile = \"syntax/broken.sylven\"\n\
+                     [[contributions.syntaxes]]\nfile = \"syntax/rust.sylven\"\n\
+                     [[contributions.syntaxes]]\nfile = \"syntax/missing.sylven\"\n\
+                     [[contributions.languages]]\nid = \"good\"\nextensions = [\"good\"]\nsyntax = \"goodlang\"\n";
+        write(&root, "g", &format!("{head}{files}"));
+        let syntax = root.join("g").join("syntax");
+        std::fs::create_dir_all(&syntax).unwrap();
+        std::fs::write(
+            syntax.join("good.sylven"),
+            "language {\n  id \"goodlang\"\n  extensions [\".good\"]\n  comment.line \"--\"\n}\n\ntokens {\n  keyword [\"let\"]\n  ident /[a-z]+/\n}\n",
+        )
+        .unwrap();
+        std::fs::write(syntax.join("broken.sylven"), "language { id ").unwrap();
+        std::fs::write(syntax.join("rust.sylven"), "language {\n  id \"rust\"\n}\n").unwrap();
+        let (packages, _) = scan(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let p = &packages[0];
+        assert!(matches!(p.state, State::Ready(_)));
+        let names: Vec<&str> = p.grammars.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["goodlang"]);
+        assert_eq!(p.problems.len(), 3, "{:?}", p.problems);
+        assert!(p.problems.iter().any(|w| w.contains("bundled")));
+        let mut ext = Extensions {
+            packages,
+            ..Extensions::default()
+        };
+        let (assoc, notes) = ext.associations();
+        assert_eq!(assoc.extensions.get("good"), Some(&"goodlang"));
+        assert!(notes.is_empty(), "{notes:?}");
+        // a second read keeps one copy of the name
+        let (again, _) = ext.associations();
+        assert!(std::ptr::eq(
+            *assoc.extensions.get("good").unwrap(),
+            *again.extensions.get("good").unwrap()
+        ));
+    }
+
+    #[test]
+    fn grammar_paths_stay_in_the_package() {
+        let head =
+            "[package]\nid = \"org.example.g\"\nname = \"G\"\nversion = \"0.1.0\"\napi = \"1\"\n";
+        for bad in [
+            "../x.sylven",
+            "/abs.sylven",
+            "a//b.sylven",
+            "a/./b.sylven",
+            "x.toml",
+            "C:\\\\x.sylven",
+        ] {
+            let text = format!("{head}[[contributions.syntaxes]]\nfile = \"{bad}\"\n");
+            assert!(manifest::parse(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn big_manifest_is_not_read() {
         let root = std::env::temp_dir().join(format!("ligase-ext-big-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -246,10 +410,12 @@ body = "theorem $1 := by\n  $0"
     #[test]
     fn languages_borrow_syntax_and_snippets_follow() {
         let manifest = manifest::parse(LEAN).unwrap();
-        let ext = Extensions {
+        let mut ext = Extensions {
             packages: vec![Package {
                 dir: PathBuf::new(),
-                state: State::Ready(manifest),
+                state: State::Ready(Box::new(manifest)),
+                grammars: Vec::new(),
+                problems: Vec::new(),
             }],
             ..Extensions::default()
         };

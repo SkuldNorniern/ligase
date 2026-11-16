@@ -139,6 +139,17 @@ pub struct Documents {
 }
 
 impl Documents {
+    /// open files in `languages` get coloured again, after their grammar
+    /// changed.
+    pub fn recolour(&mut self, languages: &[&str]) {
+        for doc in self.docs.values_mut() {
+            if doc.language.is_some_and(|l| languages.contains(&l)) {
+                doc.spans.clear();
+                doc.asked = None;
+            }
+        }
+    }
+
     /// takes the file types extensions add now. open files whose language
     /// changes start their colours over.
     pub fn set_associations(&mut self, associations: syntax::Associations) {

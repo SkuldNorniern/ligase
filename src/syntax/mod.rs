@@ -171,6 +171,14 @@ struct Ask {
     text: TextSnapshot,
 }
 
+/// what the worker is sent.
+enum Msg {
+    Ask(Ask),
+    /// a grammar from a package, as sylven spec text. it replaces one
+    /// with the same language id.
+    Grammar(String),
+}
+
 pub struct Parsed {
     pub doc: DocumentId,
     pub revision: Revision,
@@ -191,14 +199,14 @@ pub struct Symbol {
 }
 
 pub struct Syntax {
-    to_worker: Option<Sender<Ask>>,
+    to_worker: Option<Sender<Msg>>,
     done: Receiver<Parsed>,
     canvas: Arc<Mutex<Option<CanvasId>>>,
 }
 
 impl Default for Syntax {
     fn default() -> Self {
-        let (to_worker, asks) = channel::<Ask>();
+        let (to_worker, asks) = channel::<Msg>();
         let (results, done) = channel();
         let canvas: Arc<Mutex<Option<CanvasId>>> = Arc::default();
         let wake = Arc::clone(&canvas);
@@ -208,10 +216,15 @@ impl Default for Syntax {
                 let mut engine = SyntaxEngine::new();
                 sylven_runtime::register_bundled(engine.registry_mut());
                 while let Ok(first) = asks.recv() {
-                    // keep only the newest ask per document
+                    // grammars go in first; keep only the newest ask per document
                     let mut newest: HashMap<DocumentId, Ask> = HashMap::new();
-                    for ask in std::iter::once(first).chain(asks.try_iter()) {
-                        newest.insert(ask.doc, ask);
+                    for msg in std::iter::once(first).chain(asks.try_iter()) {
+                        match msg {
+                            Msg::Ask(ask) => {
+                                newest.insert(ask.doc, ask);
+                            }
+                            Msg::Grammar(text) => add_grammar(&mut engine, &text),
+                        }
                     }
                     for ask in newest.into_values() {
                         let parsed = parse(&engine, ask);
@@ -243,17 +256,40 @@ impl Syntax {
     /// asks for colours of `text`. false when there is no worker.
     pub fn ask(&self, doc: DocumentId, language: &'static str, text: TextSnapshot) -> bool {
         self.to_worker.as_ref().is_some_and(|tx| {
-            tx.send(Ask {
+            tx.send(Msg::Ask(Ask {
                 doc,
                 language,
                 text,
-            })
+            }))
             .is_ok()
         })
     }
 
+    /// hands a package grammar to the worker. it was parsed once already
+    /// when the package was read.
+    pub fn add_grammar(&self, text: String) {
+        if let Some(tx) = &self.to_worker {
+            let _ = tx.send(Msg::Grammar(text));
+        }
+    }
+
     pub fn take(&self) -> Option<Parsed> {
         self.done.try_recv().ok()
+    }
+}
+
+/// registers a package grammar. a spec that trips the parser or the
+/// compiler is skipped; files in that language stay plain.
+fn add_grammar(engine: &mut SyntaxEngine, text: &str) {
+    let compiled = std::panic::catch_unwind(|| {
+        sylven_dsl::parse_spec(text)
+            .ok()
+            .map(|spec| sylven_runtime::compile(&spec))
+    });
+    if let Ok(Some(compiled)) = compiled {
+        engine
+            .registry_mut()
+            .register(Arc::new(sylven_runtime::RuntimePlugin::new(compiled)));
     }
 }
 

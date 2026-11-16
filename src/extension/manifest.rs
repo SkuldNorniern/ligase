@@ -30,6 +30,8 @@ const MAX_PREFIX: usize = 40;
 const MAX_BODY: usize = 4096;
 const MAX_SNIPPET_DESCRIPTION: usize = 120;
 const MAX_VIEWS: usize = 20;
+const MAX_SYNTAXES: usize = 10;
+const MAX_PATH: usize = 200;
 const MAX_VIEW_ID: usize = 64;
 const MAX_TITLE: usize = 40;
 
@@ -46,6 +48,8 @@ pub struct Manifest {
     pub languages: Vec<Language>,
     pub snippets: Vec<Snippet>,
     pub views: Vec<View>,
+    /// grammar files in the package, relative paths with `/`.
+    pub syntaxes: Vec<String>,
     /// things skipped but not fatal, e.g. unknown keys.
     pub warnings: Vec<String>,
 }
@@ -277,9 +281,32 @@ fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
     check_keys(
         table,
         "contributions",
-        &["languages", "snippets", "views"],
+        &["languages", "snippets", "views", "syntaxes"],
         report,
     );
+
+    if let Some(items) = list(table, "contributions", "syntaxes", MAX_SYNTAXES, report) {
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.syntaxes[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            check_keys(t, &path, &["file"], report);
+            let Some(file) = required_string(t, &path, "file", report) else {
+                continue;
+            };
+            if !package_path_ok(file) || !file.ends_with(".sylven") {
+                report.error(
+                    &join(&path, "file"),
+                    "must be a path inside the package ending in .sylven, parts of a-z A-Z 0-9 _ . - split by /",
+                );
+            } else if out.syntaxes.iter().any(|f| f == file) {
+                report.error(&join(&path, "file"), "listed twice");
+            } else {
+                out.syntaxes.push(file.to_owned());
+            }
+        }
+    }
 
     if let Some(items) = list(table, "contributions", "views", MAX_VIEWS, report) {
         for (i, item) in items.iter().enumerate() {
@@ -718,6 +745,20 @@ fn item_table<'a>(value: &'a Value, path: &str, report: &mut Report) -> Option<&
     }
 }
 
+/// a relative path that stays in the package: no root, no `..`, plain parts.
+fn package_path_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PATH
+        && s.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        })
+}
+
 fn word_byte(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'+' | b'-')
 }
@@ -847,6 +888,7 @@ description = "a theorem"
         let m = ok(EXAMPLE);
         let expected = Manifest {
             views: Vec::new(),
+            syntaxes: Vec::new(),
             id: "org.example.lean".into(),
             name: "Lean Support".into(),
             version: (0, 1, 0),

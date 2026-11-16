@@ -80,6 +80,13 @@ fn lines(p: &Package) -> Vec<(String, Tone)> {
             ));
         }
     }
+    if !p.grammars.is_empty() {
+        let names: Vec<&str> = p.grammars.iter().map(|g| g.name.as_str()).collect();
+        out.push((format!("grammars: {}", names.join(", ")), Tone::Dim));
+    }
+    for w in p.problems.iter().take(MAX_SHOWN) {
+        out.push((w.clone(), Tone::Bad));
+    }
     out
 }
 

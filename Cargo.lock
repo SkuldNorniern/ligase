@@ -281,6 +281,7 @@ dependencies = [
  "resolvase",
  "serde_json",
  "sylven",
+ "sylven-dsl",
  "sylven-runtime",
  "toml",
  "vanta",

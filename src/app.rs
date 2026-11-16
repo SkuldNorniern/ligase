@@ -3777,7 +3777,18 @@ impl App {
         let (associations, more) = self.extensions.associations();
         notes.extend(more);
         self.extensions.notes = notes;
+        let grammars: Vec<(String, String)> = self
+            .extensions
+            .grammars()
+            .iter()
+            .map(|g| (g.name.clone(), g.text.clone()))
+            .collect();
+        for (_, text) in &grammars {
+            self.syntax.add_grammar(text.clone());
+        }
         self.docs.set_associations(associations);
+        let names: Vec<&str> = grammars.iter().map(|(n, _)| n.as_str()).collect();
+        self.docs.recolour(&names);
         let broken = self.extensions.broken();
         if broken > 0 {
             self.say(format!(
