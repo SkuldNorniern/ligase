@@ -102,6 +102,14 @@ enum Pending {
     Complete(ViewId, Revision, crate::document::DocumentId),
 }
 
+/// how a language's server is doing, for the status bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerState {
+    Starting,
+    Running,
+    Missing,
+}
+
 #[derive(Default)]
 pub struct Lsp {
     servers: HashMap<&'static str, Slot>,
@@ -132,6 +140,15 @@ impl Lsp {
             }
         }
         out
+    }
+
+    /// the server of `language`, none when it has none or none was asked.
+    pub fn state(&self, language: &str) -> Option<ServerState> {
+        Some(match self.servers.get(language)? {
+            Slot::Starting => ServerState::Starting,
+            Slot::Running(..) => ServerState::Running,
+            Slot::Failed => ServerState::Missing,
+        })
     }
 
     /// the start job came back.

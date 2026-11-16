@@ -311,6 +311,8 @@ pub struct App {
     /// session file for this workspace; none when there is no config dir.
     session: Option<PathBuf>,
     status: String,
+    /// the message as last drawn, and since when; it goes after a while.
+    status_shown: (String, Instant),
     /// the editor view with the keyboard, from the last frame.
     focus: Option<ViewId>,
     /// the layout changed since it was last written.
@@ -368,6 +370,7 @@ impl App {
             canvas: None,
             session: workbench::session_path(root),
             status: String::new(),
+            status_shown: (String::new(), Instant::now()),
             focus: None,
             layout_dirty: false,
             restored: false,
@@ -2397,10 +2400,9 @@ impl App {
                     self.status = format!("{}: {why}", self.texts.tr("can't open the settings"));
                 }
                 Done::Server(language, result) => {
-                    if let Some(why) = self.lsp.started(language, result) {
-                        // a missing server is fine; the editor works without it
-                        self.status = format!("{}: {why}", self.texts.tr("no language server"));
-                    }
+                    // a missing server is fine; the editor works without it, and
+                    // the status bar says so beside the language
+                    let _ = self.lsp.started(language, result);
                 }
                 Done::Saved(result) => {
                     if let Err(why) = result {
@@ -2708,6 +2710,19 @@ impl App {
         if let (Some(wait), Some(canvas)) = (blink, self.canvas) {
             request_canvas_redraw_at(canvas, Instant::now() + wait);
         }
+        // a message stays a while, then the frame after takes it away
+        if self.status != self.status_shown.0 {
+            self.status_shown = (self.status.clone(), Instant::now());
+            if let (false, Some(canvas)) = (self.status.is_empty(), self.canvas) {
+                request_canvas_redraw_at(canvas, Instant::now() + STATUS_FOR);
+            }
+        } else if !self.status.is_empty() && self.status_shown.1.elapsed() >= STATUS_FOR {
+            self.status.clear();
+            self.status_shown.0.clear();
+            if let Some(canvas) = self.canvas {
+                request_canvas_redraw(canvas);
+            }
+        }
         if changed {
             self.layout_dirty = true;
         }
@@ -2784,7 +2799,16 @@ impl App {
             );
         let indent = format!("{} {}", self.texts.tr("Spaces:"), self.settings.tab_size);
         let eol = if doc.crlf { "CRLF" } else { "LF" };
-        let language = doc.language.unwrap_or("text");
+        let language = match doc.language {
+            Some(language) => match self.lsp.state(language) {
+                Some(lsp::ServerState::Missing) => {
+                    format!("{language} ({})", self.texts.tr("no language server"))
+                }
+                Some(lsp::ServerState::Starting) => format!("{language} …"),
+                _ => language.to_owned(),
+            },
+            None => "text".to_owned(),
+        };
         let about = format!("{at}    {indent}    UTF-8    {eol}    {language}");
         if errors + warnings == 0 {
             about
@@ -2828,6 +2852,9 @@ fn hint(ui: &mut Ui<'_, Id>, rect: Rect, text: &str) -> AureaResult<()> {
     let color = ui.theme.palette.dim;
     ui.text(text, rect, &font, color, Align::Center)
 }
+
+/// how long a status message stays.
+const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(8);
 
 fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> AureaResult<()> {
     let palette = ui.theme.palette;
