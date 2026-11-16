@@ -22,6 +22,8 @@ pub enum Ask {
     Open(PathBuf),
     Stage(Vec<String>),
     Unstage(Vec<String>),
+    /// throw away the working tree's edits, after asking.
+    Discard(Vec<String>),
     Commit,
 }
 
@@ -120,21 +122,21 @@ pub fn show(
                     }
                     let letter = if *staged { change.index } else { change.tree };
                     let letter = if letter == '?' { 'U' } else { letter };
-                    // the file's icon, its name, its folder, then on the right
-                    // the stage button (on hover) and git's letter
+                    // git's letter, the file's icon, its name and folder in the
+                    // middle, the buttons on the right
+                    let untracked = change.tree == '?';
+                    let can_discard = !*staged && !untracked;
+                    let buttons = if can_discard { 2.0 } else { 1.0 };
                     let inner = row.rect.inset_xy(8.0, 0.0);
-                    let (icon_at, rest) = inner.split_left(16.0, 6.0);
-                    let (rest, mark) = rest.split_right(14.0, 4.0);
-                    let (body, button_at) = if row.hovered {
-                        rest.split_right(22.0, 4.0)
-                    } else {
-                        (rest, Rect::new(rest.right(), rest.y, 0.0, 0.0))
-                    };
+                    let (mark, rest) = inner.split_left(14.0, 4.0);
+                    let (icon_at, rest) = rest.split_left(16.0, 6.0);
+                    // split_right gives the right part first
+                    let (button_at, body) = rest.split_right(buttons * 22.0, 4.0);
+                    let colour = letter_colour(ui, if untracked { '?' } else { letter });
+                    ui.text(&letter.to_string(), mark, &small, colour, Align::Center)?;
                     let icon_box = Rect::new(icon_at.x, icon_at.y + (ROW - 16.0) / 2.0, 16.0, 16.0);
                     let icon = icons::for_path(&change.path, false, false);
                     icons::draw(ui, icon, icon_box, palette.dim)?;
-                    let colour = letter_colour(ui, if change.tree == '?' { '?' } else { letter });
-                    ui.text(&letter.to_string(), mark, &small, colour, Align::Center)?;
                     let (dir, name) = match change.rel.rsplit_once('/') {
                         Some((dir, name)) => (dir, name),
                         None => ("", change.rel.as_str()),
@@ -149,25 +151,35 @@ pub fn show(
                         ui.fill(Rect::new(name_at.x, mid, name_w, 1.0), colour)?;
                     }
                     ui.text_clipped(dir, dir_at, &small, palette.dim, Align::Start)?;
-                    // stage or unstage, on the row the pointer is on
-                    if row.hovered {
-                        let at = Rect::new(button_at.x, row.rect.y + 1.0, 22.0, ROW - 2.0);
-                        let icon = icons::image(if *staged { "minus" } else { "plus" });
-                        let part = u16::try_from(row.index).unwrap_or(u16::MAX);
-                        let hit = Button::icon_only(icon).quiet().icon_size(14.0).show(
-                            ui,
-                            Id::ScmRow(part),
-                            at,
-                        )?;
+                    // discard (tracked edits only), then stage or unstage
+                    let part = u16::try_from(row.index * 2).unwrap_or(u16::MAX - 1);
+                    let mut x = button_at.x;
+                    if can_discard {
+                        let at = Rect::new(x, row.rect.y + 1.0, 22.0, ROW - 2.0);
+                        let hit = Button::icon_only(icons::image("discard"))
+                            .quiet()
+                            .icon_size(14.0)
+                            .show(ui, Id::ScmRow(part + 1), at)?;
                         if hit.clicked {
-                            let mut rels = vec![change.rel.clone()];
-                            rels.extend(change.old.clone());
-                            button_ask = Some(if *staged {
-                                Ask::Unstage(rels)
-                            } else {
-                                Ask::Stage(vec![change.rel.clone()])
-                            });
+                            button_ask = Some(Ask::Discard(vec![change.rel.clone()]));
                         }
+                        x += 22.0;
+                    }
+                    let at = Rect::new(x, row.rect.y + 1.0, 22.0, ROW - 2.0);
+                    let icon = icons::image(if *staged { "minus" } else { "plus" });
+                    let hit = Button::icon_only(icon).quiet().icon_size(14.0).show(
+                        ui,
+                        Id::ScmRow(part),
+                        at,
+                    )?;
+                    if hit.clicked {
+                        let mut rels = vec![change.rel.clone()];
+                        rels.extend(change.old.clone());
+                        button_ask = Some(if *staged {
+                            Ask::Unstage(rels)
+                        } else {
+                            Ask::Stage(vec![change.rel.clone()])
+                        });
                     }
                 }
             }

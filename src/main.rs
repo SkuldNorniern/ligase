@@ -181,7 +181,7 @@ fn show_dialog(
         let (name, folder) = match start {
             DialogStart::File(name, folder) => (name, folder),
             DialogStart::Message(title, text) | DialogStart::Confirm(title, text) => {
-                let buttons = if matches!(dialog, Dialog::ConfirmDelete) {
+                let buttons = if matches!(dialog, Dialog::ConfirmDelete | Dialog::ConfirmDiscard) {
                     MessageButtons::OkCancel
                 } else {
                     MessageButtons::SaveDiscardCancel
@@ -220,7 +220,7 @@ fn show_dialog(
                 .flatten()
                 .into_iter()
                 .collect(),
-            Dialog::Unsaved(_) | Dialog::ConfirmDelete => Vec::new(),
+            Dialog::Unsaved(_) | Dialog::ConfirmDelete | Dialog::ConfirmDiscard => Vec::new(),
         };
         if let Ok(mut a) = app.try_borrow_mut() {
             a.dialog_done(dialog, picked);

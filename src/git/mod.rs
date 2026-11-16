@@ -176,6 +176,13 @@ pub fn unstage(top: &Path, rels: &[String]) -> Result<(), String> {
     run(top, &args).map(drop)
 }
 
+/// puts `rels` in the working tree back to what the index has, edits gone.
+pub fn discard(top: &Path, rels: &[String]) -> Result<(), String> {
+    let mut args = vec!["restore", "--worktree", "--"];
+    args.extend(rels.iter().map(String::as_str));
+    run(top, &args).map(drop)
+}
+
 /// commits what is staged with `message`.
 pub fn commit(top: &Path, message: &str) -> Result<(), String> {
     run(top, &["commit", "--quiet", "-m", message]).map(drop)

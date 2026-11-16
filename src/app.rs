@@ -185,6 +185,8 @@ pub enum Dialog {
     Unsaved(Option<PaneId>),
     /// delete the file or folder in `App::delete_path`?
     ConfirmDelete,
+    /// throw away the edits in `App::discard_rels`?
+    ConfirmDiscard,
 }
 
 /// how a dialog starts out.
@@ -354,6 +356,8 @@ pub struct App {
     open_after: Option<(PathBuf, Option<usize>)>,
     /// a folder to open once this window has closed.
     reopen: Option<PathBuf>,
+    /// files whose working tree edits wait on `Dialog::ConfirmDiscard`.
+    discard_rels: Vec<String>,
     /// the new window's: no folder of its own.
     blank: bool,
     /// other folders opened before, newest first.
@@ -422,6 +426,7 @@ impl App {
             restored: false,
             open_after: None,
             reopen: None,
+            discard_rels: Vec::new(),
             blank,
             recent: Vec::new(),
             closing: false,
@@ -1650,6 +1655,15 @@ impl App {
                 let up = self.root().parent().unwrap_or(self.root());
                 DialogStart::File(String::new(), up.to_path_buf())
             }
+            Dialog::ConfirmDiscard => {
+                let title = self.texts.tr("Discard changes").to_owned();
+                let text = format!(
+                    "{}\n\n{}",
+                    self.texts.tr("the edits in these files are lost for good:"),
+                    self.discard_rels.join("\n")
+                );
+                DialogStart::Confirm(title, text)
+            }
             Dialog::ConfirmDelete => {
                 let name = self
                     .delete_path
@@ -1702,6 +1716,17 @@ impl App {
     /// the answer to a save / discard / cancel box.
     pub fn answered(&mut self, dialog: Dialog, choice: aurea::dialog::MessageChoice) {
         use aurea::dialog::MessageChoice;
+        if dialog == Dialog::ConfirmDiscard {
+            let rels = std::mem::take(&mut self.discard_rels);
+            if choice == MessageChoice::Ok
+                && !rels.is_empty()
+                && let Some(top) = self.changes.as_ref().map(|s| s.top.clone())
+            {
+                self.jobs
+                    .run(move || Done::GitDid(crate::git::discard(&top, &rels).map(|()| false)));
+            }
+            return;
+        }
         if dialog == Dialog::ConfirmDelete {
             if let (MessageChoice::Ok, Some(path)) = (choice, self.delete_path.take()) {
                 let rescan = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -2215,7 +2240,7 @@ impl App {
     pub fn dialog_done(&mut self, dialog: Dialog, picked: Vec<PathBuf>) {
         match dialog {
             // answered through `answered`
-            Dialog::Unsaved(_) | Dialog::ConfirmDelete => {}
+            Dialog::Unsaved(_) | Dialog::ConfirmDelete | Dialog::ConfirmDiscard => {}
             Dialog::Open => {
                 for path in picked {
                     let view = self.open_file(&path);
@@ -2358,6 +2383,10 @@ impl App {
             Ask::Stage(rels) => {
                 self.jobs
                     .run(move || Done::GitDid(crate::git::stage(&top, &rels).map(|()| false)));
+            }
+            Ask::Discard(rels) => {
+                self.discard_rels = rels;
+                self.dialog = Some(Dialog::ConfirmDiscard);
             }
             Ask::Unstage(rels) => {
                 self.jobs
