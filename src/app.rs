@@ -247,6 +247,10 @@ enum Done {
     Settings(Option<String>),
     /// the settings file to open, made with every key shown when missing.
     SettingsFile(Result<PathBuf, String>),
+    /// a file's text at HEAD; none when git doesn't track it.
+    GitBase(DocumentId, Option<std::sync::Arc<str>>),
+    GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
+    Branch(Option<String>),
 }
 
 pub struct App {
@@ -312,6 +316,8 @@ pub struct App {
     /// session file for this workspace; none when there is no config dir.
     session: Option<PathBuf>,
     status: String,
+    /// the branch the workspace folder is on, for the status bar.
+    branch: Option<String>,
     /// the message as last drawn, and since when; it goes after a while.
     status_shown: (String, Instant),
     /// the editor view with the keyboard, from the last frame.
@@ -371,6 +377,7 @@ impl App {
             canvas: None,
             session: workbench::session_path(root),
             status: String::new(),
+            branch: None,
             status_shown: (String::new(), Instant::now()),
             focus: None,
             layout_dirty: false,
@@ -397,6 +404,10 @@ impl App {
         self.jobs.set_canvas(id);
         self.syntax.set_canvas(id);
         self.canvas = Some(id);
+        // the branch, now that its answer has a canvas to wake
+        let root = self.explorer.root().to_path_buf();
+        self.jobs
+            .run(move || Done::Branch(crate::git::branch(&root)));
     }
 
     pub fn busy(&self) -> bool {
@@ -421,6 +432,7 @@ impl App {
         if matches!(event, WindowEvent::Focused) {
             // back from another program: files may have changed under us
             self.check_disk();
+            self.refresh_git();
         }
         if matches!(event, WindowEvent::Unfocused) && self.settings.save_on_focus_loss {
             for view in self.docs.dirty_views() {
@@ -2152,6 +2164,41 @@ impl App {
     }
 
     /// stats every open file on the worker to see what changed outside.
+    /// asks git for `doc`'s text at HEAD, so its changed lines can be marked.
+    fn ask_git_base(&mut self, doc: DocumentId) {
+        let Some(path) = self
+            .docs
+            .doc(doc)
+            .filter(|d| !d.untitled)
+            .map(|d| d.path.clone())
+        else {
+            return;
+        };
+        self.jobs
+            .run(move || Done::GitBase(doc, crate::git::base(&path)));
+    }
+
+    /// asks again for every file's HEAD and the branch: a commit or a
+    /// checkout outside changes both.
+    fn refresh_git(&mut self) {
+        for (doc, _) in self.docs.files() {
+            self.ask_git_base(doc);
+        }
+        let root = self.explorer.root().to_path_buf();
+        self.jobs
+            .run(move || Done::Branch(crate::git::branch(&root)));
+    }
+
+    /// sends a diff off for each file whose text moved on.
+    fn ask_git_hunks(&mut self) {
+        for (doc, revision, text, base) in self.docs.git_wanted() {
+            self.jobs.run(move || {
+                let now = text.slice(0..text.len()).unwrap_or_default();
+                Done::GitHunks(doc, revision, crate::git::hunks(&base, &now))
+            });
+        }
+    }
+
     fn check_disk(&mut self) {
         let files = self.docs.on_disk();
         if files.is_empty() {
@@ -2248,6 +2295,7 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        self.ask_git_hunks();
         for event in self.lsp.poll() {
             match event {
                 lsp::Event::Diagnostics(doc, revision, diags) => {
@@ -2303,6 +2351,7 @@ impl App {
                 Done::Loaded(doc, result, disk) => {
                     self.docs.loaded(doc, result);
                     self.docs.set_disk(doc, disk);
+                    self.ask_git_base(doc);
                     let waiting: Vec<_> = self
                         .waiting_edits
                         .iter()
@@ -2379,6 +2428,11 @@ impl App {
                 Done::Files(files) => self.palette.set_files(files),
                 Done::FileOp(Ok(done)) => self.file_done(done),
                 Done::FileOp(Err(why)) => self.status = why,
+                Done::GitBase(doc, base) => self.docs.set_git_base(doc, base),
+                Done::GitHunks(doc, revision, hunks) => {
+                    self.docs.set_git_hunks(doc, revision, hunks);
+                }
+                Done::Branch(branch) => self.branch = branch,
                 Done::Note(note) => {
                     if let Some(note) = note {
                         self.status = note;
@@ -2665,7 +2719,7 @@ impl App {
             }
             menu_act = self.menu.show(&mut ui, texts, &self.keymap);
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
-            status_bar(&mut ui, status, &message, &place)?;
+            status_bar(&mut ui, status, self.branch.as_deref(), &message, &place)?;
         }
         self.focus = focus;
         if focus.is_some() {
@@ -2927,12 +2981,25 @@ fn welcome(
 /// how long a status message stays.
 const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(8);
 
-fn status_bar(ui: &mut Ui<'_, Id>, rect: Rect, message: &str, place: &str) -> AureaResult<()> {
+fn status_bar(
+    ui: &mut Ui<'_, Id>,
+    rect: Rect,
+    branch: Option<&str>,
+    message: &str,
+    place: &str,
+) -> AureaResult<()> {
     let palette = ui.theme.palette;
     ui.fill(rect, palette.surface)?;
     ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
     let font = ui.theme.font(12.0);
-    let inner = rect.inset_xy(10.0, 0.0);
+    let mut inner = rect.inset_xy(10.0, 0.0);
+    // the branch first, the way vs code and zed start theirs
+    if let Some(branch) = branch {
+        let wanted = ui.text_width(branch, &font) + 16.0;
+        let (left, rest) = inner.split_left(wanted.min(inner.width * 0.3), 8.0);
+        ui.text_clipped(branch, left, &font, palette.text, Align::Start)?;
+        inner = rest;
+    }
     // the file's facts take what they need, the message the rest
     let wanted = ui.text_width(place, &font) + 8.0;
     let (right, left) = inner.split_right(wanted.min(inner.width * 0.6), 8.0);

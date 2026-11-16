@@ -57,6 +57,8 @@ pub struct Document {
     pub overwrite: Option<Option<Stamp>>,
     /// made with new file and never saved: `path` is only a name.
     pub untitled: bool,
+    /// the file at HEAD and the lines changed since.
+    pub git: crate::git::State,
 }
 
 /// what a file on disk looked like, to notice outside changes.
@@ -163,6 +165,7 @@ impl Documents {
                 conflict: false,
                 overwrite: None,
                 untitled: false,
+                git: crate::git::State::default(),
             },
         );
         (id, true)
@@ -403,6 +406,65 @@ impl Documents {
     }
 
     /// every open document.
+    /// loaded files that have a path, to ask git about.
+    pub fn files(&self) -> Vec<(DocumentId, PathBuf)> {
+        self.docs
+            .iter()
+            .filter(|(_, d)| d.load == Load::Ready && !d.untitled)
+            .map(|(id, d)| (*id, d.path.clone()))
+            .collect()
+    }
+
+    /// the file at HEAD came back; the diff is asked again.
+    pub fn set_git_base(&mut self, id: DocumentId, base: Option<std::sync::Arc<str>>) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            if base.is_none() {
+                doc.git.hunks.clear();
+            }
+            doc.git.base = base;
+            doc.git.asked = None;
+        }
+    }
+
+    /// documents whose text moved past their last diff, with what the worker
+    /// needs. one diff out per document at a time.
+    pub fn git_wanted(&mut self) -> Vec<(DocumentId, Revision, TextSnapshot, std::sync::Arc<str>)> {
+        let mut out = Vec::new();
+        for (id, doc) in &mut self.docs {
+            let revision = doc.buffer.revision();
+            let Some(base) = &doc.git.base else {
+                continue;
+            };
+            if doc.git.pending || doc.git.asked == Some(revision) {
+                continue;
+            }
+            doc.git.asked = Some(revision);
+            doc.git.pending = true;
+            out.push((
+                *id,
+                revision,
+                doc.buffer.snapshot(),
+                std::sync::Arc::clone(base),
+            ));
+        }
+        out
+    }
+
+    /// a diff came back; kept only while the text is still that revision.
+    pub fn set_git_hunks(
+        &mut self,
+        id: DocumentId,
+        revision: Revision,
+        hunks: Vec<crate::git::Hunk>,
+    ) {
+        if let Some(doc) = self.docs.get_mut(&id) {
+            doc.git.pending = false;
+            if doc.buffer.revision() == revision {
+                doc.git.hunks = hunks;
+            }
+        }
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &Document> {
         self.docs.values()
     }

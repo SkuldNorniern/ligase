@@ -8,6 +8,7 @@ mod context_menu;
 mod document;
 mod editor;
 mod explorer;
+mod git;
 mod jobs;
 mod lang;
 mod lsp;

@@ -1386,6 +1386,26 @@ pub fn show(
                 }
             }
             let small = ui.theme.font(11.0);
+            // lines changed since HEAD: a bar by the text, a wedge where lines went
+            for (i, (line, _, _, _)) in visible.iter().enumerate() {
+                let y = row_y(i);
+                let x = content.x + gutter - 3.0;
+                for hunk in &doc.git.hunks {
+                    let colour = match hunk.kind {
+                        crate::git::Kind::Added => palette.success,
+                        crate::git::Kind::Modified => palette.accent,
+                        crate::git::Kind::Deleted => palette.danger,
+                    };
+                    if hunk.lines.contains(line) {
+                        ui.fill(Rect::new(x, y, 3.0, line_h), colour.fade(0.8))?;
+                    } else if hunk.kind == crate::git::Kind::Deleted
+                        && hunk.lines.start == *line
+                        && visible[i].2
+                    {
+                        ui.fill(Rect::new(x - 1.0, y - 1.0, 5.0, 3.0), colour)?;
+                    }
+                }
+            }
             for (i, (line, _, first_piece, _)) in visible.iter().enumerate() {
                 let (line, first_piece) = (*line, *first_piece);
                 // a wrapped line's number goes on its first row only
