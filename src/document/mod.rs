@@ -203,6 +203,8 @@ impl Documents {
                 doc.language = syntax::language_for(&doc.path);
                 doc.spans.clear();
                 doc.asked = None;
+                // a new path has its own HEAD, asked again on the next save
+                doc.git = crate::git::State::default();
             }
         }
     }
@@ -227,6 +229,7 @@ impl Documents {
             doc.overwrite = None;
             doc.spans.clear();
             doc.asked = None;
+            doc.git = crate::git::State::default();
         }
     }
 
@@ -415,9 +418,10 @@ impl Documents {
             .collect()
     }
 
-    /// the file at HEAD came back; the diff is asked again.
-    pub fn set_git_base(&mut self, id: DocumentId, base: Option<std::sync::Arc<str>>) {
-        if let Some(doc) = self.docs.get_mut(&id) {
+    /// the file at HEAD came back for `path`; the diff is asked again. an
+    /// answer for a path the document no longer has is dropped.
+    pub fn set_git_base(&mut self, id: DocumentId, path: &Path, base: Option<std::sync::Arc<str>>) {
+        if let Some(doc) = self.docs.get_mut(&id).filter(|d| d.path == path) {
             if base.is_none() {
                 doc.git.hunks.clear();
             }
@@ -459,7 +463,7 @@ impl Documents {
     ) {
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.git.pending = false;
-            if doc.buffer.revision() == revision {
+            if doc.buffer.revision() == revision && doc.git.base.is_some() {
                 doc.git.hunks = hunks;
             }
         }

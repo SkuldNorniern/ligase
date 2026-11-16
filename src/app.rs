@@ -248,7 +248,7 @@ enum Done {
     /// the settings file to open, made with every key shown when missing.
     SettingsFile(Result<PathBuf, String>),
     /// a file's text at HEAD; none when git doesn't track it.
-    GitBase(DocumentId, Option<std::sync::Arc<str>>),
+    GitBase(DocumentId, PathBuf, Option<std::sync::Arc<str>>),
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
     Branch(Option<String>),
 }
@@ -2209,8 +2209,10 @@ impl App {
         else {
             return;
         };
-        self.jobs
-            .run(move || Done::GitBase(doc, crate::git::base(&path)));
+        self.jobs.run(move || {
+            let base = crate::git::base(&path);
+            Done::GitBase(doc, path, base)
+        });
     }
 
     /// asks again for every file's HEAD and the branch: a commit or a
@@ -2455,6 +2457,8 @@ impl App {
                         self.docs.set_disk(doc, disk);
                         self.say(format!("{} {name}", self.texts.tr("saved")));
                         self.settings_saved(doc);
+                        // save as or a first save may have put it in a repository
+                        self.ask_git_base(doc);
                         self.after_save(doc, true);
                     }
                     Err(why) => {
@@ -2467,7 +2471,7 @@ impl App {
                 Done::Files(files) => self.palette.set_files(files),
                 Done::FileOp(Ok(done)) => self.file_done(done),
                 Done::FileOp(Err(why)) => self.say(why),
-                Done::GitBase(doc, base) => self.docs.set_git_base(doc, base),
+                Done::GitBase(doc, path, base) => self.docs.set_git_base(doc, &path, base),
                 Done::GitHunks(doc, revision, hunks) => {
                     self.docs.set_git_hunks(doc, revision, hunks);
                 }

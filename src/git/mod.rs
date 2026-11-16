@@ -14,7 +14,7 @@ use resolvase::Revision;
 /// files past this get no change marks.
 const MAX_BASE: usize = 8 * 1024 * 1024;
 /// edits past this many in one diff mark the whole changed middle instead.
-const MAX_EDITS: usize = 2000;
+const MAX_EDITS: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

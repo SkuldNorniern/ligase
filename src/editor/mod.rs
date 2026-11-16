@@ -1392,10 +1392,16 @@ pub fn show(
             }
             let small = ui.theme.font(11.0);
             // lines changed since HEAD: a bar by the text, a wedge where lines went
-            for (i, (line, _, _, _)) in visible.iter().enumerate() {
+            // hunks are in line order: only the ones from the top line on are looked at
+            let hunks = &doc.git.hunks;
+            let from = hunks.partition_point(|h| h.lines.end < first_line);
+            let x = content.x + gutter - 3.0;
+            for (i, (line, _, first_piece, last_piece)) in visible.iter().enumerate() {
                 let y = row_y(i);
-                let x = content.x + gutter - 3.0;
-                for hunk in &doc.git.hunks {
+                for hunk in hunks[from..]
+                    .iter()
+                    .take_while(|h| h.lines.start <= *line + 1)
+                {
                     let colour = match hunk.kind {
                         crate::git::Kind::Added => palette.success,
                         crate::git::Kind::Modified => palette.accent,
@@ -1403,11 +1409,13 @@ pub fn show(
                     };
                     if hunk.lines.contains(line) {
                         ui.fill(Rect::new(x, y, 3.0, line_h), colour.fade(0.8))?;
-                    } else if hunk.kind == crate::git::Kind::Deleted
-                        && hunk.lines.start == *line
-                        && visible[i].2
-                    {
-                        ui.fill(Rect::new(x - 1.0, y - 1.0, 5.0, 3.0), colour)?;
+                    } else if hunk.kind == crate::git::Kind::Deleted {
+                        // lines went above this one, or past the last line
+                        if hunk.lines.start == *line && *first_piece {
+                            ui.fill(Rect::new(x - 1.0, y - 1.0, 5.0, 3.0), colour)?;
+                        } else if hunk.lines.start == lines && *line + 1 == lines && *last_piece {
+                            ui.fill(Rect::new(x - 1.0, y + line_h - 2.0, 5.0, 3.0), colour)?;
+                        }
                     }
                 }
             }
