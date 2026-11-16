@@ -50,13 +50,21 @@ fn main() -> ExitCode {
 }
 
 fn run() -> AureaResult<()> {
-    let root = std::env::args_os()
+    let arg = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let root = std::path::absolute(&root).unwrap_or(root);
+    let arg = std::path::absolute(&arg).unwrap_or(arg);
+    // a file opens in its folder, like `code file.rs`
+    let (root, file) = match arg.parent() {
+        Some(dir) if arg.is_file() => (dir.to_path_buf(), Some(arg.clone())),
+        _ => (arg, None),
+    };
     let app = Rc::new(RefCell::new(App::new(&root, Lang::detect(None))));
+    if let Some(file) = file {
+        app.borrow_mut().open_at_start(file);
+    }
     let title = app.borrow().title();
     let mut window = Window::new(&title, WIDTH.cast_signed(), HEIGHT.cast_signed())?;
     window.set_min_size(640, 400)?;

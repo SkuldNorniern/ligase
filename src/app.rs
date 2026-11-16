@@ -326,6 +326,8 @@ pub struct App {
     layout_dirty: bool,
     /// the saved session came back, or there was none.
     restored: bool,
+    /// a file named on the command line, opened once the layout is back.
+    open_after: Option<PathBuf>,
     /// a save is out and the window closes once it is back.
     closing: bool,
     /// the window should close now; main does it.
@@ -382,6 +384,7 @@ impl App {
             focus: None,
             layout_dirty: false,
             restored: false,
+            open_after: None,
             closing: false,
             close_now: false,
         };
@@ -398,6 +401,16 @@ impl App {
             None => app.restored = true,
         }
         app
+    }
+
+    /// opens `path` in an editor, after the saved layout when one is still
+    /// being read, so the layout isn't thrown away for it.
+    pub fn open_at_start(&mut self, path: PathBuf) {
+        if self.restored {
+            self.open_file(&path);
+        } else {
+            self.open_after = Some(path);
+        }
     }
 
     pub fn set_canvas(&mut self, id: CanvasId) {
@@ -2409,7 +2422,12 @@ impl App {
                             .tr("changed on disk, save again to write over it")
                     );
                 }
-                Done::Session(text) => self.restore(text),
+                Done::Session(text) => {
+                    self.restore(text);
+                    if let Some(path) = self.open_after.take() {
+                        self.open_file(&path);
+                    }
+                }
                 Done::Wrote(doc, name, point, result) => match result {
                     Ok(disk) => {
                         self.docs.saved(doc, point);
