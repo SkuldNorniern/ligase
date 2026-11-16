@@ -350,6 +350,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut view, "Fold All", Command::Fold(FoldOp::FoldAll))?;
     add(&mut view, "Unfold All", Command::Fold(FoldOp::UnfoldAll))?;
     view.add_separator()?;
+    add(&mut view, "Side Bar", Command::ToggleSidebar)?;
     let explorer = add(&mut view, "Explorer", Command::ToggleExplorer)?;
     add(&mut view, "Find in Files", Command::FindInFiles)?;
     let terminal = add(&mut view, "Terminal", Command::ToggleTerminal)?;

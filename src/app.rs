@@ -9,7 +9,7 @@ use std::time::Instant;
 use aurea::render::{
     CanvasId, DrawingContext, Rect, request_canvas_redraw, request_canvas_redraw_at,
 };
-use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Sense, Theme, Ui, UiState};
+use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Sense, Splitter, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, CursorIcon, KeyCode, Keymap, WindowEvent};
 
 use resolvase::{Encoding, Point, Revision, SavePoint};
@@ -31,7 +31,7 @@ use crate::settings::{self, Settings, ThemeChoice};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
-use crate::workbench::{self, Refused, Workbench};
+use crate::workbench::{self, Refused, Workbench, rail};
 
 /// tabs a rename may open for files that weren't open.
 const MAX_OPENED_BY_EDIT: usize = 50;
@@ -66,6 +66,8 @@ pub enum Id {
     Status,
     Menu,
     Welcome,
+    Rail,
+    SideSplit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +94,10 @@ pub enum Command {
     References,
     Complete,
     FindInFiles,
+    /// the side bar in or out, with the panel it last showed.
+    ToggleSidebar,
     ToggleExplorer,
+    ToggleSearch,
     ToggleTerminal,
     ToggleProblems,
     ToggleGit,
@@ -169,7 +174,9 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Format Document", Command::Format),
     ("Find References", Command::References),
     ("Complete", Command::Complete),
+    ("Side Bar", Command::ToggleSidebar),
     ("Explorer", Command::ToggleExplorer),
+    ("Search", Command::ToggleSearch),
     ("Terminal", Command::ToggleTerminal),
     ("Problems", Command::ToggleProblems),
     ("Source Control", Command::ToggleGit),
@@ -464,11 +471,7 @@ impl App {
         }
         if blank {
             app.session = None;
-            for panel in [Panel::Explorer, Panel::Search] {
-                if app.shows(panel) {
-                    app.bench.toggle(panel);
-                }
-            }
+            app.bench.side.shown = None;
         }
         match app.session.clone() {
             Some(path) => {
@@ -685,7 +688,10 @@ impl App {
         match self.keymap.resolve(event, false) {
             Some(
                 command @ (Command::ToggleTerminal
+                | Command::ToggleSidebar
                 | Command::ToggleExplorer
+                | Command::ToggleSearch
+                | Command::ToggleGit
                 | Command::FindInFiles
                 | Command::ResetLayout),
             ) => {
@@ -1045,7 +1051,17 @@ impl App {
                 }
                 return;
             }
+            Command::ToggleSidebar => {
+                self.bench.toggle_side();
+                self.refresh_status();
+            }
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
+            Command::ToggleSearch => {
+                self.bench.toggle(Panel::Search);
+                if self.shows(Panel::Search) {
+                    self.ui.focus(Id::SearchField, 0);
+                }
+            }
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ToggleProblems => self.bench.toggle(Panel::Problems),
             Command::OpenChanges => {
@@ -2200,10 +2216,7 @@ impl App {
 
     /// is a panel in the dock now; for menu ticks.
     pub fn shows(&self, panel: Panel) -> bool {
-        self.bench
-            .panels
-            .find(panel)
-            .is_some_and(|id| self.bench.dock.tree.contains(id))
+        self.bench.shows(panel)
     }
 
     fn request_close(&mut self) {
@@ -2417,9 +2430,10 @@ impl App {
             .run(move || Done::Branch(crate::git::branch(&root)));
     }
 
-    /// asks git what changed in the repository, for the source control panel.
+    /// asks git what changed in the repository, for the source control
+    /// panel and the count on its rail button.
     fn refresh_status(&mut self) {
-        if !self.shows(Panel::Git) {
+        if !self.shows(Panel::Git) && self.branch.is_none() {
             return;
         }
         let root = self.explorer.root().to_path_buf();
@@ -3106,8 +3120,13 @@ impl App {
         let keymap = &self.keymap;
         let recent = &self.recent;
         let mut recent_pick: Option<PathBuf> = None;
+        let rail_items = self.rail_items();
+        let side_head = self.side_head(&titles);
+        let rail_pick;
+        let mut side_held = false;
+        let mut side_moved = false;
         {
-            let Workbench { dock, panels } = &mut self.bench;
+            let Workbench { dock, panels, side } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
             let shell = &mut self.shell;
             let hover = &self.hover;
@@ -3121,7 +3140,8 @@ impl App {
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
-            let content = |ui: &mut Ui<'_, Id>, pane: PaneId, rect: Rect| match panels.get(pane) {
+            let mut content = |ui: &mut Ui<'_, Id>, pane: PaneId, rect: Rect| match panels.get(pane)
+            {
                 Some(Panel::Explorer) => {
                     let shown = explorer::view::show(ui, explorer, rect, active_file.as_deref())?;
                     clicks.extend(shown.click);
@@ -3237,7 +3257,30 @@ impl App {
                     Ok(())
                 }
             };
-            let response = DockView::new(dock, title, content)
+            let (rail_at, work) = main.split_left(workbench::rail::WIDTH, 0.0);
+            rail_pick = workbench::rail::show(
+                &mut ui,
+                rail_at,
+                (&rail_items.0, &rail_items.1),
+                texts,
+                keymap,
+            )?;
+            let mut dock_at = work;
+            if let Some(pane) = side.shown.and_then(|p| panels.find(p)) {
+                let (side_at, rest, split) = Splitter::new(&mut side.width)
+                    .min(160.0, 320.0)
+                    .threshold(2.0)
+                    .whole_pixels(true)
+                    .label(texts.tr("Side Bar"))
+                    .show(&mut ui, Id::SideSplit, work)?;
+                side_held = split.held;
+                side_moved = split.changed;
+                let (head_at, body) = side_at.split_top(workbench::rail::HEAD, 0.0);
+                workbench::rail::head(&mut ui, head_at, &side_head.0, &side_head.1)?;
+                content(&mut ui, pane, body)?;
+                dock_at = rest;
+            }
+            let response = DockView::new(dock, title, &mut content)
                 .style(DockStyle::new(&self.theme))
                 .close_buttons(true)
                 .dirty(|pane| dirty.contains(&pane))
@@ -3245,7 +3288,7 @@ impl App {
                     let name = tab_icons.get(&pane)?;
                     Some(aurea::ui::IconSource::Vector(crate::icons::image(name)))
                 })
-                .show(&mut ui, Id::Dock, main)?;
+                .show(&mut ui, Id::Dock, dock_at)?;
             changed = response.changed;
             if let Some(view) = bar.view
                 && let Some((_, rect)) = rects.iter().find(|(v, _)| *v == view)
@@ -3370,8 +3413,11 @@ impl App {
             self.menu_target = Some(Target::Editor(view));
             self.menu.ask(at, context_menu::editor());
         }
-        if let Some(command) = welcome_pick.or(status_pick) {
+        if let Some(command) = welcome_pick.or(status_pick).or(rail_pick) {
             self.run(command);
+        }
+        if side_moved {
+            self.layout_dirty = true;
         }
         if let Some(folder) = recent_pick {
             self.reopen = Some(folder);
@@ -3389,7 +3435,8 @@ impl App {
                 Click::Toggled => {}
             }
         }
-        if self.layout_dirty && self.restored && self.bench.dock.dragging().is_none() {
+        if self.layout_dirty && self.restored && !side_held && self.bench.dock.dragging().is_none()
+        {
             self.save_layout();
         }
         Ok(())
@@ -3397,6 +3444,91 @@ impl App {
 }
 
 impl App {
+    /// the rail's buttons: side bar panels on top; the panels under the
+    /// editors and settings below.
+    fn rail_items(&self) -> (Vec<rail::Item>, Vec<rail::Item>) {
+        let item = |icon, label, command, panel: Option<Panel>, badge| rail::Item {
+            icon,
+            label,
+            command,
+            lit: panel.is_some_and(|p| self.shows(p)),
+            badge,
+        };
+        let changes = self.changes.as_ref().map_or(0, |s| s.changes.len());
+        let problems: usize = self.docs.all().map(|d| d.diags.len()).sum();
+        let top = vec![
+            item(
+                "files",
+                "Explorer",
+                Command::ToggleExplorer,
+                Some(Panel::Explorer),
+                0,
+            ),
+            item(
+                "search",
+                "Search",
+                Command::ToggleSearch,
+                Some(Panel::Search),
+                0,
+            ),
+            item(
+                "source-control",
+                "Source Control",
+                Command::ToggleGit,
+                Some(Panel::Git),
+                changes,
+            ),
+        ];
+        let bottom = vec![
+            item(
+                "shell",
+                "Terminal",
+                Command::ToggleTerminal,
+                Some(Panel::Terminal),
+                0,
+            ),
+            item(
+                "problems",
+                "Problems",
+                Command::ToggleProblems,
+                Some(Panel::Problems),
+                problems,
+            ),
+            item("settings", "Settings", Command::OpenSettings, None, 0),
+        ];
+        (top, bottom)
+    }
+
+    /// the side bar's title, and what it is about: the folder for the
+    /// explorer, the branch for source control.
+    fn side_head(&self, titles: &HashMap<PaneId, String>) -> (String, String) {
+        let Some(panel) = self.bench.side.shown else {
+            return (String::new(), String::new());
+        };
+        let title = match panel {
+            Panel::Explorer => self.texts.tr("Explorer").to_owned(),
+            Panel::Git => self.texts.tr("Source Control").to_owned(),
+            _ => self
+                .bench
+                .panels
+                .find(panel)
+                .and_then(|p| titles.get(&p))
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let about = match panel {
+            Panel::Explorer => self
+                .explorer
+                .root()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Panel::Git => self.branch.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        (title, about)
+    }
+
     /// the focused editor's facts for the status bar, each with what a
     /// click on it does.
     fn place(&self) -> Vec<(String, Option<Command>)> {
@@ -3737,7 +3869,8 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Equals), Command::ZoomIn)
         .bind(Chord::command(KeyCode::Minus), Command::ZoomOut)
         .bind(Chord::command(KeyCode::Key0), Command::ZoomReset)
-        .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
+        .bind(Chord::command(KeyCode::B), Command::ToggleSidebar)
+        .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)

@@ -3,6 +3,7 @@
 //! layout saves as stable names, not runtime ids.
 
 pub mod panels;
+pub mod rail;
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,31 @@ const LAYOUT_VERSION: i64 = 1;
 pub struct Workbench {
     pub dock: Dock<PaneId>,
     pub panels: Panels,
+    pub side: Side,
+}
+
+/// side bar width when nothing says otherwise.
+pub const SIDE_WIDTH: f32 = 260.0;
+/// side bar widths a session file may ask for.
+const SIDE_WIDTHS: std::ops::RangeInclusive<f32> = 120.0..=1200.0;
+
+/// the side bar beside the rail: one tool panel at a time, or hidden.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Side {
+    pub shown: Option<Panel>,
+    /// what comes back when the side bar opens again.
+    pub last: Panel,
+    pub width: f32,
+}
+
+impl Default for Side {
+    fn default() -> Self {
+        Self {
+            shown: Some(Panel::Explorer),
+            last: Panel::Explorer,
+            width: SIDE_WIDTH,
+        }
+    }
 }
 
 /// why a close was refused.
@@ -31,19 +57,16 @@ pub enum Refused {
 impl Default for Workbench {
     fn default() -> Self {
         let mut panels = Panels::default();
+        side_panes(&mut panels);
         let welcome = panels.pane(Panel::Welcome);
         let mut tree = DockTree::new(welcome);
-        let explorer = panels.pane(Panel::Explorer);
-        tree.insert_sized(explorer, welcome, DockSide::Left, 0.22);
-        let search = panels.pane(Panel::Search);
-        tree.insert(search, explorer, DockSide::Center);
-        tree.activate(explorer);
         let terminal = panels.pane(Panel::Terminal);
         tree.insert_sized(terminal, welcome, DockSide::Bottom, 0.28);
         tree.activate(welcome);
         Self {
             dock: Dock::new(tree),
             panels,
+            side: Side::default(),
         }
     }
 }
@@ -115,6 +138,11 @@ impl Workbench {
                 self.tree().remove(pane);
             }
             Some(Panel::Welcome) => return Err(Refused::KeepsEditorArea),
+            Some(side) if side.is_side() => {
+                if self.side.shown == Some(side) {
+                    self.side.shown = None;
+                }
+            }
             Some(
                 Panel::Explorer | Panel::Search | Panel::Git | Panel::Terminal | Panel::Problems,
             ) => {
@@ -179,6 +207,10 @@ impl Workbench {
 
     /// shows or hides a tool panel. it comes back at its home spot.
     pub fn toggle(&mut self, panel: Panel) {
+        if panel.is_side() && self.side.shown == Some(panel) {
+            self.side.shown = None;
+            return;
+        }
         let pane = self.panels.pane(panel);
         if self.dock.tree.contains(pane) {
             self.tree().remove(pane);
@@ -187,17 +219,36 @@ impl Workbench {
         self.show(panel);
     }
 
-    /// puts a tool panel in front, at its home spot if it was hidden:
-    /// terminal under the editors, explorer and search side by side as tabs
-    /// on the left.
+    /// shows or hides the side bar, coming back with what it last showed.
+    pub fn toggle_side(&mut self) {
+        self.side.shown = match self.side.shown {
+            Some(_) => None,
+            None => Some(self.side.last),
+        };
+    }
+
+    /// is `panel` in sight now: in the side bar or in the dock.
+    pub fn shows(&self, panel: Panel) -> bool {
+        if panel.is_side() {
+            return self.side.shown == Some(panel);
+        }
+        self.panels
+            .find(panel)
+            .is_some_and(|id| self.dock.tree.contains(id))
+    }
+
+    /// puts a tool panel in front: side ones in the side bar, the terminal
+    /// and problems under the editors, at their home spot if hidden.
     pub fn show(&mut self, panel: Panel) {
+        if panel.is_side() {
+            self.side.shown = Some(panel);
+            self.side.last = panel;
+            return;
+        }
         let pane = self.panels.pane(panel);
         if !self.dock.tree.contains(pane) {
-            // tool panels share a spot: explorer with search, the bottom
-            // ones with each other
+            // the bottom ones share a spot
             let sibling = match panel {
-                Panel::Explorer => Some(Panel::Search),
-                Panel::Search | Panel::Git => Some(Panel::Explorer),
                 Panel::Terminal => Some(Panel::Problems),
                 Panel::Problems => Some(Panel::Terminal),
                 _ => None,
@@ -212,11 +263,7 @@ impl Workbench {
                     let Some(area) = self.editor_area() else {
                         return;
                     };
-                    let (side, share) = match panel {
-                        Panel::Terminal | Panel::Problems => (DockSide::Bottom, 0.28),
-                        _ => (DockSide::Left, 0.22),
-                    };
-                    self.tree().insert_sized(pane, area, side, share);
+                    self.tree().insert_sized(pane, area, DockSide::Bottom, 0.28);
                 }
             }
         }
@@ -288,6 +335,15 @@ impl Workbench {
             "editors".into(),
             toml::Value::Array(editors.into_iter().map(Into::into).collect()),
         );
+        let side_name = |p: Panel| match p {
+            Panel::Search => "search",
+            Panel::Git => "git",
+            _ => "explorer",
+        };
+        let shown = self.side.shown.map_or("", side_name);
+        file.insert("side".into(), shown.into());
+        file.insert("side_last".into(), side_name(self.side.last).into());
+        file.insert("side_width".into(), f64::from(self.side.width).into());
         file.to_string()
     }
 
@@ -323,14 +379,14 @@ impl Workbench {
         let plan = DockPlan::from_text(file.get("layout")?.as_str()?, slot)?;
 
         let mut panels = Panels::default();
+        side_panes(&mut panels);
         let slots: Vec<Option<PaneId>> = names
             .into_inner()
             .iter()
             .map(|name| {
                 let panel = match name.as_str() {
-                    "explorer" => Panel::Explorer,
-                    "search" => Panel::Search,
-                    "git" => Panel::Git,
+                    // side panels moved out of the dock; older files had them in it
+                    "explorer" | "search" | "git" => return None,
                     "terminal" => Panel::Terminal,
                     "problems" => Panel::Problems,
                     "welcome" => Panel::Welcome,
@@ -343,9 +399,31 @@ impl Workbench {
             })
             .collect();
         let plan = map_plan(plan, &|slot| slots.get(slot).copied().flatten())?;
+        let side_panel = |key: &str| match file.get(key).and_then(toml::Value::as_str) {
+            Some("explorer") => Some(Some(Panel::Explorer)),
+            Some("search") => Some(Some(Panel::Search)),
+            Some("git") => Some(Some(Panel::Git)),
+            Some("") => Some(None),
+            _ => None,
+        };
+        let mut side = Side::default();
+        if let Some(shown) = side_panel("side") {
+            side.shown = shown;
+        }
+        if let Some(Some(last)) = side_panel("side_last") {
+            side.last = last;
+        }
+        if let Some(width) = file.get("side_width").and_then(toml::Value::as_float) {
+            #[allow(clippy::cast_possible_truncation)]
+            let width = width as f32;
+            if SIDE_WIDTHS.contains(&width) {
+                side.width = width;
+            }
+        }
         let mut bench = Workbench {
             dock: Dock::new(DockTree::from_plan(&plan)),
             panels,
+            side,
         };
         if bench.editor_area().is_none() {
             // every editor was dropped; keep an editor area
@@ -365,6 +443,14 @@ impl Workbench {
             }
         }
         Some(bench)
+    }
+}
+
+/// the side bar's panels get their panes up front; they never sit in the
+/// dock, so nothing else makes them.
+fn side_panes(panels: &mut Panels) {
+    for panel in [Panel::Explorer, Panel::Search, Panel::Git] {
+        panels.pane(panel);
     }
 }
 
@@ -538,21 +624,19 @@ mod tests {
     }
 
     #[test]
-    fn search_sits_with_explorer() {
+    fn side_bar_shows_one_panel_and_folds_away() {
         let mut bench = Workbench::default();
-        let explorer = bench.panels.find(Panel::Explorer).unwrap();
-        assert!(bench.dock.tree.is_active(explorer));
+        assert!(bench.shows(Panel::Explorer));
+        assert!(!in_tree(&bench, Panel::Explorer), "never a dock tab");
         bench.show(Panel::Search);
-        let search = bench.panels.find(Panel::Search).unwrap();
-        assert!(bench.dock.tree.is_active(search));
-        assert!(
-            !bench.dock.tree.is_active(explorer),
-            "same group, one shows"
-        );
+        assert!(bench.shows(Panel::Search));
+        assert!(!bench.shows(Panel::Explorer), "one at a time");
         bench.toggle(Panel::Search);
-        assert!(!in_tree(&bench, Panel::Search));
-        bench.toggle(Panel::Search);
-        assert!(bench.dock.tree.is_active(search));
+        assert_eq!(bench.side.shown, None);
+        bench.toggle_side();
+        assert!(bench.shows(Panel::Search), "comes back with the last one");
+        bench.toggle(Panel::Git);
+        assert!(bench.shows(Panel::Git));
     }
 
     #[test]
@@ -562,11 +646,11 @@ mod tests {
         assert!(!in_tree(&bench, Panel::Terminal));
         bench.toggle(Panel::Terminal);
         assert!(in_tree(&bench, Panel::Terminal));
-        let explorer = bench.panels.find(Panel::Explorer).unwrap();
+        let terminal = bench.panels.find(Panel::Terminal).unwrap();
         let mut docs = Documents::default();
-        assert_eq!(bench.close(explorer, &mut docs), Ok(()));
-        assert!(!in_tree(&bench, Panel::Explorer));
-        assert!(bench.panels.find(Panel::Explorer).is_some(), "kept alive");
+        assert_eq!(bench.close(terminal, &mut docs), Ok(()));
+        assert!(!in_tree(&bench, Panel::Terminal));
+        assert!(bench.panels.find(Panel::Terminal).is_some(), "kept alive");
     }
 
     #[test]
@@ -578,6 +662,8 @@ mod tests {
         bench.show_editor(a);
         bench.show_editor(b);
         bench.toggle(Panel::Terminal);
+        bench.show(Panel::Git);
+        bench.side.width = 333.0;
         let saved = bench.save(&docs);
 
         let mut opened = Vec::new();
@@ -589,7 +675,7 @@ mod tests {
         .expect("restores");
         assert_eq!(opened.len(), 2);
         assert!(opened.contains(&PathBuf::from(r"C:\work\src\main.rs")));
-        assert!(in_tree(&back, Panel::Explorer));
+        assert_eq!(back.side, bench.side);
         assert!(!in_tree(&back, Panel::Terminal));
         assert!(!in_tree(&back, Panel::Welcome));
         assert_eq!(back.save(&fresh).lines().count(), saved.lines().count());
@@ -603,7 +689,16 @@ mod tests {
         let saved = bench.save(&docs);
         let back = Workbench::restore(&saved, |_| None).expect("restores");
         assert!(in_tree(&back, Panel::Welcome));
-        assert!(in_tree(&back, Panel::Explorer));
+        assert!(back.shows(Panel::Explorer));
+    }
+
+    #[test]
+    fn old_layout_with_side_tabs_moves_them_out() {
+        let old = "version = 1\nlayout = \"row(0.22, tabs(0: explorer, search), tabs(0: welcome))\"\nside_width = 99999.0\n";
+        let back = Workbench::restore(old, |_| None).expect("restores");
+        assert!(!in_tree(&back, Panel::Explorer));
+        assert!(in_tree(&back, Panel::Welcome));
+        assert_eq!(back.side.width, SIDE_WIDTH, "a silly width is ignored");
     }
 
     #[test]

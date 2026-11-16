@@ -27,6 +27,11 @@ impl Panel {
     pub fn is_editor_area(self) -> bool {
         matches!(self, Panel::Welcome | Panel::Editor(_) | Panel::Diff(_))
     }
+
+    /// panels that live in the side bar, one at a time, never in the dock.
+    pub fn is_side(self) -> bool {
+        matches!(self, Panel::Explorer | Panel::Search | Panel::Git)
+    }
 }
 
 #[derive(Default)]
