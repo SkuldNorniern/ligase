@@ -43,7 +43,7 @@ pub fn show(
             let lit = row.rect.inset_xy(4.0, 1.0);
             if row.picked {
                 ui.round(lit, 4.0, palette.selection)?;
-            } else if active == Some(entry.path) {
+            } else if active.is_some_and(|a| same_path(a, entry.path)) {
                 ui.round(lit, 4.0, palette.raised)?;
             } else if row.hovered {
                 ui.round(lit, 4.0, palette.hover)?;
@@ -98,6 +98,15 @@ pub fn show(
             .and_then(|row| explorer.click(row)),
         menu,
     })
+}
+
+/// paths alike as the file system sees them: windows ignores case.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+    } else {
+        a == b
+    }
 }
 
 /// small arrow: right when closed, down when open.

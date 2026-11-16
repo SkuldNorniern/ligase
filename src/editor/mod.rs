@@ -951,15 +951,18 @@ fn overview(
     let text = doc.buffer.text();
     let lines = text.line_count().max(1) as f32;
     let palette = ui.theme.palette;
+    // an offset from an older text (a late diagnostic) has no line; no mark
     let y_of = |at: usize| {
-        let line = text.line_of(at).unwrap_or(0) as f32;
-        (track.y + line / lines * track.height).min(track.y + track.height - 2.0)
+        let line = text.line_of(at).ok()? as f32;
+        Some((track.y + line / lines * track.height).min(track.y + track.height - 2.0))
     };
     let half = (track.width / 2.0).floor();
     // one mark a pixel row is plenty, however many hits share it
     let mut last = f32::NEG_INFINITY;
     for hit in found {
-        let y = y_of(hit.start).floor();
+        let Some(y) = y_of(hit.start).map(f32::floor) else {
+            continue;
+        };
         if y > last {
             let mark = Rect::new(track.x + 2.0, y, half - 3.0, 2.0);
             ui.fill(mark, palette.warning.fade(0.7))?;
@@ -970,11 +973,13 @@ fn overview(
         if diag.severity == Severity::Hint {
             continue;
         }
-        let y = y_of(diag.range.start).floor();
+        let Some(y) = y_of(diag.range.start).map(f32::floor) else {
+            continue;
+        };
         let mark = Rect::new(track.x + half + 1.0, y, half - 3.0, 3.0);
         ui.fill(mark, severity_colour(&palette, diag.severity))?;
     }
-    let y = y_of(caret).floor();
+    let y = y_of(caret).unwrap_or(track.y).floor();
     ui.fill(
         Rect::new(track.x + 2.0, y, track.width - 4.0, 1.0),
         palette.text.fade(0.5),
