@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use aurea::render::{Point, Rect};
 use aurea::ui::{Align, ListView, Ui};
 use aurea::{AureaResult, KeyCode};
@@ -18,7 +20,13 @@ pub struct Shown {
 }
 
 /// draws the tree. a click on a row comes back for the app to act on.
-pub fn show(ui: &mut Ui<'_, Id>, explorer: &mut Explorer, rect: Rect) -> AureaResult<Shown> {
+/// `active` is the file in the editor with the keyboard; its row is marked.
+pub fn show(
+    ui: &mut Ui<'_, Id>,
+    explorer: &mut Explorer,
+    rect: Rect,
+    active: Option<&Path>,
+) -> AureaResult<Shown> {
     let font = ui.theme.font(13.0);
     let palette = ui.theme.palette;
     let before = explorer.selected;
@@ -31,10 +39,20 @@ pub fn show(ui: &mut Ui<'_, Id>, explorer: &mut Explorer, rect: Rect) -> AureaRe
             let Some(entry) = tree.row(row.index) else {
                 return Ok(());
             };
+            // inset and rounded, the way zed and vs code mark a row
+            let lit = row.rect.inset_xy(4.0, 1.0);
             if row.picked {
-                ui.fill(row.rect, palette.selection)?;
+                ui.round(lit, 4.0, palette.selection)?;
+            } else if active == Some(entry.path) {
+                ui.round(lit, 4.0, palette.raised)?;
             } else if row.hovered {
-                ui.fill(row.rect, palette.hover)?;
+                ui.round(lit, 4.0, palette.hover)?;
+            }
+            // one faint line per folder this row sits in, under its arrow
+            for depth in 0..entry.depth {
+                let x = row.rect.x + 8.0 + f32::from(depth) * INDENT + 6.0;
+                let line = Rect::new(x.round(), row.rect.y, 1.0, row.rect.height);
+                ui.fill(line, palette.border.fade(0.55))?;
             }
             let indent = 8.0 + f32::from(entry.depth) * INDENT;
             let (mark, name) = row.rect.split_left(indent + 12.0, 4.0);

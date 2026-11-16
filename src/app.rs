@@ -2543,6 +2543,11 @@ impl App {
             self.status.clone()
         };
         let root = self.explorer.root().to_path_buf();
+        let active_file = self
+            .last_editor
+            .and_then(|v| self.docs.doc_of(v))
+            .filter(|d| !d.untitled)
+            .map(|d| d.path.clone());
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
@@ -2556,7 +2561,7 @@ impl App {
             let title = |pane: PaneId| titles.get(&pane).map_or("", String::as_str);
             let content = |ui: &mut Ui<'_, Id>, pane: PaneId, rect: Rect| match panels.get(pane) {
                 Some(Panel::Explorer) => {
-                    let shown = explorer::view::show(ui, explorer, rect)?;
+                    let shown = explorer::view::show(ui, explorer, rect, active_file.as_deref())?;
                     clicks.extend(shown.click);
                     if let Some((at, row)) = shown.menu {
                         explorer_menu = Some((at, row.and_then(|r| explorer.row_path(r))));
@@ -2579,9 +2584,14 @@ impl App {
                             &[]
                         };
                         let current = bar.current.and_then(|i| found.get(i)).cloned();
+                        let crumbs = (!doc.untitled).then(|| {
+                            let path = doc.path.strip_prefix(&root).unwrap_or(&doc.path);
+                            path.to_string_lossy().replace('\\', "/")
+                        });
                         let look = editor::Look {
                             settings,
                             dark,
+                            crumbs: crumbs.as_deref(),
                             size: zoom,
                             idle,
                             hover,

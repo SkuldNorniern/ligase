@@ -56,6 +56,10 @@ pub struct Settings {
     pub line_numbers: LineNumbers,
     pub current_line: bool,
     pub indent_guides: bool,
+    /// the file's place in the folder, above the text.
+    pub breadcrumbs: bool,
+    /// marks for problems and find hits beside the scroll bar.
+    pub overview: bool,
     pub whitespace: Whitespace,
     /// other copies of the word under the caret lit.
     pub word_highlight: bool,
@@ -87,6 +91,8 @@ impl Default for Settings {
             line_numbers: LineNumbers::On,
             current_line: true,
             indent_guides: true,
+            breadcrumbs: true,
+            overview: true,
             whitespace: Whitespace::Selection,
             word_highlight: true,
             auto_pairs: true,
@@ -121,6 +127,8 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # line_numbers = "on"       # "on", "relative" or "off"
 # current_line = true
 # indent_guides = true
+# breadcrumbs = true
+# overview = true          # problem and find marks by the scroll bar
 # whitespace = "selection"  # "none", "selection" or "all"
 # word_highlight = true
 # auto_pairs = true
@@ -220,6 +228,8 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
         | "smooth_caret"
         | "current_line"
         | "indent_guides"
+        | "breadcrumbs"
+        | "overview"
         | "word_highlight"
         | "auto_pairs"
         | "trim_trailing_whitespace"
@@ -234,6 +244,8 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
                 "smooth_caret" => &mut out.smooth_caret,
                 "current_line" => &mut out.current_line,
                 "indent_guides" => &mut out.indent_guides,
+                "breadcrumbs" => &mut out.breadcrumbs,
+                "overview" => &mut out.overview,
                 "word_highlight" => &mut out.word_highlight,
                 "trim_trailing_whitespace" => &mut out.trim_trailing_whitespace,
                 "final_newline" => &mut out.final_newline,

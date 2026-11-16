@@ -906,6 +906,80 @@ pub struct Look<'a> {
     pub settings: &'a crate::settings::Settings,
     /// the theme is dark; picks the syntax colours.
     pub dark: bool,
+    /// the file's path from the workspace folder, `/` between parts; none
+    /// for an untitled one.
+    pub crumbs: Option<&'a str>,
+}
+
+/// height of the strip naming the file above the text.
+const CRUMBS: f32 = 24.0;
+
+/// the file's path above the text, folders dim and the file itself bright.
+fn crumbs(ui: &mut Ui<'_, Id>, path: &str, strip: Rect) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(12.0);
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut x = strip.x + 12.0;
+    let end = strip.x + strip.width - 12.0;
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let w = ui.text_width(part, &font);
+        let room = Rect::new(x, strip.y, (end - x).max(0.0), strip.height);
+        let colour = if last { palette.text } else { palette.dim };
+        ui.text_clipped(part, room, &font, colour, Align::Start)?;
+        x += w;
+        if last || x >= end {
+            break;
+        }
+        let sep = Rect::new(x, strip.y, 16.0, strip.height);
+        ui.text("›", sep, &font, palette.faint, Align::Center)?;
+        x += 16.0;
+    }
+    Ok(())
+}
+
+/// where problems and find hits are in the whole file, in the strip the
+/// scroll bar runs in: hits on the left half, problems on the right, the
+/// caret's line across. by line, so folds and wraps only bend it a little.
+fn overview(
+    ui: &mut Ui<'_, Id>,
+    track: Rect,
+    doc: &Document,
+    found: &[Range<usize>],
+    caret: usize,
+) -> AureaResult<()> {
+    let text = doc.buffer.text();
+    let lines = text.line_count().max(1) as f32;
+    let palette = ui.theme.palette;
+    let y_of = |at: usize| {
+        let line = text.line_of(at).unwrap_or(0) as f32;
+        (track.y + line / lines * track.height).min(track.y + track.height - 2.0)
+    };
+    let half = (track.width / 2.0).floor();
+    // one mark a pixel row is plenty, however many hits share it
+    let mut last = f32::NEG_INFINITY;
+    for hit in found {
+        let y = y_of(hit.start).floor();
+        if y > last {
+            let mark = Rect::new(track.x + 2.0, y, half - 3.0, 2.0);
+            ui.fill(mark, palette.warning.fade(0.7))?;
+            last = y;
+        }
+    }
+    for diag in &doc.diags {
+        if diag.severity == Severity::Hint {
+            continue;
+        }
+        let y = y_of(diag.range.start).floor();
+        let mark = Rect::new(track.x + half + 1.0, y, half - 3.0, 3.0);
+        ui.fill(mark, severity_colour(&palette, diag.severity))?;
+    }
+    let y = y_of(caret).floor();
+    ui.fill(
+        Rect::new(track.x + 2.0, y, track.width - 4.0, 1.0),
+        palette.text.fade(0.5),
+    )?;
+    Ok(())
 }
 
 /// line height for a font size and a multiple of it.
@@ -991,6 +1065,15 @@ pub fn show(
     let tab = " ".repeat(settings.tab_size.max(1));
     let tab = tab.as_str();
     let palette = ui.theme.palette;
+    // the path on top also keeps the first line off the tab bar
+    let rect = match look.crumbs.filter(|_| settings.breadcrumbs) {
+        Some(path) => {
+            let (strip, rest) = rect.split_top(CRUMBS, 0.0);
+            crumbs(ui, path, strip)?;
+            rest
+        }
+        None => rect,
+    };
     match &doc.load {
         Load::Loading => {
             ui.text(texts.tr("loading"), rect, &font, palette.dim, Align::Center)?;
@@ -1076,6 +1159,10 @@ pub fn show(
     let mut preedit = view.preedit.clone();
     let mut hscroll = view.hscroll;
     let seen_line = view.caret_line;
+    if settings.overview {
+        let track = Rect::new(rect.x + rect.width - BAR, rect.y, BAR, rect.height);
+        overview(ui, track, doc, look.found, view.sel.head)?;
+    }
     let (_, pull) = ScrollArea::new(&mut view.scroll, height).show(
         ui,
         Id::Editor(id),
