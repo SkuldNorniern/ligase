@@ -641,11 +641,8 @@ fn hover_text(contents: &Value) -> String {
         Value::Array(list) => list.iter().map(one).collect::<Vec<_>>().join("\n\n"),
         other => one(other),
     };
-    // code fences only get in the way in a plain text box
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // markdown as it came; the card reads its fences
+    text
 }
 
 #[cfg(test)]
@@ -693,7 +690,7 @@ mod tests {
     #[test]
     fn hover_text_from_any_shape() {
         let markup = json!({ "kind": "markdown", "value": "```rust\nfn x()\n```\ndoes x" });
-        assert_eq!(hover_text(&markup), "fn x()\ndoes x");
+        assert_eq!(hover_text(&markup), "```rust\nfn x()\n```\ndoes x");
         let list = json!(["a", { "language": "rust", "value": "b" }]);
         assert_eq!(hover_text(&list), "a\n\nb");
     }

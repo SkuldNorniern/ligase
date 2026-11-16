@@ -4,6 +4,7 @@
 pub mod cursor;
 pub mod find;
 pub mod fold;
+mod hover;
 pub mod input;
 pub mod lines;
 pub mod multi;
@@ -54,7 +55,7 @@ const H_SCROLL: u16 = 0;
 const CARET_X: u16 = 0;
 const CARET_Y: u16 = 1;
 
-const MONO: &str = if cfg!(windows) {
+pub(super) const MONO: &str = if cfg!(windows) {
     "Consolas"
 } else if cfg!(target_os = "macos") {
     "Menlo"
@@ -779,50 +780,6 @@ fn squiggles(
         }
         points.push(Point::new(x1, y));
         ui.polyline(&points, 1.0, color)?;
-    }
-    Ok(())
-}
-
-/// language server hover text in a box under the caret, or over it when
-/// there is no room below.
-fn hover_box(
-    ui: &mut Ui<'_, Id>,
-    text: &str,
-    caret: Rect,
-    seen: Rect,
-    alpha: f32,
-) -> AureaResult<()> {
-    const MAX_LINES: usize = 16;
-    let palette = ui.theme.palette;
-    let font = ui.theme.font(13.0);
-    let lines: Vec<&str> = text.lines().take(MAX_LINES).collect();
-    let row = 18.0;
-    let width = lines
-        .iter()
-        .map(|l| ui.text_width(l, &font))
-        .fold(120.0_f32, f32::max)
-        .min(seen.width * 0.8)
-        + 16.0;
-    let height = lines.len() as f32 * row + 12.0;
-    let below = caret.y + caret.height + 4.0;
-    let y = if below + height <= seen.y + seen.height {
-        below
-    } else {
-        (caret.y - height - 4.0).max(seen.y)
-    };
-    let x = caret.x.min(seen.x + seen.width - width).max(seen.x);
-    // fades in and rises a little as it comes
-    let card = Rect::new(x, y + (1.0 - alpha) * 6.0, width, height);
-    ui.round(card, 6.0, palette.raised.fade(alpha))?;
-    ui.border(card, 6.0, 1.0, palette.border.fade(alpha))?;
-    for (i, line) in lines.iter().enumerate() {
-        let at = Rect::new(
-            card.x + 8.0,
-            card.y + 6.0 + i as f32 * row,
-            width - 16.0,
-            row,
-        );
-        ui.text_clipped(line, at, &font, palette.text.fade(alpha), Align::Start)?;
     }
     Ok(())
 }
@@ -1781,7 +1738,7 @@ pub fn show(
             hscroll = hscroll.min((widest - area.width * 0.5).max(0.0));
             if let (Some(text), Some(caret)) = (look.hover, shown.caret) {
                 let alpha = ui.animate(Id::Editor(id), PART_HOVER, Channel::Custom(0), 1.0, 14.0);
-                hover_box(ui, text, caret, seen, alpha)?;
+                hover::show(ui, text, caret, seen, alpha, (look.dark, look.size))?;
             } else {
                 ui.set_animated(Id::Editor(id), PART_HOVER, Channel::Custom(0), 0.0);
             }
