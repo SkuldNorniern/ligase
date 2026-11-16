@@ -134,9 +134,25 @@ pub struct Documents {
     docs: HashMap<DocumentId, Document>,
     views: HashMap<ViewId, View>,
     next: u32,
+    /// file types extensions added, beside the bundled ones.
+    associations: syntax::Associations,
 }
 
 impl Documents {
+    /// takes the file types extensions add now. open files whose language
+    /// changes start their colours over.
+    pub fn set_associations(&mut self, associations: syntax::Associations) {
+        self.associations = associations;
+        for doc in self.docs.values_mut() {
+            let language = syntax::language_for(&doc.path, &self.associations);
+            if language != doc.language {
+                doc.language = language;
+                doc.spans.clear();
+                doc.asked = None;
+            }
+        }
+    }
+
     fn take_id(&mut self) -> u32 {
         self.next += 1;
         self.next
@@ -156,7 +172,7 @@ impl Documents {
                 buffer: TextBuffer::new(),
                 load: Load::Loading,
                 crlf: false,
-                language: syntax::language_for(path),
+                language: syntax::language_for(path, &self.associations),
                 spans: Spans::new(),
                 folds: Vec::new(),
                 symbols: Vec::new(),
@@ -202,7 +218,7 @@ impl Documents {
                 } else {
                     to.join(rest)
                 };
-                doc.language = syntax::language_for(&doc.path);
+                doc.language = syntax::language_for(&doc.path, &self.associations);
                 doc.spans.clear();
                 doc.asked = None;
                 // a new path has its own HEAD, asked again on the next save
@@ -224,7 +240,7 @@ impl Documents {
     pub fn set_path(&mut self, id: DocumentId, path: &Path) {
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.path = path.to_path_buf();
-            doc.language = syntax::language_for(path);
+            doc.language = syntax::language_for(path, &self.associations);
             doc.untitled = false;
             doc.disk = None;
             doc.conflict = false;

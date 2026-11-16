@@ -22,45 +22,88 @@ const MAX_SYMBOLS: usize = 10_000;
 
 pub type Spans = Vec<(Range<usize>, HighlightKind)>;
 
-/// sylven language for a file, by its extension.
-pub fn language_for(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "rs" => "rust",
-        "toml" => "toml",
-        "json" => "json",
-        "md" | "markdown" => "markdown",
-        "yaml" | "yml" => "yaml",
-        "c" | "h" => "c",
-        "py" => "python",
-        "v" | "vh" => "verilog",
-        "sv" | "svh" => "systemverilog",
-        "vhd" | "vhdl" => "vhdl",
-        "bsv" => "bsv",
-        "bs" => "bh",
-        "sdc" | "xdc" => "sdc",
-        "oxy" => "oxygen",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "ts" | "mts" | "cts" | "tsx" => "typescript",
-        "go" => "go",
-        "java" => "java",
-        "kt" | "kts" => "kotlin",
-        "cs" => "csharp",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
-        "swift" => "swift",
-        "lua" => "lua",
-        "rb" | "rake" | "gemspec" => "ruby",
-        "php" => "php",
-        "sh" | "bash" | "zsh" => "shell",
-        "ps1" | "psm1" | "psd1" => "powershell",
-        "css" | "scss" | "less" => "css",
-        "html" | "htm" | "xhtml" | "vue" | "svelte" => "html",
-        "xml" | "svg" | "xaml" | "csproj" | "plist" | "xsd" => "xml",
-        "sql" => "sql",
-        "ini" | "cfg" | "conf" | "properties" | "env" | "editorconfig" | "gitconfig" => "ini",
-        "zig" => "zig",
-        _ => return None,
-    })
+/// every bundled language and the file extensions it takes.
+const LANGUAGES: &[(&str, &[&str])] = &[
+    ("rust", &["rs"]),
+    ("toml", &["toml"]),
+    ("json", &["json"]),
+    ("markdown", &["md", "markdown"]),
+    ("yaml", &["yaml", "yml"]),
+    ("c", &["c", "h"]),
+    ("python", &["py"]),
+    ("verilog", &["v", "vh"]),
+    ("systemverilog", &["sv", "svh"]),
+    ("vhdl", &["vhd", "vhdl"]),
+    ("bsv", &["bsv"]),
+    ("bh", &["bs"]),
+    ("sdc", &["sdc", "xdc"]),
+    ("oxygen", &["oxy"]),
+    ("javascript", &["js", "mjs", "cjs", "jsx"]),
+    ("typescript", &["ts", "mts", "cts", "tsx"]),
+    ("go", &["go"]),
+    ("java", &["java"]),
+    ("kotlin", &["kt", "kts"]),
+    ("csharp", &["cs"]),
+    ("cpp", &["cpp", "cc", "cxx", "hpp", "hh", "hxx"]),
+    ("swift", &["swift"]),
+    ("lua", &["lua"]),
+    ("ruby", &["rb", "rake", "gemspec"]),
+    ("php", &["php"]),
+    ("shell", &["sh", "bash", "zsh"]),
+    ("powershell", &["ps1", "psm1", "psd1"]),
+    ("css", &["css", "scss", "less"]),
+    ("html", &["html", "htm", "xhtml", "vue", "svelte"]),
+    ("xml", &["xml", "svg", "xaml", "csproj", "plist", "xsd"]),
+    ("sql", &["sql"]),
+    (
+        "ini",
+        &[
+            "ini",
+            "cfg",
+            "conf",
+            "properties",
+            "env",
+            "editorconfig",
+            "gitconfig",
+        ],
+    ),
+    ("zig", &["zig"]),
+];
+
+/// the bundled language called `name`, for an extension borrowing its
+/// syntax.
+pub fn bundled(name: &str) -> Option<&'static str> {
+    LANGUAGES.iter().find(|(n, _)| *n == name).map(|(n, _)| *n)
+}
+
+/// file extensions and names extensions map to a bundled language. the
+/// bundled mappings win where both have one; these only add.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Associations {
+    /// lowercase extension to language.
+    pub extensions: HashMap<String, &'static str>,
+    /// exact file name to language.
+    pub files: HashMap<String, &'static str>,
+}
+
+/// sylven language for a file: by its extension, then by what extensions
+/// added.
+pub fn language_for(path: &Path, extra: &Associations) -> Option<&'static str> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if let Some(ext) = &ext
+        && let Some((lang, _)) = LANGUAGES
+            .iter()
+            .find(|(_, exts)| exts.contains(&ext.as_str()))
+    {
+        return Some(lang);
+    }
+    let name = path.file_name().and_then(|n| n.to_str());
+    name.and_then(|n| extra.files.get(n))
+        .or_else(|| ext.and_then(|e| extra.extensions.get(&e)))
+        .copied()
 }
 
 /// colour for a kind on a light or dark background. control flow
@@ -277,10 +320,24 @@ mod tests {
 
     #[test]
     fn languages_by_extension() {
-        assert_eq!(language_for(Path::new("a/main.RS")), Some("rust"));
-        assert_eq!(language_for(Path::new("Cargo.toml")), Some("toml"));
-        assert_eq!(language_for(Path::new("notes.txt")), None);
-        assert_eq!(language_for(Path::new("Makefile")), None);
+        let none = Associations::default();
+        assert_eq!(language_for(Path::new("a/main.RS"), &none), Some("rust"));
+        assert_eq!(language_for(Path::new("Cargo.toml"), &none), Some("toml"));
+        assert_eq!(language_for(Path::new("notes.txt"), &none), None);
+        assert_eq!(language_for(Path::new("Makefile"), &none), None);
+        let mut extra = Associations::default();
+        extra.extensions.insert("lean".into(), "rust");
+        extra.extensions.insert("rs".into(), "c");
+        extra.files.insert("Makefile".into(), "shell");
+        assert_eq!(language_for(Path::new("a.LEAN"), &extra), Some("rust"));
+        assert_eq!(
+            language_for(Path::new("a.rs"), &extra),
+            Some("rust"),
+            "bundled wins"
+        );
+        assert_eq!(language_for(Path::new("x/Makefile"), &extra), Some("shell"));
+        assert_eq!(bundled("python"), Some("python"));
+        assert_eq!(bundled("nope"), None);
     }
 
     #[test]
