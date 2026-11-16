@@ -19,6 +19,8 @@ const GROUPS: [&str; 6] = ["All", "Look", "Editor", "Files", "Layout", "Terminal
 const ROW: f32 = 58.0;
 const CONTROL: f32 = 230.0;
 const PAD: f32 = 18.0;
+/// pixels one wheel notch moves the list.
+const WHEEL: f32 = 48.0;
 
 /// what the sheet asks the app.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +65,11 @@ impl Sheet {
 
     pub fn close(&mut self) {
         self.open = false;
+    }
+
+    /// a wheel turn on the list; the list keeps the offset in range.
+    pub fn wheel(&mut self, delta_y: f64) {
+        self.scroll = (self.scroll - delta_y as f32 * WHEEL).max(0.0);
     }
 
     /// the rows the search and the chip let through.
@@ -231,6 +238,7 @@ pub fn show(
     }
     let defaults = Settings::default();
     let content = rows.len() as f32 * ROW;
+    sheet.scroll = sheet.scroll.min((content - list.height).max(0.0));
     let typing = &mut sheet.typing;
     let (_, asked) = ScrollArea::new(&mut sheet.scroll, content).show(
         ui,

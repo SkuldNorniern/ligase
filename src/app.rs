@@ -619,6 +619,12 @@ impl App {
                 self.sheet.close();
                 return true;
             }
+            // aurea gives the wheel to the first list under the pointer in
+            // draw order, which is the editor under the sheet; take it here
+            if let WindowEvent::MouseWheel { delta_y, .. } = event {
+                self.sheet.wheel(*delta_y);
+                return true;
+            }
             if let WindowEvent::KeyInput { pressed: true, .. } = event
                 && !self.ui.text_focused()
             {
