@@ -2997,7 +2997,17 @@ impl App {
         }
         if let Some(view) = self.want_complete.take() {
             self.complete_for = Some(view);
+            // no server: extension snippets alone, and only on a word, not
+            // after every space
+            let on_word = self
+                .docs
+                .view(view)
+                .zip(self.docs.doc_of(view))
+                .is_some_and(|(v, d)| {
+                    completion::word_start(d.buffer.text(), v.sel.head) < v.sel.head
+                });
             if !self.lsp.complete(&self.docs, view)
+                && on_word
                 && let Some(revision) = self.docs.doc_of(view).map(|d| d.buffer.revision())
             {
                 // no server: extension snippets alone
