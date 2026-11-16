@@ -139,71 +139,147 @@ pub enum Command {
     PrevTab,
 }
 
-/// every command by name, for the palette.
-const COMMANDS: &[(&str, Command)] = &[
-    ("Quick Open", Command::QuickOpen),
-    ("New File", Command::NewFile),
-    ("Open File", Command::OpenFile),
-    ("Open Folder", Command::OpenFolder),
-    ("New Window", Command::NewWindow),
-    ("Save", Command::Save),
-    ("Save As", Command::SaveAs),
-    ("Save All", Command::SaveAll),
-    ("Close Tab", Command::CloseTab),
-    ("Reopen Closed Tab", Command::ReopenClosed),
-    ("Word Wrap", Command::ToggleWrap),
-    ("Next Tab", Command::NextTab),
-    ("Previous Tab", Command::PrevTab),
-    ("Undo", Command::Undo),
-    ("Redo", Command::Redo),
-    ("Cut", Command::Cut),
-    ("Copy", Command::Copy),
-    ("Paste", Command::Paste),
-    ("Select All", Command::SelectAll),
-    ("Select Line", Command::Line(LineOp::Select)),
-    ("Toggle Comment", Command::Line(LineOp::Comment)),
-    ("Move Line Up", Command::Line(LineOp::Move(true))),
-    ("Move Line Down", Command::Line(LineOp::Move(false))),
-    ("Copy Line Up", Command::Line(LineOp::Copy(true))),
-    ("Copy Line Down", Command::Line(LineOp::Copy(false))),
-    ("Delete Line", Command::Line(LineOp::Delete)),
-    ("Add Next Match", Command::Caret(CaretOp::AddNext)),
-    ("Select All Matches", Command::Caret(CaretOp::SelectMatches)),
-    ("Add Caret Above", Command::Caret(CaretOp::AddAbove)),
-    ("Add Caret Below", Command::Caret(CaretOp::AddBelow)),
-    ("Fold", Command::Fold(FoldOp::Fold)),
-    ("Unfold", Command::Fold(FoldOp::Unfold)),
-    ("Fold All", Command::Fold(FoldOp::FoldAll)),
-    ("Unfold All", Command::Fold(FoldOp::UnfoldAll)),
-    ("Find", Command::Find),
-    ("Replace", Command::Replace),
-    ("Find Next", Command::FindNext),
-    ("Find Previous", Command::FindPrev),
-    ("Find in Files", Command::FindInFiles),
-    ("Go to Line", Command::GotoLine),
-    ("Go to Symbol", Command::GotoSymbol),
-    ("Go to Definition", Command::GotoDefinition),
-    ("Show Hover", Command::ShowHover),
-    ("Rename Symbol", Command::Rename),
-    ("Format Document", Command::Format),
-    ("Find References", Command::References),
-    ("Complete", Command::Complete),
-    ("Side Bar", Command::ToggleSidebar),
-    ("Explorer", Command::ToggleExplorer),
-    ("Search", Command::ToggleSearch),
-    ("Terminal", Command::ToggleTerminal),
-    ("Problems", Command::ToggleProblems),
-    ("Source Control", Command::ToggleGit),
-    ("Extensions", Command::ToggleExtensions),
-    ("Open Changes", Command::OpenChanges),
-    ("Split Editor", Command::SplitEditor),
-    ("Zoom In", Command::ZoomIn),
-    ("Zoom Out", Command::ZoomOut),
-    ("Reset Zoom", Command::ZoomReset),
-    ("Reset Layout", Command::ResetLayout),
-    ("Settings", Command::OpenSettings),
-    ("Open Settings File", Command::OpenSettingsFile),
+/// every command by stable id, label and command, for the palette.
+pub const COMMANDS: &[(&str, &str, Command)] = &[
+    ("workbench.quickOpen", "Quick Open", Command::QuickOpen),
+    ("file.newFile", "New File", Command::NewFile),
+    ("file.openFile", "Open File", Command::OpenFile),
+    ("file.openFolder", "Open Folder", Command::OpenFolder),
+    ("file.newWindow", "New Window", Command::NewWindow),
+    ("file.save", "Save", Command::Save),
+    ("file.saveAs", "Save As", Command::SaveAs),
+    ("file.saveAll", "Save All", Command::SaveAll),
+    ("file.closeTab", "Close Tab", Command::CloseTab),
+    (
+        "file.reopenClosed",
+        "Reopen Closed Tab",
+        Command::ReopenClosed,
+    ),
+    ("editor.toggleWordWrap", "Word Wrap", Command::ToggleWrap),
+    ("editor.nextTab", "Next Tab", Command::NextTab),
+    ("editor.prevTab", "Previous Tab", Command::PrevTab),
+    ("edit.undo", "Undo", Command::Undo),
+    ("edit.redo", "Redo", Command::Redo),
+    ("edit.cut", "Cut", Command::Cut),
+    ("edit.copy", "Copy", Command::Copy),
+    ("edit.paste", "Paste", Command::Paste),
+    ("selection.selectAll", "Select All", Command::SelectAll),
+    (
+        "selection.selectLine",
+        "Select Line",
+        Command::Line(LineOp::Select),
+    ),
+    (
+        "edit.toggleComment",
+        "Toggle Comment",
+        Command::Line(LineOp::Comment),
+    ),
+    (
+        "edit.moveLineUp",
+        "Move Line Up",
+        Command::Line(LineOp::Move(true)),
+    ),
+    (
+        "edit.moveLineDown",
+        "Move Line Down",
+        Command::Line(LineOp::Move(false)),
+    ),
+    (
+        "edit.copyLineUp",
+        "Copy Line Up",
+        Command::Line(LineOp::Copy(true)),
+    ),
+    (
+        "edit.copyLineDown",
+        "Copy Line Down",
+        Command::Line(LineOp::Copy(false)),
+    ),
+    (
+        "edit.deleteLine",
+        "Delete Line",
+        Command::Line(LineOp::Delete),
+    ),
+    (
+        "selection.addNextMatch",
+        "Add Next Match",
+        Command::Caret(CaretOp::AddNext),
+    ),
+    (
+        "selection.selectAllMatches",
+        "Select All Matches",
+        Command::Caret(CaretOp::SelectMatches),
+    ),
+    (
+        "selection.addCaretAbove",
+        "Add Caret Above",
+        Command::Caret(CaretOp::AddAbove),
+    ),
+    (
+        "selection.addCaretBelow",
+        "Add Caret Below",
+        Command::Caret(CaretOp::AddBelow),
+    ),
+    ("editor.fold", "Fold", Command::Fold(FoldOp::Fold)),
+    ("editor.unfold", "Unfold", Command::Fold(FoldOp::Unfold)),
+    ("editor.foldAll", "Fold All", Command::Fold(FoldOp::FoldAll)),
+    (
+        "editor.unfoldAll",
+        "Unfold All",
+        Command::Fold(FoldOp::UnfoldAll),
+    ),
+    ("find.find", "Find", Command::Find),
+    ("find.replace", "Replace", Command::Replace),
+    ("find.next", "Find Next", Command::FindNext),
+    ("find.previous", "Find Previous", Command::FindPrev),
+    ("find.inFiles", "Find in Files", Command::FindInFiles),
+    ("go.line", "Go to Line", Command::GotoLine),
+    ("go.symbol", "Go to Symbol", Command::GotoSymbol),
+    ("go.definition", "Go to Definition", Command::GotoDefinition),
+    ("editor.showHover", "Show Hover", Command::ShowHover),
+    ("editor.renameSymbol", "Rename Symbol", Command::Rename),
+    ("editor.formatDocument", "Format Document", Command::Format),
+    ("go.references", "Find References", Command::References),
+    ("editor.complete", "Complete", Command::Complete),
+    ("view.toggleSidebar", "Side Bar", Command::ToggleSidebar),
+    ("view.explorer", "Explorer", Command::ToggleExplorer),
+    ("view.search", "Search", Command::ToggleSearch),
+    ("view.terminal", "Terminal", Command::ToggleTerminal),
+    ("view.problems", "Problems", Command::ToggleProblems),
+    ("view.sourceControl", "Source Control", Command::ToggleGit),
+    ("view.extensions", "Extensions", Command::ToggleExtensions),
+    ("git.openChanges", "Open Changes", Command::OpenChanges),
+    ("editor.split", "Split Editor", Command::SplitEditor),
+    ("view.zoomIn", "Zoom In", Command::ZoomIn),
+    ("view.zoomOut", "Zoom Out", Command::ZoomOut),
+    ("view.zoomReset", "Reset Zoom", Command::ZoomReset),
+    (
+        "workbench.resetLayout",
+        "Reset Layout",
+        Command::ResetLayout,
+    ),
+    ("workbench.settings", "Settings", Command::OpenSettings),
+    (
+        "workbench.settingsFile",
+        "Open Settings File",
+        Command::OpenSettingsFile,
+    ),
 ];
+
+/// a built-in command by its stable id.
+pub fn command_by_id(id: &str) -> Option<Command> {
+    COMMANDS
+        .iter()
+        .find(|(i, _, _)| *i == id)
+        .map(|(_, _, c)| *c)
+}
+
+/// the stable id of a built-in command, when it has one.
+pub fn command_id(command: Command) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .find(|(_, _, c)| *c == command)
+        .map(|(i, _, _)| *i)
+}
 
 /// a native dialog to show once the frame is done; main shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -998,7 +1074,7 @@ impl App {
                 } else {
                     self.palette.commands = COMMANDS
                         .iter()
-                        .map(|(label, c)| palette::Item {
+                        .map(|(_, label, c)| palette::Item {
                             text: self.texts.tr(label).to_owned(),
                             note: self
                                 .keymap
@@ -2014,7 +2090,7 @@ impl App {
                 self.last_editor = Some(view);
             }
             Kind::Commands => {
-                if let Some(&(_, command)) = COMMANDS.get(item) {
+                if let Some(&(_, _, command)) = COMMANDS.get(item) {
                     self.run(command);
                 }
             }
@@ -4149,6 +4225,50 @@ fn keymap() -> Keymap<Command> {
 mod tests {
     use super::*;
     use aurea::dialog::MessageChoice;
+
+    #[test]
+    fn command_ids_are_unique() {
+        for (i, (id, _, _)) in COMMANDS.iter().enumerate() {
+            assert!(
+                COMMANDS[..i].iter().all(|(other, _, _)| other != id),
+                "duplicate id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_ids_match_the_charset_and_shape() {
+        for (id, _, _) in COMMANDS {
+            assert!(
+                id.chars().next().is_some_and(|c| c.is_ascii_lowercase()),
+                "id {id} must start lowercase"
+            );
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphabetic() || c == '.'),
+                "id {id} has a char outside [a-zA-Z.]"
+            );
+            let dots = id.matches('.').count();
+            assert!((1..=2).contains(&dots), "id {id} needs one or two dots");
+        }
+    }
+
+    #[test]
+    fn command_labels_are_unique() {
+        for (i, (_, label, _)) in COMMANDS.iter().enumerate() {
+            assert!(
+                COMMANDS[..i].iter().all(|(_, other, _)| other != label),
+                "duplicate label {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_id_round_trips() {
+        for (_, _, command) in COMMANDS {
+            assert_eq!(command_by_id(command_id(*command).unwrap()), Some(*command));
+        }
+        assert_eq!(command_by_id("nope"), None);
+    }
 
     fn app() -> App {
         let dir = std::env::temp_dir().join(format!("ligase-app-{}", std::process::id()));
