@@ -13,7 +13,7 @@ use crate::app::Id;
 use crate::lang::Texts;
 
 const BAR: f32 = 14.0;
-const PAD: f32 = 6.0;
+const PAD: f32 = 12.0;
 
 const MONO: &str = if cfg!(windows) {
     "Consolas"
