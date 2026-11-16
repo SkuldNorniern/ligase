@@ -46,6 +46,10 @@ const CARET_RATE: f32 = 38.0;
 const PART_H: u16 = 2;
 const PART_CARET: u16 = 3;
 const PART_HOVER: u16 = 4;
+/// sticky lines take parts from here, one each.
+const PART_STICKY: u16 = 16;
+/// at most this many sticky lines.
+const MAX_STICKY: usize = 4;
 const H_SCROLL: u16 = 0;
 const CARET_X: u16 = 0;
 const CARET_Y: u16 = 1;
@@ -1164,6 +1168,7 @@ pub fn show(
     let mut preedit = view.preedit.clone();
     let mut hscroll = view.hscroll;
     let seen_line = view.caret_line;
+    let mut stuck_jump: Option<usize> = None;
     if settings.overview {
         let track = Rect::new(rect.x + rect.width - BAR, rect.y, BAR, rect.height);
         overview(ui, track, doc, look.found, view.sel.head)?;
@@ -1696,6 +1701,74 @@ pub fn show(
                 shown.caret = Some(Rect::new(body_x + target_x, y, 2.0, line_h));
                 Ok(())
             })?;
+            // the lines that open the scopes the top line sits in, pinned over
+            // it, the innermost last. a click goes to that line
+            if settings.sticky_scroll && first_row > 0 {
+                let top = visible.first().map_or(0, |v| v.0);
+                let mut heads: Vec<usize> = doc
+                    .folds
+                    .iter()
+                    .filter_map(|f| fold::hides(text, f))
+                    .map(|(first, last)| (first - 1, last))
+                    .filter(|&(head, last)| head < top && top <= last)
+                    .map(|(head, _)| head)
+                    .collect();
+                heads.sort_unstable();
+                heads.dedup();
+                let keep = heads.len().saturating_sub(MAX_STICKY);
+                let heads = &heads[keep..];
+                // the lines under them must not show through
+                let width = (seen.width - BAR).max(0.0);
+                let band = Rect::new(seen.x, seen.y, width, heads.len() as f32 * line_h);
+                if !heads.is_empty() {
+                    ui.fill(band, palette.surface)?;
+                    let edge = Rect::new(seen.x, band.y + band.height, width, 1.0);
+                    ui.fill(edge, palette.border)?;
+                }
+                for (i, &line) in heads.iter().enumerate() {
+                    let y = seen.y + i as f32 * line_h;
+                    let row = Rect::new(seen.x, y, width, line_h);
+                    let input = ui.interact(
+                        Id::Editor(id),
+                        PART_STICKY + i as u16,
+                        row,
+                        Sense::Click,
+                        true,
+                    );
+                    if input.hovered {
+                        ui.fill(row, palette.hover)?;
+                        ui.set_cursor(CursorIcon::Pointer);
+                    }
+                    if input.clicked {
+                        stuck_jump = Some(line);
+                    }
+                    if settings.line_numbers != LineNumbers::Off {
+                        let number = Rect::new(content.x, y, gutter - 26.0, line_h);
+                        ui.text(
+                            &(line + 1).to_string(),
+                            number,
+                            &font,
+                            palette.faint,
+                            Align::End,
+                        )?;
+                    }
+                    let range = span(text, line);
+                    let laid = lay(text, range.clone(), tab);
+                    let body =
+                        Rect::new(body_x, y, (area.x + area.width - body_x).max(0.0), line_h);
+                    ui.clipped(Rect::new(area.x, y, area.width, line_h), |ui| {
+                        paint_line(
+                            ui,
+                            &font,
+                            &laid,
+                            &doc.spans,
+                            range,
+                            body,
+                            (palette.text, look.dark),
+                        )
+                    })?;
+                }
+            }
             // no scrolling far past the longest line in sight
             hscroll = hscroll.min((widest - area.width * 0.5).max(0.0));
             if let (Some(text), Some(caret)) = (look.hover, shown.caret) {
@@ -1712,6 +1785,13 @@ pub fn show(
     view.caret_line = Some(text.line_of(sel.head).unwrap_or(0));
     view.sel = sel;
     view.extra = extras;
+    // a sticky line was clicked: to its start, in sight next frame
+    if let Some(line) = stuck_jump {
+        view.sel = Selection::caret(span(text, line).start);
+        view.extra.clear();
+        view.reveal = true;
+        ui.mark_changed();
+    }
     view.column = column;
     view.folded = folded;
     drop(rows);

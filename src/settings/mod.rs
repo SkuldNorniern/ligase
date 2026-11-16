@@ -60,6 +60,8 @@ pub struct Settings {
     pub breadcrumbs: bool,
     /// marks for problems and find hits beside the scroll bar.
     pub overview: bool,
+    /// the lines that open the scopes the top line is in stay on top.
+    pub sticky_scroll: bool,
     pub whitespace: Whitespace,
     /// other copies of the word under the caret lit.
     pub word_highlight: bool,
@@ -93,6 +95,7 @@ impl Default for Settings {
             indent_guides: true,
             breadcrumbs: true,
             overview: true,
+            sticky_scroll: true,
             whitespace: Whitespace::Selection,
             word_highlight: true,
             auto_pairs: true,
@@ -129,6 +132,7 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # indent_guides = true
 # breadcrumbs = true
 # overview = true          # problem and find marks by the scroll bar
+# sticky_scroll = true     # the lines a scope opens on stay on top
 # whitespace = "selection"  # "none", "selection" or "all"
 # word_highlight = true
 # auto_pairs = true
@@ -230,6 +234,7 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
         | "indent_guides"
         | "breadcrumbs"
         | "overview"
+        | "sticky_scroll"
         | "word_highlight"
         | "auto_pairs"
         | "trim_trailing_whitespace"
@@ -246,6 +251,7 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
                 "indent_guides" => &mut out.indent_guides,
                 "breadcrumbs" => &mut out.breadcrumbs,
                 "overview" => &mut out.overview,
+                "sticky_scroll" => &mut out.sticky_scroll,
                 "word_highlight" => &mut out.word_highlight,
                 "trim_trailing_whitespace" => &mut out.trim_trailing_whitespace,
                 "final_newline" => &mut out.final_newline,
