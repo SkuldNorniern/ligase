@@ -1,6 +1,7 @@
 //! source view and editing. draws only the lines in sight; text comes from
 //! the buffer snapshot, never a copy of the whole file.
 
+pub mod abbrev;
 pub mod cursor;
 pub mod find;
 pub mod fold;
@@ -70,6 +71,8 @@ pub struct EditOpts {
     pub unit: String,
     /// brackets and quotes typed in pairs.
     pub auto_pairs: bool,
+    /// abbreviations by language, from packages.
+    pub abbrevs: std::collections::HashMap<&'static str, std::sync::Arc<abbrev::Abbrevs>>,
 }
 
 impl Default for EditOpts {
@@ -77,6 +80,7 @@ impl Default for EditOpts {
         Self {
             unit: TAB.to_owned(),
             auto_pairs: true,
+            abbrevs: std::collections::HashMap::new(),
         }
     }
 }
@@ -280,6 +284,27 @@ impl Place<'_> {
             sel: Selection::caret(range.start + new.len()),
             edits: vec![(range, new)],
         };
+        // a whole abbreviation before the caret: the char typed after it, or
+        // tab, turns it over
+        let abbrevs = self.language.and_then(|l| self.opts.abbrevs.get(l));
+        if sel.is_empty()
+            && let Some(abbrevs) = abbrevs
+        {
+            let turned = match action {
+                Action::Insert(typed) => {
+                    let mut chars = typed.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => abbrevs.expand(text, sel.head, c),
+                        _ => None,
+                    }
+                }
+                Action::Indent => abbrevs.finish(text, sel.head),
+                _ => None,
+            };
+            if let Some((range, with)) = turned {
+                return Some((plain(range, with), true));
+            }
+        }
         Some(match action {
             Action::Insert(typed) => match pairs::typed(text, sel, typed).filter(|_| pairs_on) {
                 Some(change) => (change, true),
@@ -1780,6 +1805,32 @@ mod tests {
     use super::*;
     use crate::editor::cursor::Motion;
     use std::path::Path;
+
+    #[test]
+    fn abbreviations_turn_over_as_you_type() {
+        let (mut docs, v) = open("");
+        let mut opts = EditOpts::default();
+        opts.abbrevs.insert(
+            "rust",
+            std::sync::Arc::new(abbrev::Abbrevs::new(
+                '\\',
+                [
+                    ("to".to_owned(), "→".to_owned()),
+                    ("a".to_owned(), "α".to_owned()),
+                ],
+            )),
+        );
+        for c in ["\\", "t", "o", " ", "\\", "a"] {
+            act_with(&mut docs, v, Action::Insert(c.into()), &opts);
+        }
+        assert_eq!(text(&docs, v), "→ \\a");
+        act_with(&mut docs, v, Action::Indent, &opts);
+        assert_eq!(text(&docs, v), "→ α", "tab finishes it, no tab added");
+        assert!(docs.undo(v));
+        assert_eq!(text(&docs, v), "", "the typing run is one step");
+        act(&mut docs, v, Action::Insert("\\to x".into()));
+        assert_eq!(text(&docs, v), "\\to x", "a paste is left alone");
+    }
 
     fn open(text: &str) -> (Documents, ViewId) {
         let mut docs = Documents::default();

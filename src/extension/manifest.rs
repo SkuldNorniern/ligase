@@ -32,6 +32,7 @@ const MAX_SNIPPET_DESCRIPTION: usize = 120;
 const MAX_VIEWS: usize = 20;
 const MAX_SYNTAXES: usize = 10;
 const MAX_SERVERS: usize = 5;
+const MAX_ABBREV_SETS: usize = 10;
 const MAX_ARGS: usize = 20;
 const MAX_ARG: usize = 200;
 const MAX_PATH: usize = 200;
@@ -55,6 +56,8 @@ pub struct Manifest {
     pub syntaxes: Vec<String>,
     /// language servers to start, once the user allows it.
     pub servers: Vec<Server>,
+    /// abbreviation tables, each a file in the package.
+    pub abbreviations: Vec<AbbrevSet>,
     /// things skipped but not fatal, e.g. unknown keys.
     pub warnings: Vec<String>,
 }
@@ -101,6 +104,15 @@ pub struct View {
     /// a bundled icon name for its rail button.
     pub icon: String,
     pub body: Node,
+}
+
+/// abbreviations for a language: a leader char and a table file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbbrevSet {
+    pub language: String,
+    pub leader: char,
+    /// a toml file of `"key" = "text"` inside the package.
+    pub file: String,
 }
 
 /// a language server a package starts for a language's files.
@@ -307,9 +319,76 @@ fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
     check_keys(
         table,
         "contributions",
-        &["languages", "snippets", "views", "syntaxes", "servers"],
+        &[
+            "languages",
+            "snippets",
+            "views",
+            "syntaxes",
+            "servers",
+            "abbreviations",
+        ],
         report,
     );
+
+    if let Some(items) = list(
+        table,
+        "contributions",
+        "abbreviations",
+        MAX_ABBREV_SETS,
+        report,
+    ) {
+        for (i, item) in items.iter().enumerate() {
+            let path = format!("contributions.abbreviations[{i}]");
+            let Some(t) = item_table(item, &path, report) else {
+                continue;
+            };
+            check_keys(t, &path, &["language", "leader", "file"], report);
+            let language = required_string(t, &path, "language", report).and_then(|l| {
+                let ok = lang_id_ok(l);
+                if !ok {
+                    report.error(&join(&path, "language"), LANG_ID_RULE);
+                }
+                ok.then(|| l.to_owned())
+            });
+            let leader = match string(t, &path, "leader", report) {
+                None => Some('\\'),
+                Some(l) => {
+                    let mut chars = l.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None)
+                            if !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control() =>
+                        {
+                            Some(c)
+                        }
+                        _ => {
+                            report.error(
+                                &join(&path, "leader"),
+                                "must be one char, not a letter, digit or space",
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            let file = required_string(t, &path, "file", report).and_then(|f| {
+                let ok = package_path_ok(f) && f.ends_with(".toml");
+                if !ok {
+                    report.error(
+                        &join(&path, "file"),
+                        "must be a path inside the package ending in .toml",
+                    );
+                }
+                ok.then(|| f.to_owned())
+            });
+            if let (Some(language), Some(leader), Some(file)) = (language, leader, file) {
+                out.abbreviations.push(AbbrevSet {
+                    language,
+                    leader,
+                    file,
+                });
+            }
+        }
+    }
 
     if let Some(items) = list(table, "contributions", "servers", MAX_SERVERS, report) {
         if !items.is_empty() && !out.permissions.spawn_process {
@@ -1006,6 +1085,7 @@ description = "a theorem"
             views: Vec::new(),
             syntaxes: Vec::new(),
             servers: Vec::new(),
+            abbreviations: Vec::new(),
             id: "org.example.lean".into(),
             name: "Lean Support".into(),
             version: (0, 1, 0),

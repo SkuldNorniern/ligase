@@ -2167,10 +2167,9 @@ impl App {
         if settings.editor_size != self.settings.editor_size || self.zoom == editor::SIZE {
             self.zoom = settings.editor_size;
         }
-        self.edit_opts = editor::EditOpts {
-            unit: " ".repeat(settings.tab_size),
-            auto_pairs: settings.auto_pairs,
-        };
+        // the abbreviations come from packages, not settings
+        self.edit_opts.unit = " ".repeat(settings.tab_size);
+        self.edit_opts.auto_pairs = settings.auto_pairs;
         if settings.language != self.settings.language {
             let lang = Lang::detect(settings.language.as_deref());
             lang.font_family().clone_into(&mut self.theme.font_family);
@@ -3839,6 +3838,7 @@ impl App {
         let names: Vec<&str> = grammars.iter().map(|(n, _)| n.as_str()).collect();
         self.docs.recolour(&names);
         self.lsp.set_extra(self.extensions.servers());
+        self.edit_opts.abbrevs = self.extensions.abbrevs();
         let broken = self.extensions.broken();
         if broken > 0 {
             self.say(format!(

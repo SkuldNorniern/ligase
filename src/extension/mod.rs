@@ -31,7 +31,25 @@ pub struct Package {
     pub grammars: Vec<Grammar>,
     /// what went wrong with parts of a package that still loaded.
     pub problems: Vec<String>,
+    /// abbreviation tables read from the package.
+    pub abbrevs: Vec<AbbrevTable>,
 }
+
+/// key and text pairs.
+pub type Pairs = Vec<(String, String)>;
+
+/// an abbreviation table a package brings for a language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbbrevTable {
+    pub language: String,
+    pub leader: char,
+    pub pairs: Pairs,
+}
+
+/// largest abbreviation file read.
+pub const MAX_ABBREV_FILE: u64 = 256 * 1024;
+/// abbreviations kept per file.
+pub const MAX_ABBREVS: usize = 5000;
 
 /// a sylven grammar a package brings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,7 +120,22 @@ pub fn scan(root: &Path) -> (Vec<Package>, Vec<String>) {
             };
             let mut grammars = Vec::new();
             let mut problems = Vec::new();
+            let mut abbrevs = Vec::new();
             if let State::Ready(m) = &state {
+                for set in &m.abbreviations {
+                    match abbreviations(&dir, &set.file, set.leader) {
+                        Ok((pairs, skipped)) => {
+                            problems
+                                .extend(skipped.into_iter().map(|w| format!("{}: {w}", set.file)));
+                            abbrevs.push(AbbrevTable {
+                                language: set.language.clone(),
+                                leader: set.leader,
+                                pairs,
+                            });
+                        }
+                        Err(why) => problems.push(format!("{}: {why}", set.file)),
+                    }
+                }
                 for file in &m.syntaxes {
                     match grammar(&dir, file) {
                         Ok(g) if grammars.iter().any(|o: &Grammar| o.name == g.name) => {
@@ -118,6 +151,7 @@ pub fn scan(root: &Path) -> (Vec<Package>, Vec<String>) {
                 state,
                 grammars,
                 problems,
+                abbrevs,
             }
         })
         .collect();
@@ -127,6 +161,50 @@ pub fn scan(root: &Path) -> (Vec<Package>, Vec<String>) {
 /// every command line `m` would start, as a grant records them.
 pub fn lines(m: &Manifest) -> Vec<Vec<String>> {
     m.servers.iter().map(manifest::Server::line).collect()
+}
+
+/// an abbreviation table: `"key" = "text"` pairs. keys are 1-32 chars, no
+/// spaces and no leader; texts 1-32 chars, no control chars. a bad pair is
+/// skipped and said, the rest load.
+fn abbreviations(dir: &Path, file: &str, leader: char) -> Result<(Pairs, Vec<String>), String> {
+    let path = file
+        .split('/')
+        .fold(dir.to_path_buf(), |p, part| p.join(part));
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_ABBREV_FILE {
+        return Err(format!("over {} KiB", MAX_ABBREV_FILE / 1024));
+    }
+    let text = String::from_utf8(std::fs::read(&path).map_err(|e| e.to_string())?)
+        .map_err(|_| "not utf-8".to_owned())?;
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        e.to_string().lines().next().unwrap_or_default().to_owned()
+    })?;
+    let mut pairs = Vec::new();
+    let mut skipped = Vec::new();
+    for (key, value) in &table {
+        if pairs.len() == MAX_ABBREVS {
+            skipped.push(format!("more than {MAX_ABBREVS}, the rest left out"));
+            break;
+        }
+        let key_ok = (1..=editor_key_max()).contains(&key.chars().count())
+            && !key
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == leader);
+        let text = value
+            .as_str()
+            .filter(|t| (1..=32).contains(&t.chars().count()) && !t.chars().any(char::is_control));
+        match (key_ok, text) {
+            (true, Some(text)) => pairs.push((key.clone(), text.to_owned())),
+            _ => skipped.push(format!(
+                "{key:?} skipped: key 1-32 chars, no spaces, text 1-32 chars"
+            )),
+        }
+    }
+    Ok((pairs, skipped))
+}
+
+fn editor_key_max() -> usize {
+    crate::editor::abbrev::MAX_KEY
 }
 
 /// a grammar file from a package: read with a size cap, parsed under a
@@ -250,6 +328,45 @@ impl Extensions {
         let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
         self.names.insert(kept);
         kept
+    }
+
+    /// abbreviation tables by language for the editor. tables of one
+    /// language from several packages join; the later package wins a key.
+    pub fn abbrevs(
+        &mut self,
+    ) -> std::collections::HashMap<&'static str, std::sync::Arc<crate::editor::abbrev::Abbrevs>>
+    {
+        let mut joined: Vec<AbbrevTable> = Vec::new();
+        for p in &self.packages {
+            if !matches!(p.state, State::Ready(_)) {
+                continue;
+            }
+            for table in &p.abbrevs {
+                match joined
+                    .iter_mut()
+                    .find(|t| t.language == table.language && t.leader == table.leader)
+                {
+                    Some(slot) => slot.pairs.extend(table.pairs.iter().cloned()),
+                    None => joined.push(table.clone()),
+                }
+            }
+        }
+        joined
+            .into_iter()
+            .map(
+                |AbbrevTable {
+                     language,
+                     leader,
+                     pairs,
+                 }| {
+                    let name = syntax::bundled(&language).unwrap_or_else(|| self.intern(&language));
+                    (
+                        name,
+                        std::sync::Arc::new(crate::editor::abbrev::Abbrevs::new(leader, pairs)),
+                    )
+                },
+            )
+            .collect()
     }
 
     /// every grammar the ready packages bring, first one per name.
@@ -445,6 +562,7 @@ body = "theorem $1 := by\n  $0"
                 state: State::Ready(Box::new(manifest)),
                 grammars: Vec::new(),
                 problems: Vec::new(),
+                abbrevs: Vec::new(),
             }],
             ..Extensions::default()
         };
