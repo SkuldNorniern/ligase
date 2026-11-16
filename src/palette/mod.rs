@@ -177,6 +177,12 @@ impl Palette {
         }
     }
 
+    /// moves the rows in sight by `by`, the pick staying where it is.
+    pub fn scroll(&mut self, by: isize, rows: usize) {
+        let most = self.shown.len().saturating_sub(rows);
+        self.top = self.top.saturating_add_signed(by).min(most);
+    }
+
     /// the item picked now.
     pub fn picked(&self) -> Option<usize> {
         self.shown.get(self.pick).map(|s| s.item)
@@ -312,6 +318,10 @@ mod tests {
         p.step(5, 1);
         assert_eq!(p.pick, 1);
         assert_eq!(p.top, 1);
+        p.scroll(-9, 1);
+        assert_eq!((p.pick, p.top), (1, 0), "the wheel leaves the pick");
+        p.scroll(9, 1);
+        assert_eq!(p.top, 1, "never past the last row");
         p.query = ">sav".into();
         assert_eq!(p.wanted(), (Kind::Commands, "sav"));
     }

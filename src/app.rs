@@ -650,6 +650,15 @@ impl App {
                 return true;
             }
         }
+        if self.palette.is_open()
+            && let WindowEvent::MouseWheel { delta_y, .. } = event
+        {
+            // three rows a notch; the editor under the card keeps still
+            #[allow(clippy::cast_possible_truncation)]
+            let by = -(delta_y * 3.0).round() as isize;
+            self.palette.scroll(by, palette::view::ROWS);
+            return true;
+        }
         if let WindowEvent::MouseWheel {
             delta_y, modifiers, ..
         } = event
