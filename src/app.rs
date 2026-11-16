@@ -9,8 +9,8 @@ use std::time::Instant;
 use aurea::render::{
     CanvasId, DrawingContext, Rect, request_canvas_redraw, request_canvas_redraw_at,
 };
-use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Theme, Ui, UiState};
-use aurea::{AureaResult, Chord, KeyCode, Keymap, WindowEvent};
+use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Sense, Theme, Ui, UiState};
+use aurea::{AureaResult, Chord, CursorIcon, KeyCode, Keymap, WindowEvent};
 
 use resolvase::{Encoding, Point, Revision, SavePoint};
 
@@ -56,6 +56,7 @@ pub enum Id {
     CompletionRow(u16),
     ProblemList,
     Menu,
+    Welcome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2509,6 +2510,7 @@ impl App {
         let titles = self.titles();
         let dirty = self.dirty_panes();
         let mut clicks: Vec<Click> = Vec::new();
+        let mut welcome_pick: Option<Command> = None;
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let menu_act;
@@ -2548,6 +2550,7 @@ impl App {
             .and_then(|v| self.docs.doc_of(v))
             .filter(|d| !d.untitled)
             .map(|d| d.path.clone());
+        let keymap = &self.keymap;
         {
             let Workbench { dock, panels } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
@@ -2636,7 +2639,8 @@ impl App {
                     Ok(())
                 }
                 Some(Panel::Welcome) | None => {
-                    hint(ui, rect, texts.tr("open a file from the explorer"))
+                    welcome_pick = welcome(ui, rect, texts, keymap)?.or(welcome_pick);
+                    Ok(())
                 }
             };
             let response = DockView::new(dock, title, content)
@@ -2761,6 +2765,9 @@ impl App {
             self.menu_target = Some(Target::Editor(view));
             self.menu.ask(at, context_menu::editor());
         }
+        if let Some(command) = welcome_pick {
+            self.run(command);
+        }
         if let Some(act) = menu_act {
             self.menu_act(act);
         }
@@ -2857,10 +2864,64 @@ fn settings_file(path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn hint(ui: &mut Ui<'_, Id>, rect: Rect, text: &str) -> AureaResult<()> {
+/// what the welcome page offers, with the label its menu item has.
+const WELCOME: [(&str, Command); 7] = [
+    ("Quick Open", Command::QuickOpen),
+    ("Command Palette", Command::Commands),
+    ("New File", Command::NewFile),
+    ("Open File", Command::OpenFile),
+    ("Find in Files", Command::FindInFiles),
+    ("Terminal", Command::ToggleTerminal),
+    ("Settings", Command::OpenSettings),
+];
+
+/// the page with no file open: a few commands and their keys, each one a
+/// button. the command clicked comes back.
+fn welcome(
+    ui: &mut Ui<'_, Id>,
+    rect: Rect,
+    texts: &Texts,
+    keymap: &Keymap<Command>,
+) -> AureaResult<Option<Command>> {
+    const ROW: f32 = 30.0;
+    let palette = ui.theme.palette;
+    let title_font = ui.theme.font(22.0);
     let font = ui.theme.font(13.0);
-    let color = ui.theme.palette.dim;
-    ui.text(text, rect, &font, color, Align::Center)
+    let width = 340.0_f32.min(rect.width - 32.0).max(0.0);
+    let height = 44.0 + 28.0 + WELCOME.len() as f32 * ROW;
+    let x = rect.x + (rect.width - width) / 2.0;
+    let mut y = rect.y + ((rect.height - height) / 2.0).max(16.0);
+    let title = Rect::new(x + 10.0, y, width, 36.0);
+    ui.text(
+        texts.tr("Ligase"),
+        title,
+        &title_font,
+        palette.text,
+        Align::Start,
+    )?;
+    y += 44.0;
+    let note = Rect::new(x + 10.0, y, width, 20.0);
+    let line = texts.tr("open a file from the explorer");
+    ui.text(line, note, &font, palette.dim, Align::Start)?;
+    y += 28.0;
+    let mut picked = None;
+    for (i, (label, command)) in WELCOME.iter().enumerate() {
+        let row = Rect::new(x, y + i as f32 * ROW, width, ROW - 2.0);
+        let input = ui.interact(Id::Welcome, i as u16, row, Sense::Click, true);
+        if input.hovered {
+            ui.round(row, 5.0, palette.hover)?;
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        let inner = row.inset_xy(10.0, 0.0);
+        ui.text(texts.tr(label), inner, &font, palette.text, Align::Start)?;
+        if let Some(chord) = keymap.chord_for(command) {
+            ui.text(&chord.label(), inner, &font, palette.dim, Align::End)?;
+        }
+        if input.clicked {
+            picked = Some(*command);
+        }
+    }
+    Ok(picked)
 }
 
 /// how long a status message stays.
