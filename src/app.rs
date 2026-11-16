@@ -354,6 +354,8 @@ pub struct App {
     open_after: Option<(PathBuf, Option<usize>)>,
     /// a folder to open once this window has closed.
     reopen: Option<PathBuf>,
+    /// the new window's: no folder of its own.
+    blank: bool,
     /// other folders opened before, newest first.
     recent: Vec<PathBuf>,
     /// a save is out and the window closes once it is back.
@@ -420,6 +422,7 @@ impl App {
             restored: false,
             open_after: None,
             reopen: None,
+            blank,
             recent: Vec::new(),
             closing: false,
             close_now: false,
@@ -512,7 +515,7 @@ impl App {
 
     pub fn title(&self) -> String {
         // a new window has no folder to name
-        if self.session.is_none() && !self.shows(Panel::Explorer) {
+        if self.blank {
             return self.texts.tr("Ligase").to_owned();
         }
         let root = self.explorer.root();
@@ -1771,9 +1774,10 @@ impl App {
     /// a save came back: a close that waited on it goes ahead.
     fn after_save(&mut self, doc: DocumentId, ok: bool) {
         if !ok {
-            // a failed save keeps everything open
+            // a failed save keeps everything open, here and no folder after
             self.close_after_save = false;
             self.close_pane_after_save = None;
+            self.reopen = None;
             return;
         }
         if let Some(pane) = self.close_pane_after_save
@@ -2234,6 +2238,7 @@ impl App {
                     // cancelled: a close waiting on this file stays open
                     self.close_after_save = false;
                     self.close_pane_after_save = None;
+                    self.reopen = None;
                     return;
                 };
                 let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
