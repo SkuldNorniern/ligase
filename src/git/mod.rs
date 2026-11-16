@@ -2,6 +2,7 @@
 //! and the branch. git runs as a program on the file worker; no repository
 //! is ever read on the ui thread.
 
+pub mod diff;
 pub mod view;
 
 use std::collections::hash_map::DefaultHasher;
@@ -212,6 +213,18 @@ pub fn branch(dir: &Path) -> Option<String> {
         .or_else(|| git(dir, &["rev-parse", "--short", "HEAD"]).and_then(line))
 }
 
+/// the lines of `text` as the diff counts them, `\r` off their ends.
+fn lines_of(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+}
+
 fn line_hashes(text: &str) -> Vec<u64> {
     let mut lines: Vec<&str> = text.split('\n').collect();
     // a final newline ends the last line; it doesn't start another
@@ -296,6 +309,92 @@ fn edits(a: &[u64], b: &[u64], cap: usize) -> Option<Vec<Op>> {
     Some(ops)
 }
 
+/// one row of a unified diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffLine {
+    /// a line both have: its number in HEAD and now, from 0.
+    Same(usize, usize, String),
+    /// a line only HEAD had.
+    Removed(usize, String),
+    /// a line only the text now has.
+    Added(usize, String),
+    /// this many lines alike, folded away.
+    Gap(usize),
+}
+
+/// `base` against `now` as a unified diff: changes with `context` lines
+/// around them, longer stretches alike folded into gaps. empty when alike.
+pub fn unified(base: &str, now: &str, context: usize) -> Vec<DiffLine> {
+    let (old, new) = (lines_of(base), lines_of(now));
+    let (a, b) = (line_hashes(base), line_hashes(now));
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (mid_a, mid_b) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+    if mid_a.is_empty() && mid_b.is_empty() {
+        return Vec::new();
+    }
+    let mid = edits(mid_a, mid_b, MAX_EDITS).unwrap_or_else(|| {
+        let mut ops = vec![Op::Delete; mid_a.len()];
+        ops.extend(std::iter::repeat_n(Op::Insert, mid_b.len()));
+        ops
+    });
+    let ops = std::iter::repeat_n(Op::Keep, head)
+        .chain(mid)
+        .chain(std::iter::repeat_n(Op::Keep, tail));
+    let (mut i, mut j) = (0, 0);
+    let mut rows = Vec::new();
+    for op in ops {
+        match op {
+            Op::Keep => {
+                rows.push(DiffLine::Same(i, j, new[j].to_owned()));
+                i += 1;
+                j += 1;
+            }
+            Op::Delete => {
+                rows.push(DiffLine::Removed(i, old[i].to_owned()));
+                i += 1;
+            }
+            Op::Insert => {
+                rows.push(DiffLine::Added(j, new[j].to_owned()));
+                j += 1;
+            }
+        }
+    }
+    // keep `context` alike lines on each side of a change, fold the rest
+    let changed: Vec<bool> = rows
+        .iter()
+        .map(|r| !matches!(r, DiffLine::Same(..)))
+        .collect();
+    let total = rows.len();
+    let near = |k: usize| {
+        let lo = k.saturating_sub(context);
+        let hi = (k + context + 1).min(total);
+        changed[lo..hi].iter().any(|c| *c)
+    };
+    let mut out = Vec::new();
+    let mut folded = 0;
+    for (k, row) in rows.into_iter().enumerate() {
+        if matches!(row, DiffLine::Same(..)) && !near(k) {
+            folded += 1;
+            continue;
+        }
+        if folded > 0 {
+            out.push(DiffLine::Gap(folded));
+            folded = 0;
+        }
+        out.push(row);
+    }
+    if folded > 0 {
+        out.push(DiffLine::Gap(folded));
+    }
+    out
+}
+
 /// the lines of `now` that differ from `base`.
 pub fn hunks(base: &str, now: &str) -> Vec<Hunk> {
     let (a, b) = (line_hashes(base), line_hashes(now));
@@ -374,6 +473,25 @@ mod tests {
         assert_eq!(by("d.rs").old.as_deref(), Some("old.rs"));
         assert_eq!(by("a.rs").old, None);
         assert_eq!(by("a.rs").path, top.join("a.rs"));
+    }
+
+    #[test]
+    fn unified_shows_changes_with_context_and_folds_the_rest() {
+        let base: String = (1..=20).map(|i| format!("l{i}\n")).collect();
+        let now = base.replace("l10\n", "ten\n").replace("l15\n", "");
+        let rows = unified(&base, &now, 2);
+        assert_eq!(rows.first(), Some(&DiffLine::Gap(7)), "lines 1 to 7 folded");
+        assert!(rows.contains(&DiffLine::Removed(9, "l10".into())));
+        assert!(rows.contains(&DiffLine::Added(9, "ten".into())));
+        assert!(rows.contains(&DiffLine::Removed(14, "l15".into())));
+        assert!(
+            rows.contains(&DiffLine::Same(11, 11, "l12".into())),
+            "context kept"
+        );
+        assert_eq!(rows.last(), Some(&DiffLine::Gap(3)));
+        assert!(unified(&base, &base, 3).is_empty());
+        assert_eq!(unified("", "a\n", 3), [DiffLine::Added(0, "a".into())]);
+        assert_eq!(unified("a\r\n", "a\n", 3), [], "line ends aside");
     }
 
     #[test]

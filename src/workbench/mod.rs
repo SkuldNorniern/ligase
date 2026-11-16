@@ -71,7 +71,12 @@ impl Workbench {
 
     /// shows `view` as a tab in the editor area, replacing the welcome tab.
     pub fn show_editor(&mut self, view: ViewId) -> PaneId {
-        let pane = self.panels.pane(Panel::Editor(view));
+        self.show_in_editor_area(Panel::Editor(view))
+    }
+
+    /// shows `panel` as a tab in the editor area, replacing the welcome tab.
+    pub fn show_in_editor_area(&mut self, panel: Panel) -> PaneId {
+        let pane = self.panels.pane(panel);
         if !self.dock.tree.contains(pane) {
             match self.editor_area() {
                 Some(beside) => {
@@ -115,6 +120,18 @@ impl Workbench {
             ) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
+            }
+            Some(Panel::Diff(_)) => {
+                let last = !self
+                    .panels
+                    .iter()
+                    .any(|(id, p)| id != pane && p.is_editor_area() && self.dock.tree.contains(id));
+                if last {
+                    let welcome = self.panels.pane(Panel::Welcome);
+                    self.tree().insert(welcome, pane, DockSide::Center);
+                }
+                self.tree().remove(pane);
+                self.panels.remove(pane);
             }
             Some(Panel::Editor(view)) => {
                 if !discard && docs.close_loses_work(view) {
@@ -224,6 +241,16 @@ impl Workbench {
                         // a file never saved has no path to come back to
                         let path = docs
                             .doc_of(view)
+                            .filter(|d| !d.untitled)
+                            .map(|d| d.path.display().to_string())
+                            .unwrap_or_default();
+                        editors.push(path);
+                        format!("editor{}", editors.len() - 1)
+                    }
+                    // a diff comes back as its file
+                    Panel::Diff(doc) => {
+                        let path = docs
+                            .doc(doc)
                             .filter(|d| !d.untitled)
                             .map(|d| d.path.display().to_string())
                             .unwrap_or_default();

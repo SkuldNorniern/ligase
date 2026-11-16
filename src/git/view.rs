@@ -20,6 +20,8 @@ const PAD: f32 = 8.0;
 /// what the panel asks the app to do.
 pub enum Ask {
     Open(PathBuf),
+    /// a changed file against HEAD.
+    Diff(PathBuf),
     Stage(Vec<String>),
     Unstage(Vec<String>),
     /// throw away the working tree's edits, after asking.
@@ -193,8 +195,13 @@ pub fn show(
         .row_clicked
         .or(response.activated.then_some(picked).flatten())
         .and_then(|i| match lines.get(i) {
+            // a file git had before opens as a diff, a new one as itself
             Some(Line::File(change, _)) if change.tree != 'D' && change.index != 'D' => {
-                Some(Ask::Open(change.path.clone()))
+                if matches!(change.tree, '?') || change.index == 'A' {
+                    Some(Ask::Open(change.path.clone()))
+                } else {
+                    Some(Ask::Diff(change.path.clone()))
+                }
             }
             _ => None,
         });

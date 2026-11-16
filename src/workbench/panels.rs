@@ -1,7 +1,7 @@
 //! what sits in each dock tab. the dock only knows `PaneId`s; this maps
 //! them to panels.
 
-use crate::document::ViewId;
+use crate::document::{DocumentId, ViewId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaneId(u32);
@@ -18,12 +18,14 @@ pub enum Panel {
     /// stands in the editor area when no file is open.
     Welcome,
     Editor(ViewId),
+    /// a file against HEAD.
+    Diff(DocumentId),
 }
 
 impl Panel {
     /// editors and the welcome tab make up the editor area.
     pub fn is_editor_area(self) -> bool {
-        matches!(self, Panel::Welcome | Panel::Editor(_))
+        matches!(self, Panel::Welcome | Panel::Editor(_) | Panel::Diff(_))
     }
 }
 

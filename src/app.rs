@@ -59,6 +59,8 @@ pub enum Id {
     ScmCommit,
     ScmList,
     ScmRow(u16),
+    DiffOpen(DocumentId),
+    DiffList(DocumentId),
     Status,
     Menu,
     Welcome,
@@ -92,6 +94,8 @@ pub enum Command {
     ToggleTerminal,
     ToggleProblems,
     ToggleGit,
+    /// the focused file against HEAD.
+    OpenChanges,
     SplitEditor,
     ResetLayout,
     ZoomIn,
@@ -167,6 +171,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Terminal", Command::ToggleTerminal),
     ("Problems", Command::ToggleProblems),
     ("Source Control", Command::ToggleGit),
+    ("Open Changes", Command::OpenChanges),
     ("Split Editor", Command::SplitEditor),
     ("Zoom In", Command::ZoomIn),
     ("Zoom Out", Command::ZoomOut),
@@ -268,6 +273,7 @@ enum Done {
     Branch(Option<String>),
     Recent(Vec<PathBuf>),
     Changes(Option<crate::git::Status>),
+    Diff(DocumentId, Revision, Vec<crate::git::DiffLine>),
     /// stage, unstage or commit came back; a commit says so.
     GitDid(Result<bool, String>),
 }
@@ -345,6 +351,10 @@ pub struct App {
     /// git was asked and hasn't answered yet.
     changes_asked: bool,
     scm: crate::git::view::Scm,
+    /// each diff tab's rows, the revision they are for, and whether a new
+    /// diff is out.
+    diffs: HashMap<DocumentId, (Option<Revision>, bool, Vec<crate::git::DiffLine>)>,
+    diff_shown: HashMap<DocumentId, crate::git::diff::Shown>,
     /// when the message was said; it goes after a while.
     status_at: Instant,
     /// the editor view with the keyboard, from the last frame.
@@ -423,6 +433,8 @@ impl App {
             changes_known: false,
             changes_asked: false,
             scm: crate::git::view::Scm::default(),
+            diffs: HashMap::new(),
+            diff_shown: HashMap::new(),
             status_at: Instant::now(),
             focus: None,
             layout_dirty: false,
@@ -1026,6 +1038,12 @@ impl App {
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ToggleProblems => self.bench.toggle(Panel::Problems),
+            Command::OpenChanges => {
+                if let Some(view) = focus.or(self.last_editor) {
+                    self.show_diff(view);
+                }
+                return;
+            }
             Command::ToggleGit => {
                 self.bench.toggle(Panel::Git);
                 self.refresh_status();
@@ -2400,6 +2418,49 @@ impl App {
             .run(move || Done::Changes(crate::git::status(&root)));
     }
 
+    /// opens `view`'s file against HEAD, in a tab beside it.
+    fn show_diff(&mut self, view: ViewId) {
+        let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
+            return;
+        };
+        self.bench.show_in_editor_area(Panel::Diff(doc));
+        self.layout_dirty = true;
+    }
+
+    /// sends the diff off for every diff tab whose text moved on.
+    fn ask_diffs(&mut self) {
+        let open: Vec<DocumentId> = self
+            .bench
+            .panels
+            .iter()
+            .filter_map(|(_, p)| match p {
+                Panel::Diff(doc) => Some(doc),
+                _ => None,
+            })
+            .collect();
+        self.diffs.retain(|doc, _| open.contains(doc));
+        self.diff_shown.retain(|doc, _| open.contains(doc));
+        for doc in open {
+            let Some(d) = self.docs.doc(doc) else {
+                continue;
+            };
+            let Some(base) = d.git.base.clone() else {
+                continue;
+            };
+            let revision = d.buffer.revision();
+            let entry = self.diffs.entry(doc).or_insert((None, false, Vec::new()));
+            if entry.1 || entry.0 == Some(revision) {
+                continue;
+            }
+            entry.1 = true;
+            let text = d.buffer.snapshot();
+            self.jobs.run(move || {
+                let now = String::from(&text);
+                Done::Diff(doc, revision, crate::git::unified(&base, &now, 3))
+            });
+        }
+    }
+
     /// what the source control panel asked for.
     fn scm_ask(&mut self, ask: crate::git::view::Ask) {
         use crate::git::view::Ask;
@@ -2411,6 +2472,11 @@ impl App {
                 let view = self.open_file(&path);
                 self.ui.focus(Id::Editor(view), 1);
                 self.last_editor = Some(view);
+            }
+            Ask::Diff(path) => {
+                let view = self.open_file(&path);
+                self.last_editor = Some(view);
+                self.show_diff(view);
             }
             Ask::Stage(rels) => {
                 self.jobs
@@ -2542,6 +2608,7 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        self.ask_diffs();
         // a server that never answers the format still lets the file save
         if let Some((_, doc, _)) = self.save_after_format {
             self.finish_format_save(doc, true);
@@ -2702,6 +2769,9 @@ impl App {
                 }
                 Done::Branch(branch) => self.branch = branch,
                 Done::Recent(recent) => self.recent = recent,
+                Done::Diff(doc, revision, rows) => {
+                    self.diffs.insert(doc, (Some(revision), false, rows));
+                }
                 Done::Changes(status) => {
                     self.changes = status;
                     self.changes_known = true;
@@ -2815,6 +2885,14 @@ impl App {
                         }
                     }
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
+                    Panel::Diff(doc) => {
+                        let name = self
+                            .docs
+                            .doc(doc)
+                            .map(document::Document::name)
+                            .unwrap_or_default();
+                        format!("{name} ({})", self.texts.tr("changes"))
+                    }
                     Panel::Git => {
                         let label = self.texts.tr("Source Control");
                         match self.changes.as_ref().map(|s| s.changes.len()) {
@@ -2849,7 +2927,7 @@ impl App {
                     }
                     Panel::Explorer => "folder",
                     Panel::Search => "search",
-                    Panel::Git => "source-control",
+                    Panel::Git | Panel::Diff(_) => "source-control",
                     Panel::Terminal => "shell",
                     Panel::Problems | Panel::Welcome => return None,
                 };
@@ -2899,6 +2977,7 @@ impl App {
         }
         let mut problem_picked = None;
         let mut scm_asked = None;
+        let mut diff_asked: Option<(DocumentId, crate::git::diff::Ask)> = None;
         self.fill_symbols();
         let mut picked_completion = None;
         let mut found = None;
@@ -2938,6 +3017,8 @@ impl App {
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
             let changes_known = self.changes_known;
+            let (diffs, diff_shown) = (&self.diffs, &mut self.diff_shown);
+            let mono = aurea::render::Font::new(editor::MONO, (zoom - 1.0).max(10.0));
             let bar = &mut self.bar;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
@@ -3014,6 +3095,23 @@ impl App {
                     problem_picked = problems::show(ui, problems, &root, rect, texts)?;
                     Ok(())
                 }
+                Some(Panel::Diff(doc)) => {
+                    let name = docs
+                        .doc(doc)
+                        .map(document::Document::name)
+                        .unwrap_or_default();
+                    let rows = diffs
+                        .get(&doc)
+                        .filter(|d| d.0.is_some())
+                        .map(|d| d.2.as_slice());
+                    let shown = diff_shown.entry(doc).or_default();
+                    let ask =
+                        crate::git::diff::show(ui, doc, &name, rows, shown, rect, (texts, &mono))?;
+                    if let Some(ask) = ask {
+                        diff_asked = Some((doc, ask));
+                    }
+                    Ok(())
+                }
                 Some(Panel::Git) => {
                     scm_asked = if changes_known {
                         crate::git::view::show(ui, scm, changes.as_ref(), rect, texts)?
@@ -3073,6 +3171,15 @@ impl App {
         }
         if let Some(ask) = scm_asked {
             self.scm_ask(ask);
+        }
+        if let Some((doc, crate::git::diff::Ask::Open(line))) = diff_asked
+            && let Some(path) = self.docs.doc(doc).map(|d| d.path.clone())
+        {
+            self.open_line(&path, Some(line));
+            if let Some(view) = self.view_of_path(&path) {
+                self.ui.focus(Id::Editor(view), 1);
+                self.last_editor = Some(view);
+            }
         }
         if let Some(p) = problem_picked {
             let view = self.open_file(&p.path);
