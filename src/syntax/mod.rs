@@ -40,26 +40,47 @@ pub fn language_for(path: &Path) -> Option<&'static str> {
         "bs" => "bh",
         "sdc" | "xdc" => "sdc",
         "oxy" => "oxygen",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" | "tsx" => "typescript",
+        "go" => "go",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "cs" => "csharp",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "swift" => "swift",
+        "lua" => "lua",
+        "rb" | "rake" | "gemspec" => "ruby",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "shell",
+        "ps1" | "psm1" | "psd1" => "powershell",
+        "css" | "scss" | "less" => "css",
+        "html" | "htm" | "xhtml" | "vue" | "svelte" => "html",
+        "xml" | "svg" | "xaml" | "csproj" | "plist" | "xsd" => "xml",
+        "sql" => "sql",
+        "ini" | "cfg" | "conf" | "properties" | "env" | "editorconfig" | "gitconfig" => "ini",
+        "zig" => "zig",
         _ => return None,
     })
 }
 
-/// colour for a kind, on a dark background.
-/// colour for a kind on a light or dark background.
+/// colour for a kind on a light or dark background. control flow
+/// (if, return, loops) stands apart from the other keywords.
 pub fn colour_on(kind: HighlightKind, dark: bool) -> Color {
     if dark {
         return colour(kind);
     }
     match kind {
-        HighlightKind::Keyword | HighlightKind::KeywordControl => Color::rgb(0x8a, 0x2b, 0xc8),
+        HighlightKind::Keyword => Color::rgb(0x8a, 0x2b, 0xc8),
+        HighlightKind::KeywordControl => Color::rgb(0xb4, 0x23, 0x7a),
         HighlightKind::Type => Color::rgb(0x1a, 0x7f, 0x6e),
         HighlightKind::String => Color::rgb(0x3b, 0x7d, 0x1e),
         HighlightKind::Comment => Color::rgb(0x7a, 0x82, 0x8c),
         HighlightKind::Number => Color::rgb(0xb0, 0x5a, 0x10),
         HighlightKind::Operator | HighlightKind::Punctuation => Color::rgb(0x55, 0x5d, 0x66),
         HighlightKind::Function => Color::rgb(0x1f, 0x5f, 0xc0),
-        HighlightKind::Variable => Color::rgb(0x24, 0x29, 0x2f),
-        HighlightKind::Attribute | HighlightKind::Macro => Color::rgb(0x95, 0x6a, 0x00),
+        HighlightKind::Variable => Color::rgb(0x00, 0x3d, 0x8f),
+        HighlightKind::Attribute => Color::rgb(0x95, 0x6a, 0x00),
+        HighlightKind::Macro => Color::rgb(0x0e, 0x7c, 0x86),
         HighlightKind::Lifetime => Color::rgb(0xb3, 0x38, 0x38),
         HighlightKind::SectionHeader => Color::rgb(0x1f, 0x5f, 0xc0),
     }
@@ -67,15 +88,17 @@ pub fn colour_on(kind: HighlightKind, dark: bool) -> Color {
 
 pub fn colour(kind: HighlightKind) -> Color {
     match kind {
-        HighlightKind::Keyword | HighlightKind::KeywordControl => Color::rgb(0xc6, 0x8a, 0xf0),
+        HighlightKind::Keyword => Color::rgb(0xc6, 0x8a, 0xf0),
+        HighlightKind::KeywordControl => Color::rgb(0xf0, 0x8a, 0xc8),
         HighlightKind::Type => Color::rgb(0x4e, 0xc9, 0xb0),
         HighlightKind::String => Color::rgb(0xa8, 0xd0, 0x8d),
         HighlightKind::Comment => Color::rgb(0x6f, 0x7a, 0x86),
         HighlightKind::Number => Color::rgb(0xe8, 0xa8, 0x6a),
         HighlightKind::Operator | HighlightKind::Punctuation => Color::rgb(0xa9, 0xb1, 0xbb),
         HighlightKind::Function => Color::rgb(0x6c, 0xb6, 0xff),
-        HighlightKind::Variable => Color::rgb(0xd8, 0xdc, 0xe2),
-        HighlightKind::Attribute | HighlightKind::Macro => Color::rgb(0xe0, 0xc0, 0x6a),
+        HighlightKind::Variable => Color::rgb(0x9c, 0xd2, 0xf6),
+        HighlightKind::Attribute => Color::rgb(0xe0, 0xc0, 0x6a),
+        HighlightKind::Macro => Color::rgb(0x56, 0xd4, 0xc8),
         HighlightKind::Lifetime => Color::rgb(0xe8, 0x8a, 0x8a),
         HighlightKind::SectionHeader => Color::rgb(0x6c, 0xb6, 0xff),
     }
