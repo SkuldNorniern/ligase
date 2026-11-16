@@ -146,11 +146,12 @@ impl<'c> Rows<'c> {
             let lines = text.line_count();
             let mut first = Vec::with_capacity(lines + 1);
             let mut row = 0;
-            for line in 0..lines {
+            // one walk over the text, not a lookup and a copy per line
+            for (line, (_, body)) in text.lines().enumerate() {
                 first.push(row);
                 if fold::is_hidden(line, &hidden).is_none() {
-                    let (_, body) = line_text(text, line);
-                    row += pieces(&body, cols, tab).len();
+                    let body = body.strip_suffix('\r').unwrap_or(&body);
+                    row += pieces(body, cols, tab).len();
                 }
             }
             first.push(row);
