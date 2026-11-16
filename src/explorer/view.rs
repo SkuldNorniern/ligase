@@ -6,6 +6,7 @@ use aurea::{AureaResult, KeyCode};
 
 use super::{Click, Explorer};
 use crate::app::Id;
+use crate::icons;
 
 const ROW: f32 = 22.0;
 const INDENT: f32 = 14.0;
@@ -55,10 +56,15 @@ pub fn show(
                 ui.fill(line, palette.border.fade(0.55))?;
             }
             let indent = 8.0 + f32::from(entry.depth) * INDENT;
-            let (mark, name) = row.rect.split_left(indent + 12.0, 4.0);
+            let (mark, rest) = row.rect.split_left(indent + 12.0, 4.0);
             if entry.dir {
                 chevron(ui, mark.split_right(12.0, 0.0).0, entry.open, palette.dim)?;
             }
+            // the file or folder's icon, then its name
+            let (icon_at, name) = rest.split_left(16.0, 6.0);
+            let icon_box = Rect::new(icon_at.x, icon_at.y + (ROW - 16.0) / 2.0, 16.0, 16.0);
+            let icon = icons::for_path(entry.path, entry.dir, entry.open);
+            icons::draw(ui, icon, icon_box, palette.dim)?;
             ui.text_clipped(entry.name, name, &font, palette.text, Align::Start)?;
             Ok(())
         })?;

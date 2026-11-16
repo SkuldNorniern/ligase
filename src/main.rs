@@ -9,6 +9,7 @@ mod document;
 mod editor;
 mod explorer;
 mod git;
+mod icons;
 mod jobs;
 mod lang;
 mod lsp;
