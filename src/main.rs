@@ -66,8 +66,11 @@ fn with_line(arg: PathBuf) -> (PathBuf, Option<usize>) {
 }
 
 fn run() -> AureaResult<()> {
-    let arg = std::env::args_os()
-        .nth(1)
+    let first = std::env::args_os().nth(1);
+    // a new window has no folder; its explorer is hidden, home stands in
+    let blank = first.as_deref() == Some(std::ffi::OsStr::new(app::NEW_WINDOW));
+    let home = || std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    let arg = if blank { home() } else { first }
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -78,7 +81,7 @@ fn run() -> AureaResult<()> {
         Some(dir) if arg.is_file() => (dir.to_path_buf(), Some(arg.clone())),
         _ => (arg, None),
     };
-    let app = Rc::new(RefCell::new(App::new(&root, Lang::detect(None))));
+    let app = Rc::new(RefCell::new(App::new(&root, Lang::detect(None), blank)));
     if let Some(file) = file {
         app.borrow_mut().open_at_start(file, line);
     }
@@ -264,6 +267,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     };
     let mut file = bar.add_submenu(a.texts.tr("File"))?;
     add(&mut file, "New File", Command::NewFile)?;
+    add(&mut file, "New Window", Command::NewWindow)?;
     add(&mut file, "Open File", Command::OpenFile)?;
     add(&mut file, "Open Folder", Command::OpenFolder)?;
     add(&mut file, "Quick Open", Command::QuickOpen)?;

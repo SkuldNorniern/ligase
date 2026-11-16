@@ -97,6 +97,7 @@ pub enum Command {
     ZoomOut,
     ZoomReset,
     NewFile,
+    NewWindow,
     OpenFile,
     OpenFolder,
     SaveAs,
@@ -118,6 +119,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("New File", Command::NewFile),
     ("Open File", Command::OpenFile),
     ("Open Folder", Command::OpenFolder),
+    ("New Window", Command::NewWindow),
     ("Save", Command::Save),
     ("Save As", Command::SaveAs),
     ("Save All", Command::SaveAll),
@@ -352,7 +354,7 @@ pub struct App {
     open_after: Option<(PathBuf, Option<usize>)>,
     /// a folder to open once this window has closed.
     reopen: Option<PathBuf>,
-    /// folders opened before, newest first, this one among them.
+    /// other folders opened before, newest first.
     recent: Vec<PathBuf>,
     /// a save is out and the window closes once it is back.
     closing: bool,
@@ -361,7 +363,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(root: &Path, lang: Lang) -> Self {
+    /// a window on `root`. a `blank` one is the new window's: no folder
+    /// shown, no saved layout read or written, not in the recent list.
+    pub fn new(root: &Path, lang: Lang, blank: bool) -> Self {
         let mut theme = Theme::dark();
         lang.font_family().clone_into(&mut theme.font_family);
         let mut app = Self {
@@ -425,6 +429,14 @@ impl App {
             app.jobs
                 .run(move || Done::Settings(std::fs::read_to_string(path).ok()));
         }
+        if blank {
+            app.session = None;
+            for panel in [Panel::Explorer, Panel::Search] {
+                if app.shows(panel) {
+                    app.bench.toggle(panel);
+                }
+            }
+        }
         match app.session.clone() {
             Some(path) => {
                 app.jobs
@@ -432,14 +444,18 @@ impl App {
             }
             None => app.restored = true,
         }
-        // this folder goes first in the recent list
+        // this folder goes first in the recent list; a blank window only reads it
         if let Some(path) = workbench::recent_path() {
             let root = root.to_path_buf();
             app.jobs.run(move || {
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let recent = workbench::recent_with(&text, &root);
-                let lines: Vec<String> = recent.iter().map(|p| p.display().to_string()).collect();
-                let _ = workbench::write_session(&path, &(lines.join("\n") + "\n"));
+                let mut recent = workbench::recent_with(&text, &root);
+                if !blank {
+                    let lines: Vec<String> =
+                        recent.iter().map(|p| p.display().to_string()).collect();
+                    let _ = workbench::write_session(&path, &(lines.join("\n") + "\n"));
+                }
+                recent.remove(0);
                 Done::Recent(recent)
             });
         }
@@ -495,6 +511,10 @@ impl App {
     }
 
     pub fn title(&self) -> String {
+        // a new window has no folder to name
+        if self.session.is_none() && !self.shows(Panel::Explorer) {
+            return self.texts.tr("Ligase").to_owned();
+        }
         let root = self.explorer.root();
         let name = root.file_name().map_or_else(
             || root.display().to_string(),
@@ -742,6 +762,14 @@ impl App {
             }
             Command::OpenFolder => {
                 self.dialog = Some(Dialog::OpenFolder);
+                return;
+            }
+            Command::NewWindow => {
+                let spawned = std::env::current_exe()
+                    .and_then(|exe| std::process::Command::new(exe).arg(NEW_WINDOW).spawn());
+                if let Err(e) = spawned {
+                    self.say(format!("{}: {e}", self.texts.tr("can't open a new window")));
+                }
                 return;
             }
             Command::Undo | Command::Redo => {
@@ -3127,6 +3155,9 @@ fn settings_file(path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
+/// the command line flag a new window starts with.
+pub const NEW_WINDOW: &str = "--new-window";
+
 /// what the welcome page offers, with the label its menu item has.
 const WELCOME: [(&str, Command); 8] = [
     ("Quick Open", Command::QuickOpen),
@@ -3149,8 +3180,7 @@ fn welcome(
     recent: &[PathBuf],
 ) -> AureaResult<(Option<Command>, Option<PathBuf>)> {
     const ROW: f32 = 30.0;
-    // the folder open now is first in the list; the rest are elsewhere
-    let others: Vec<&PathBuf> = recent.iter().skip(1).take(6).collect();
+    let others: Vec<&PathBuf> = recent.iter().take(6).collect();
     let palette = ui.theme.palette;
     let title_font = ui.theme.font(22.0);
     let font = ui.theme.font(13.0);
@@ -3345,6 +3375,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
+        .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
 }
@@ -3357,7 +3388,7 @@ mod tests {
     fn app() -> App {
         let dir = std::env::temp_dir().join(format!("ligase-app-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        App::new(&dir, Lang::En)
+        App::new(&dir, Lang::En, false)
     }
 
     /// a file with an edit in it, open in a tab.
