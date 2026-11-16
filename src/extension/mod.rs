@@ -3,6 +3,7 @@
 //! a bundled syntax, and snippets. nothing in a package runs.
 
 pub mod manifest;
+pub mod ui;
 pub mod view;
 
 use std::collections::HashSet;
