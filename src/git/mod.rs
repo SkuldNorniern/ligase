@@ -2,10 +2,12 @@
 //! and the branch. git runs as a program on the file worker; no repository
 //! is ever read on the ui thread.
 
+pub mod view;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -42,21 +44,124 @@ pub struct State {
     pub pending: bool,
 }
 
-fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+/// runs git in `dir`; its output, or what it said went wrong. pathspecs are
+/// taken literally, so a file named `*` is only that file.
+fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
+    cmd.arg("--literal-pathspecs")
+        .arg("-C")
         .arg(dir)
         .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().ok()?;
-    out.status.success().then_some(out.stdout)
+    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        return Ok(out.stdout);
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let first = said
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("git failed");
+    Err(first.trim().to_owned())
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    run(dir, args).ok()
+}
+
+/// one changed file: where it is, and git's two letters for it, the index
+/// (staged) one and the working tree one, `?` for untracked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub path: PathBuf,
+    /// from the repository's top, `/` between parts, as git takes it back.
+    pub rel: String,
+    pub index: char,
+    pub tree: char,
+}
+
+impl Change {
+    pub fn staged(&self) -> bool {
+        !matches!(self.index, ' ' | '?')
+    }
+
+    pub fn unstaged(&self) -> bool {
+        self.tree != ' '
+    }
+}
+
+/// the repository's changed files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub top: PathBuf,
+    pub changes: Vec<Change>,
+}
+
+/// changes past this many are not listed.
+const MAX_CHANGES: usize = 5000;
+
+/// what changed in the repository `dir` is in; none outside one.
+pub fn status(dir: &Path) -> Option<Status> {
+    let top = git(dir, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(String::from_utf8(top).ok()?.trim());
+    let out = git(
+        &top,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    Some(Status {
+        changes: parse_status(&top, &out),
+        top,
+    })
+}
+
+fn parse_status(top: &Path, out: &[u8]) -> Vec<Change> {
+    let mut changes = Vec::new();
+    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(field) = fields.next() {
+        let text = String::from_utf8_lossy(field);
+        let mut chars = text.chars();
+        let (Some(index), Some(tree), Some(' ')) = (chars.next(), chars.next(), chars.next())
+        else {
+            continue;
+        };
+        let rel = chars.as_str().to_owned();
+        // a rename or copy names the old path next; the new one is the file
+        if matches!(index, 'R' | 'C') || matches!(tree, 'R' | 'C') {
+            fields.next();
+        }
+        changes.push(Change {
+            path: top.join(&rel),
+            rel,
+            index,
+            tree,
+        });
+        if changes.len() >= MAX_CHANGES {
+            break;
+        }
+    }
+    changes.sort_by(|a, b| a.rel.cmp(&b.rel));
+    changes
+}
+
+/// stages `rel` in the repository at `top`.
+pub fn stage(top: &Path, rel: &str) -> Result<(), String> {
+    run(top, &["add", "--", rel]).map(drop)
+}
+
+/// takes `rel` out of the index, back to what HEAD has.
+pub fn unstage(top: &Path, rel: &str) -> Result<(), String> {
+    run(top, &["restore", "--staged", "--", rel]).map(drop)
+}
+
+/// commits what is staged with `message`.
+pub fn commit(top: &Path, message: &str) -> Result<(), String> {
+    run(top, &["commit", "--quiet", "-m", message]).map(drop)
 }
 
 /// the file's text at HEAD. none when git isn't there, the file isn't in a
@@ -227,6 +332,22 @@ mod tests {
             .into_iter()
             .map(|h| (h.lines, h.kind))
             .collect()
+    }
+
+    #[test]
+    fn status_lines_and_renames() {
+        let top = Path::new("/r");
+        let out = b"M  a.rs\0 M b.rs\0?? new dir/c.rs\0R  d.rs\0old.rs\0MM e.rs\0";
+        let got = parse_status(top, out);
+        let rels: Vec<&str> = got.iter().map(|c| c.rel.as_str()).collect();
+        assert_eq!(rels, ["a.rs", "b.rs", "d.rs", "e.rs", "new dir/c.rs"]);
+        let by = |rel: &str| got.iter().find(|c| c.rel == rel).unwrap();
+        assert!(by("a.rs").staged() && !by("a.rs").unstaged());
+        assert!(!by("b.rs").staged() && by("b.rs").unstaged());
+        assert!(by("e.rs").staged() && by("e.rs").unstaged());
+        assert!(!by("new dir/c.rs").staged() && by("new dir/c.rs").unstaged());
+        assert_eq!(by("d.rs").index, 'R');
+        assert_eq!(by("a.rs").path, top.join("a.rs"));
     }
 
     #[test]

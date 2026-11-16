@@ -55,6 +55,10 @@ pub enum Id {
     Completion,
     CompletionRow(u16),
     ProblemList,
+    ScmField,
+    ScmCommit,
+    ScmList,
+    ScmRow(u16),
     Menu,
     Welcome,
 }
@@ -86,6 +90,7 @@ pub enum Command {
     ToggleExplorer,
     ToggleTerminal,
     ToggleProblems,
+    ToggleGit,
     SplitEditor,
     ResetLayout,
     ZoomIn,
@@ -156,6 +161,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Explorer", Command::ToggleExplorer),
     ("Terminal", Command::ToggleTerminal),
     ("Problems", Command::ToggleProblems),
+    ("Source Control", Command::ToggleGit),
     ("Split Editor", Command::SplitEditor),
     ("Zoom In", Command::ZoomIn),
     ("Zoom Out", Command::ZoomOut),
@@ -251,6 +257,9 @@ enum Done {
     GitBase(DocumentId, PathBuf, Option<std::sync::Arc<str>>),
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
     Branch(Option<String>),
+    Changes(Option<crate::git::Status>),
+    /// stage, unstage or commit came back; a commit says so.
+    GitDid(Result<bool, String>),
 }
 
 pub struct App {
@@ -318,6 +327,14 @@ pub struct App {
     status: String,
     /// the branch the workspace folder is on, for the status bar.
     branch: Option<String>,
+    /// the repository's changed files, for the source control panel; none
+    /// outside a repository.
+    changes: Option<crate::git::Status>,
+    /// git was asked for `changes` and answered, at least once.
+    changes_known: bool,
+    /// git was asked and hasn't answered yet.
+    changes_asked: bool,
+    scm: crate::git::view::Scm,
     /// when the message was said; it goes after a while.
     status_at: Instant,
     /// the editor view with the keyboard, from the last frame.
@@ -380,6 +397,10 @@ impl App {
             session: workbench::session_path(root),
             status: String::new(),
             branch: None,
+            changes: None,
+            changes_known: false,
+            changes_asked: false,
+            scm: crate::git::view::Scm::default(),
             status_at: Instant::now(),
             focus: None,
             layout_dirty: false,
@@ -934,6 +955,10 @@ impl App {
             Command::ToggleExplorer => self.bench.toggle(Panel::Explorer),
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::ToggleProblems => self.bench.toggle(Panel::Problems),
+            Command::ToggleGit => {
+                self.bench.toggle(Panel::Git);
+                self.refresh_status();
+            }
             Command::SplitEditor => {
                 let Some(view) = focus.or(self.last_editor) else {
                     return;
@@ -2221,9 +2246,61 @@ impl App {
         for (doc, _) in self.docs.files() {
             self.ask_git_base(doc);
         }
+        self.refresh_status();
         let root = self.explorer.root().to_path_buf();
         self.jobs
             .run(move || Done::Branch(crate::git::branch(&root)));
+    }
+
+    /// asks git what changed in the repository, for the source control panel.
+    fn refresh_status(&mut self) {
+        if !self.shows(Panel::Git) {
+            return;
+        }
+        let root = self.explorer.root().to_path_buf();
+        self.changes_asked = self
+            .jobs
+            .run(move || Done::Changes(crate::git::status(&root)));
+    }
+
+    /// what the source control panel asked for.
+    fn scm_ask(&mut self, ask: crate::git::view::Ask) {
+        use crate::git::view::Ask;
+        let Some(top) = self.changes.as_ref().map(|s| s.top.clone()) else {
+            return;
+        };
+        match ask {
+            Ask::Open(path) => {
+                let view = self.open_file(&path);
+                self.ui.focus(Id::Editor(view), 1);
+                self.last_editor = Some(view);
+            }
+            Ask::Stage(rel) => {
+                self.jobs
+                    .run(move || Done::GitDid(crate::git::stage(&top, &rel).map(|()| false)));
+            }
+            Ask::Unstage(rel) => {
+                self.jobs
+                    .run(move || Done::GitDid(crate::git::unstage(&top, &rel).map(|()| false)));
+            }
+            Ask::Commit => {
+                let message = self.scm.message.trim().to_owned();
+                if message.is_empty() {
+                    self.say(self.texts.tr("write a commit message first").to_owned());
+                    return;
+                }
+                if !self
+                    .changes
+                    .as_ref()
+                    .is_some_and(|s| s.changes.iter().any(|c| c.staged()))
+                {
+                    self.say(self.texts.tr("nothing is staged").to_owned());
+                    return;
+                }
+                self.jobs
+                    .run(move || Done::GitDid(crate::git::commit(&top, &message).map(|()| true)));
+            }
+        }
     }
 
     /// sends a diff off for each file whose text moved on.
@@ -2332,6 +2409,10 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        // a panel back from the saved layout hasn't asked yet
+        if !self.changes_known && !self.changes_asked {
+            self.refresh_status();
+        }
         self.ask_git_hunks();
         for event in self.lsp.poll() {
             match event {
@@ -2459,6 +2540,7 @@ impl App {
                         self.settings_saved(doc);
                         // save as or a first save may have put it in a repository
                         self.ask_git_base(doc);
+                        self.refresh_status();
                         self.after_save(doc, true);
                     }
                     Err(why) => {
@@ -2476,6 +2558,24 @@ impl App {
                     self.docs.set_git_hunks(doc, revision, hunks);
                 }
                 Done::Branch(branch) => self.branch = branch,
+                Done::Changes(status) => {
+                    self.changes = status;
+                    self.changes_known = true;
+                    self.changes_asked = false;
+                }
+                Done::GitDid(result) => {
+                    match result {
+                        Ok(true) => {
+                            self.scm.message.clear();
+                            self.say(self.texts.tr("committed").to_owned());
+                            // HEAD moved: every file's marks start over
+                            self.refresh_git();
+                        }
+                        Ok(false) => {}
+                        Err(why) => self.say(why),
+                    }
+                    self.refresh_status();
+                }
                 Done::Note(note) => {
                     if let Some(note) = note {
                         self.say(note);
@@ -2571,6 +2671,13 @@ impl App {
                         }
                     }
                     Panel::Welcome => self.texts.tr("Welcome").to_owned(),
+                    Panel::Git => {
+                        let label = self.texts.tr("Source Control");
+                        match self.changes.as_ref().map(|s| s.changes.len()) {
+                            Some(n) if n > 0 => format!("{label} {n}"),
+                            _ => label.to_owned(),
+                        }
+                    }
                     Panel::Editor(view) => self.docs.doc_of(view).map_or_else(String::new, |d| {
                         // ! when the file also changed on disk
                         if d.conflict {
@@ -2623,6 +2730,7 @@ impl App {
             self.problems.gather(&self.docs);
         }
         let mut problem_picked = None;
+        let mut scm_asked = None;
         self.fill_symbols();
         let mut picked_completion = None;
         let mut found = None;
@@ -2658,6 +2766,8 @@ impl App {
             let hover = &self.hover;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
+            let (scm, changes) = (&mut self.scm, &self.changes);
+            let changes_known = self.changes_known;
             let bar = &mut self.bar;
             let mut ui = self.ui.frame(ctx, &self.theme);
             let (status, main) = area.split_bottom(STATUS_HEIGHT, 0.0);
@@ -2734,6 +2844,14 @@ impl App {
                     problem_picked = problems::show(ui, problems, &root, rect, texts)?;
                     Ok(())
                 }
+                Some(Panel::Git) => {
+                    scm_asked = if changes_known {
+                        crate::git::view::show(ui, scm, changes.as_ref(), rect, texts)?
+                    } else {
+                        None
+                    };
+                    Ok(())
+                }
                 Some(Panel::Terminal) => {
                     shell_focus = terminal::show(ui, shell, rect, texts, terminal_size)?;
                     Ok(())
@@ -2776,6 +2894,9 @@ impl App {
         }
         if let Some(ask) = palette_ask {
             self.palette_ask(ask);
+        }
+        if let Some(ask) = scm_asked {
+            self.scm_ask(ask);
         }
         if let Some(p) = problem_picked {
             let view = self.open_file(&p.path);
@@ -3133,6 +3254,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::B), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
+        .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
 }

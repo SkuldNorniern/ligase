@@ -10,6 +10,8 @@ pub struct PaneId(u32);
 pub enum Panel {
     Explorer,
     Search,
+    /// git: what changed, staging and commits.
+    Git,
     Terminal,
     /// diagnostics of every open file.
     Problems,

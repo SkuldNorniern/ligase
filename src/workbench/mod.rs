@@ -110,7 +110,9 @@ impl Workbench {
                 self.tree().remove(pane);
             }
             Some(Panel::Welcome) => return Err(Refused::KeepsEditorArea),
-            Some(Panel::Explorer | Panel::Search | Panel::Terminal | Panel::Problems) => {
+            Some(
+                Panel::Explorer | Panel::Search | Panel::Git | Panel::Terminal | Panel::Problems,
+            ) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
             }
@@ -178,7 +180,7 @@ impl Workbench {
             // ones with each other
             let sibling = match panel {
                 Panel::Explorer => Some(Panel::Search),
-                Panel::Search => Some(Panel::Explorer),
+                Panel::Search | Panel::Git => Some(Panel::Explorer),
                 Panel::Terminal => Some(Panel::Problems),
                 Panel::Problems => Some(Panel::Terminal),
                 _ => None,
@@ -214,6 +216,7 @@ impl Workbench {
                 let name = match panel {
                     Panel::Explorer => "explorer".to_owned(),
                     Panel::Search => "search".to_owned(),
+                    Panel::Git => "git".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Problems => "problems".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
@@ -292,6 +295,7 @@ impl Workbench {
                 let panel = match name.as_str() {
                     "explorer" => Panel::Explorer,
                     "search" => Panel::Search,
+                    "git" => Panel::Git,
                     "terminal" => Panel::Terminal,
                     "problems" => Panel::Problems,
                     "welcome" => Panel::Welcome,
