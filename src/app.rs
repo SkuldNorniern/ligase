@@ -2275,26 +2275,18 @@ impl App {
                 self.ui.focus(Id::Editor(view), 1);
                 self.last_editor = Some(view);
             }
-            Ask::Stage(rel) => {
+            Ask::Stage(rels) => {
                 self.jobs
-                    .run(move || Done::GitDid(crate::git::stage(&top, &rel).map(|()| false)));
+                    .run(move || Done::GitDid(crate::git::stage(&top, &rels).map(|()| false)));
             }
-            Ask::Unstage(rel) => {
+            Ask::Unstage(rels) => {
                 self.jobs
-                    .run(move || Done::GitDid(crate::git::unstage(&top, &rel).map(|()| false)));
+                    .run(move || Done::GitDid(crate::git::unstage(&top, &rels).map(|()| false)));
             }
             Ask::Commit => {
                 let message = self.scm.message.trim().to_owned();
                 if message.is_empty() {
                     self.say(self.texts.tr("write a commit message first").to_owned());
-                    return;
-                }
-                if !self
-                    .changes
-                    .as_ref()
-                    .is_some_and(|s| s.changes.iter().any(|c| c.staged()))
-                {
-                    self.say(self.texts.tr("nothing is staged").to_owned());
                     return;
                 }
                 self.jobs

@@ -19,8 +19,8 @@ const PAD: f32 = 8.0;
 /// what the panel asks the app to do.
 pub enum Ask {
     Open(PathBuf),
-    Stage(String),
-    Unstage(String),
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
     Commit,
 }
 
@@ -137,10 +137,12 @@ pub fn show(
                         let part = u16::try_from(row.index).unwrap_or(u16::MAX);
                         let hit = Button::new(label).quiet().show(ui, Id::ScmRow(part), at)?;
                         if hit.clicked {
+                            let mut rels = vec![change.rel.clone()];
+                            rels.extend(change.old.clone());
                             button_ask = Some(if *staged {
-                                Ask::Unstage(change.rel.clone())
+                                Ask::Unstage(rels)
                             } else {
-                                Ask::Stage(change.rel.clone())
+                                Ask::Stage(vec![change.rel.clone()])
                             });
                         }
                     }

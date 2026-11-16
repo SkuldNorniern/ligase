@@ -63,12 +63,17 @@ fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     if out.status.success() {
         return Ok(out.stdout);
     }
-    let said = String::from_utf8_lossy(&out.stderr);
-    let first = said
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("git failed");
-    Err(first.trim().to_owned())
+    // some refusals ("nothing added to commit") come on stdout instead
+    let first = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_owned)
+    };
+    Err(first(&out.stderr)
+        .or_else(|| first(&out.stdout))
+        .unwrap_or_else(|| "git failed".to_owned()))
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -82,6 +87,8 @@ pub struct Change {
     pub path: PathBuf,
     /// from the repository's top, `/` between parts, as git takes it back.
     pub rel: String,
+    /// where a rename or copy came from, the same way.
+    pub old: Option<String>,
     pub index: char,
     pub tree: char,
 }
@@ -132,12 +139,17 @@ fn parse_status(top: &Path, out: &[u8]) -> Vec<Change> {
         };
         let rel = chars.as_str().to_owned();
         // a rename or copy names the old path next; the new one is the file
-        if matches!(index, 'R' | 'C') || matches!(tree, 'R' | 'C') {
-            fields.next();
-        }
+        let old = (matches!(index, 'R' | 'C') || matches!(tree, 'R' | 'C'))
+            .then(|| {
+                fields
+                    .next()
+                    .map(|f| String::from_utf8_lossy(f).into_owned())
+            })
+            .flatten();
         changes.push(Change {
             path: top.join(&rel),
             rel,
+            old,
             index,
             tree,
         });
@@ -149,14 +161,19 @@ fn parse_status(top: &Path, out: &[u8]) -> Vec<Change> {
     changes
 }
 
-/// stages `rel` in the repository at `top`.
-pub fn stage(top: &Path, rel: &str) -> Result<(), String> {
-    run(top, &["add", "--", rel]).map(drop)
+/// stages `rels` in the repository at `top`.
+pub fn stage(top: &Path, rels: &[String]) -> Result<(), String> {
+    let mut args = vec!["add", "--"];
+    args.extend(rels.iter().map(String::as_str));
+    run(top, &args).map(drop)
 }
 
-/// takes `rel` out of the index, back to what HEAD has.
-pub fn unstage(top: &Path, rel: &str) -> Result<(), String> {
-    run(top, &["restore", "--staged", "--", rel]).map(drop)
+/// takes `rels` out of the index, back to what HEAD has. a rename takes both
+/// its paths, or the old one stays staged as deleted.
+pub fn unstage(top: &Path, rels: &[String]) -> Result<(), String> {
+    let mut args = vec!["restore", "--staged", "--"];
+    args.extend(rels.iter().map(String::as_str));
+    run(top, &args).map(drop)
 }
 
 /// commits what is staged with `message`.
@@ -347,6 +364,8 @@ mod tests {
         assert!(by("e.rs").staged() && by("e.rs").unstaged());
         assert!(!by("new dir/c.rs").staged() && by("new dir/c.rs").unstaged());
         assert_eq!(by("d.rs").index, 'R');
+        assert_eq!(by("d.rs").old.as_deref(), Some("old.rs"));
+        assert_eq!(by("a.rs").old, None);
         assert_eq!(by("a.rs").path, top.join("a.rs"));
     }
 
