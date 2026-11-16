@@ -300,6 +300,8 @@ pub enum Dialog {
     ConfirmDelete,
     /// throw away the edits in `App::discard_rels`?
     ConfirmDiscard,
+    /// let the package in `App::trust_asked` start its programs?
+    ConfirmTrust,
 }
 
 /// how a dialog starts out.
@@ -492,6 +494,8 @@ pub struct App {
     reopen: Option<PathBuf>,
     /// a save waiting on the server's formatting, and since when.
     save_after_format: Option<(ViewId, DocumentId, Instant)>,
+    /// the package (id, command lines) waiting on `Dialog::ConfirmTrust`.
+    trust_asked: Option<(String, Vec<Vec<String>>)>,
     /// files whose working tree edits wait on `Dialog::ConfirmDiscard`.
     discard_rels: Vec<String>,
     /// the new window's: no folder of its own.
@@ -573,6 +577,7 @@ impl App {
             reopen: None,
             save_after_format: None,
             discard_rels: Vec::new(),
+            trust_asked: None,
             blank,
             recent: Vec::new(),
             closing: false,
@@ -1900,6 +1905,18 @@ impl App {
                 let up = self.root().parent().unwrap_or(self.root());
                 DialogStart::File(String::new(), up.to_path_buf())
             }
+            Dialog::ConfirmTrust => {
+                let (id, lines) = self.trust_asked.clone().unwrap_or_default();
+                let title = self.texts.tr("Allow programs").to_owned();
+                let shown: Vec<String> = lines.iter().map(|l| l.join(" ")).collect();
+                let text = format!(
+                    "{id}\n\n{}\n\n{}",
+                    self.texts
+                        .tr("wants to start these programs, with your rights, in this folder:"),
+                    shown.join("\n")
+                );
+                DialogStart::Confirm(title, text)
+            }
             Dialog::ConfirmDiscard => {
                 let title = self.texts.tr("Discard changes").to_owned();
                 let text = format!(
@@ -1961,6 +1978,16 @@ impl App {
     /// the answer to a save / discard / cancel box.
     pub fn answered(&mut self, dialog: Dialog, choice: aurea::dialog::MessageChoice) {
         use aurea::dialog::MessageChoice;
+        if dialog == Dialog::ConfirmTrust {
+            let asked = self.trust_asked.take();
+            if choice == MessageChoice::Ok
+                && let Some((id, lines)) = asked
+            {
+                self.extensions.trust.allow(&id, lines);
+                self.save_trust();
+            }
+            return;
+        }
         if dialog == Dialog::ConfirmDiscard {
             let rels = std::mem::take(&mut self.discard_rels);
             if choice == MessageChoice::Ok
@@ -2482,7 +2509,10 @@ impl App {
     pub fn dialog_done(&mut self, dialog: Dialog, picked: Vec<PathBuf>) {
         match dialog {
             // answered through `answered`
-            Dialog::Unsaved(_) | Dialog::ConfirmDelete | Dialog::ConfirmDiscard => {}
+            Dialog::Unsaved(_)
+            | Dialog::ConfirmDelete
+            | Dialog::ConfirmDiscard
+            | Dialog::ConfirmTrust => {}
             Dialog::Open => {
                 for path in picked {
                     let view = self.open_file(&path);
@@ -3818,9 +3848,9 @@ impl App {
         }
     }
 
-    /// lets the package at `i` start the servers it declares, or takes that
-    /// back, and saves the choice. a running server keeps running until
-    /// ligase starts again.
+    /// asks before the package at `i` may start the servers it declares;
+    /// taking it back needs no asking. a running server keeps running
+    /// until ligase starts again.
     fn trust_package(&mut self, i: usize, allow: bool) {
         let Some(extension::Package {
             state: extension::State::Ready(m),
@@ -3831,10 +3861,17 @@ impl App {
         };
         let (id, lines) = (m.id.clone(), extension::lines(m));
         if allow {
-            self.extensions.trust.allow(&id, lines);
-        } else {
-            self.extensions.trust.revoke(&id);
+            // starting programs is never one click: a native box names them
+            self.trust_asked = Some((id, lines));
+            self.dialog = Some(Dialog::ConfirmTrust);
+            return;
         }
+        self.extensions.trust.revoke(&id);
+        self.save_trust();
+    }
+
+    /// the grants in force now: servers follow them, and the file keeps them.
+    fn save_trust(&mut self) {
         self.lsp.set_extra(self.extensions.servers());
         let text = self.extensions.trust.write();
         if let Some(path) = extension::trust::path() {
