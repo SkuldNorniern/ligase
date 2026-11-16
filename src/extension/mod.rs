@@ -581,6 +581,24 @@ body = "theorem $1 := by\n  $0"
     }
 
     #[test]
+    fn feeds_pick_their_field() {
+        let r =
+            serde_json::json!({ "rendered": "⊢ a", "goal": { "text": "x" }, "n": 3, "none": null });
+        assert_eq!(pick(&r, "rendered").as_deref(), Some("⊢ a"));
+        assert_eq!(pick(&r, "goal.text").as_deref(), Some("x"));
+        assert_eq!(pick(&r, "n").as_deref(), Some("3"));
+        assert_eq!(pick(&r, "none"), None);
+        assert_eq!(pick(&r, "missing.deep"), None);
+        assert_eq!(pick(&serde_json::Value::Null, ""), None);
+        let long = serde_json::json!("가".repeat(MAX_FEED));
+        let cut = pick(&long, "").unwrap();
+        assert!(
+            cut.len() <= MAX_FEED && cut.ends_with('가'),
+            "cut on a char"
+        );
+    }
+
+    #[test]
     fn big_manifest_is_not_read() {
         let root = std::env::temp_dir().join(format!("ligase-ext-big-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
