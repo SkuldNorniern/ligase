@@ -318,8 +318,8 @@ pub struct App {
     status: String,
     /// the branch the workspace folder is on, for the status bar.
     branch: Option<String>,
-    /// the message as last drawn, and since when; it goes after a while.
-    status_shown: (String, Instant),
+    /// when the message was said; it goes after a while.
+    status_at: Instant,
     /// the editor view with the keyboard, from the last frame.
     focus: Option<ViewId>,
     /// the layout changed since it was last written.
@@ -380,7 +380,7 @@ impl App {
             session: workbench::session_path(root),
             status: String::new(),
             branch: None,
-            status_shown: (String::new(), Instant::now()),
+            status_at: Instant::now(),
             focus: None,
             layout_dirty: false,
             restored: false,
@@ -419,6 +419,16 @@ impl App {
             && let Some(v) = self.docs.view_mut(view)
         {
             v.goto = Some((Point::new(line, 0), Encoding::Utf32));
+        }
+    }
+
+    /// puts `text` in the status bar for a while; the same text again starts
+    /// the while over.
+    fn say(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        self.status_at = Instant::now();
+        if let Some(canvas) = self.canvas {
+            request_canvas_redraw_at(canvas, self.status_at + STATUS_FOR);
         }
     }
 
@@ -703,7 +713,7 @@ impl App {
                     },
                 };
                 if let Err(e) = aurea::clipboard::set_clipboard_text(&text) {
-                    self.status = e.to_string();
+                    self.say(e.to_string());
                     return;
                 }
                 self.line_clip = line.is_some().then(|| text.clone());
@@ -778,7 +788,7 @@ impl App {
             }
             Command::OpenSettings => {
                 let Some(path) = settings::path() else {
-                    self.status = self.texts.tr("no config folder for settings").to_owned();
+                    self.say(self.texts.tr("no config folder for settings").to_owned());
                     return;
                 };
                 self.jobs
@@ -852,7 +862,7 @@ impl App {
                 if let Some(view) = focus
                     && !self.lsp.definition(&self.docs, view)
                 {
-                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
                 return;
             }
@@ -883,7 +893,7 @@ impl App {
                 if let Some(view) = focus.or(self.last_editor)
                     && !self.lsp.format(&self.docs, view, self.settings.tab_size)
                 {
-                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
                 return;
             }
@@ -891,7 +901,7 @@ impl App {
                 if let Some(view) = focus.or(self.last_editor)
                     && !self.lsp.references(&self.docs, view)
                 {
-                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
                 return;
             }
@@ -899,7 +909,7 @@ impl App {
                 if let Some(view) = focus
                     && !self.lsp.hover(&self.docs, view)
                 {
-                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
                 return;
             }
@@ -984,7 +994,7 @@ impl App {
                     .is_some_and(|d| d.buffer.revision() != *r)
             });
         if moved {
-            self.status = self.texts.tr("the text changed, try again").to_owned();
+            self.say(self.texts.tr("the text changed, try again").to_owned());
             return;
         }
         let mut open = Vec::new();
@@ -997,11 +1007,11 @@ impl App {
         }
         // every file that isn't open becomes a tab; past this many, no
         if closed.len() > MAX_OPENED_BY_EDIT {
-            self.status = format!(
+            self.say(format!(
                 "{} ({})",
                 self.texts.tr("too many files to change here"),
                 open.len() + closed.len()
-            );
+            ));
             return;
         }
         // all checked first, so a bad file never leaves the rest half done
@@ -1015,8 +1025,10 @@ impl App {
                         .doc_of(*view)
                         .map(document::Document::name)
                         .unwrap_or_default();
-                    self.status =
-                        format!("{} {name}", self.texts.tr("the server's edits don't fit"));
+                    self.say(format!(
+                        "{} {name}",
+                        self.texts.tr("the server's edits don't fit")
+                    ));
                     return;
                 }
             }
@@ -1032,7 +1044,7 @@ impl App {
                 self.waiting_edits.push((doc, edits, encoding));
             }
         }
-        self.status = format!("{} {changed}", self.texts.tr("files changed:"));
+        self.say(format!("{} {changed}", self.texts.tr("files changed:")));
     }
 
     /// a view on the document at `path`, when one is open.
@@ -1127,7 +1139,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         if hits.is_empty() {
-            self.status = self.texts.tr("no references").to_owned();
+            self.say(self.texts.tr("no references").to_owned());
             return;
         }
         let title = self.texts.tr("references").to_owned();
@@ -1275,7 +1287,7 @@ impl App {
             return;
         };
         let Some(name) = explorer::plain_name(answer) else {
-            self.status = self.texts.tr("that name won't do").to_owned();
+            self.say(self.texts.tr("that name won't do").to_owned());
             return;
         };
         let name = name.to_owned();
@@ -1775,20 +1787,20 @@ impl App {
         }
         self.settings = settings;
         if !problems.is_empty() {
-            self.status = format!(
+            self.say(format!(
                 "{}: {}",
                 self.texts.tr("settings skipped"),
                 problems.join(", ")
-            );
+            ));
         }
     }
 
     fn settings_problem(&mut self, problems: &[String]) {
-        self.status = format!(
+        self.say(format!(
             "{}: {}",
             self.texts.tr("settings skipped"),
             problems.join(", ")
-        );
+        ));
     }
 
     /// the settings file was saved: read it from the buffer, no disk.
@@ -1805,7 +1817,7 @@ impl App {
             None => self.settings_problem(&problems),
         }
         if clean {
-            self.status = self.texts.tr("settings applied").to_owned();
+            self.say(self.texts.tr("settings applied").to_owned());
         }
     }
 
@@ -1910,17 +1922,18 @@ impl App {
                     return;
                 }
                 if hits.len() >= find::MAX_HITS {
-                    self.status = self
-                        .texts
-                        .tr("too many matches to replace at once")
-                        .to_owned();
+                    self.say(
+                        self.texts
+                            .tr("too many matches to replace at once")
+                            .to_owned(),
+                    );
                     return;
                 }
                 let count = hits.len();
                 let with = self.bar.with.clone();
                 let edits = hits.into_iter().map(|h| (h, with.clone())).collect();
                 if self.docs.edit(view, edits, false) {
-                    self.status = format!("{} {count}", self.texts.tr("replaced"));
+                    self.say(format!("{} {count}", self.texts.tr("replaced")));
                 }
             }
             find::Ask::Rename => {
@@ -1931,7 +1944,7 @@ impl App {
                     return;
                 }
                 if !self.lsp.rename(&self.docs, view, &name) {
-                    self.status = self.texts.tr("no language server for this yet").to_owned();
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
             }
             find::Ask::Goto => {
@@ -2131,7 +2144,7 @@ impl App {
                     .all_with_ids()
                     .any(|(id, d)| id != doc && d.path == path);
                 if taken {
-                    self.status = self.texts.tr("that file is open in another tab").to_owned();
+                    self.say(self.texts.tr("that file is open in another tab").to_owned());
                     return;
                 }
                 self.docs.set_path(doc, &path);
@@ -2178,10 +2191,10 @@ impl App {
             Done::Wrote(doc, name, point, wrote)
         };
         if !self.jobs.run(job) {
-            self.status = format!(
+            self.say(format!(
                 "{}: the file worker is not running",
                 self.texts.tr("can't save")
-            );
+            ));
         }
     }
 
@@ -2251,7 +2264,7 @@ impl App {
             if now.is_none() {
                 // gone: keep the text, a save puts the file back
                 self.docs.mark_conflict(id);
-                self.status = format!("{name}: {}", self.texts.tr("deleted on disk"));
+                self.say(format!("{name}: {}", self.texts.tr("deleted on disk")));
                 continue;
             }
             if self.docs.changed_on_disk(id) {
@@ -2263,11 +2276,11 @@ impl App {
                     Done::Reloaded(id, revision, document::read_text(&path), disk)
                 });
             } else {
-                self.status = format!(
+                self.say(format!(
                     "{name}: {}",
                     self.texts
                         .tr("changed on disk, save again to write over it")
-                );
+                ));
             }
         }
     }
@@ -2341,7 +2354,7 @@ impl App {
                         self.hover = Some((view, at, text));
                     }
                 }
-                lsp::Event::Status(text) => self.status = text,
+                lsp::Event::Status(text) => self.say(text),
             }
         }
         self.find_again();
@@ -2367,7 +2380,7 @@ impl App {
             match done {
                 Done::Listed(path, Ok(entries)) => self.explorer.listed(&path, entries),
                 Done::Listed(path, Err(why)) => {
-                    self.status = format!("{}: {why}", path.display());
+                    self.say(format!("{}: {why}", path.display()));
                     self.explorer.listed(&path, Vec::new());
                 }
                 Done::Loaded(doc, result, disk) => {
@@ -2397,8 +2410,7 @@ impl App {
                                 self.commit_server_edits(view, ranges);
                             }
                             None => {
-                                self.status =
-                                    self.texts.tr("the server's edits don't fit").to_owned();
+                                self.say(self.texts.tr("the server's edits don't fit").to_owned());
                             }
                         }
                     }
@@ -2414,10 +2426,10 @@ impl App {
                     let name = self.docs.doc(doc).map(document::Document::name);
                     self.docs.reload(doc, &text, disk);
                     if let Some(name) = name {
-                        self.status = format!("{} {name}", self.texts.tr("reloaded"));
+                        self.say(format!("{} {name}", self.texts.tr("reloaded")));
                     }
                 }
-                Done::Reloaded(_, _, Err(why), _) => self.status = why,
+                Done::Reloaded(_, _, Err(why), _) => self.say(why),
                 Done::Conflict(doc, name, now) => {
                     // not written: a close waiting on it stays open
                     self.after_save(doc, false);
@@ -2425,11 +2437,11 @@ impl App {
                     // is there now, if nothing else changes it first
                     self.docs.mark_conflict(doc);
                     self.docs.arm_overwrite(doc, now);
-                    self.status = format!(
+                    self.say(format!(
                         "{name}: {}",
                         self.texts
                             .tr("changed on disk, save again to write over it")
-                    );
+                    ));
                 }
                 Done::Session(text) => {
                     self.restore(text);
@@ -2441,12 +2453,12 @@ impl App {
                     Ok(disk) => {
                         self.docs.saved(doc, point);
                         self.docs.set_disk(doc, disk);
-                        self.status = format!("{} {name}", self.texts.tr("saved"));
+                        self.say(format!("{} {name}", self.texts.tr("saved")));
                         self.settings_saved(doc);
                         self.after_save(doc, true);
                     }
                     Err(why) => {
-                        self.status = format!("{} {name}: {why}", self.texts.tr("can't save"));
+                        self.say(format!("{} {name}: {why}", self.texts.tr("can't save")));
                         self.after_save(doc, false);
                     }
                 },
@@ -2454,7 +2466,7 @@ impl App {
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
                 Done::Files(files) => self.palette.set_files(files),
                 Done::FileOp(Ok(done)) => self.file_done(done),
-                Done::FileOp(Err(why)) => self.status = why,
+                Done::FileOp(Err(why)) => self.say(why),
                 Done::GitBase(doc, base) => self.docs.set_git_base(doc, base),
                 Done::GitHunks(doc, revision, hunks) => {
                     self.docs.set_git_hunks(doc, revision, hunks);
@@ -2462,7 +2474,7 @@ impl App {
                 Done::Branch(branch) => self.branch = branch,
                 Done::Note(note) => {
                     if let Some(note) = note {
-                        self.status = note;
+                        self.say(note);
                     }
                 }
                 Done::Settings(text) => {
@@ -2479,7 +2491,10 @@ impl App {
                     self.last_editor = Some(view);
                 }
                 Done::SettingsFile(Err(why)) => {
-                    self.status = format!("{}: {why}", self.texts.tr("can't open the settings"));
+                    self.say(format!(
+                        "{}: {why}",
+                        self.texts.tr("can't open the settings")
+                    ));
                 }
                 Done::Server(language, result) => {
                     // a missing server is fine; the editor works without it, and
@@ -2488,7 +2503,7 @@ impl App {
                 }
                 Done::Saved(result) => {
                     if let Err(why) = result {
-                        self.status = format!("{}: {why}", self.texts.tr("can't save the layout"));
+                        self.say(format!("{}: {why}", self.texts.tr("can't save the layout")));
                     }
                     if self.closing {
                         self.close_now = true;
@@ -2775,7 +2790,7 @@ impl App {
         if let Some(view) = definition
             && !self.lsp.definition(&self.docs, view)
         {
-            self.status = self.texts.tr("no language server for this yet").to_owned();
+            self.say(self.texts.tr("no language server for this yet").to_owned());
         }
         self.shell_focus = shell_focus;
         match found {
@@ -2805,15 +2820,9 @@ impl App {
         if let (Some(wait), Some(canvas)) = (blink, self.canvas) {
             request_canvas_redraw_at(canvas, Instant::now() + wait);
         }
-        // a message stays a while, then the frame after takes it away
-        if self.status != self.status_shown.0 {
-            self.status_shown = (self.status.clone(), Instant::now());
-            if let (false, Some(canvas)) = (self.status.is_empty(), self.canvas) {
-                request_canvas_redraw_at(canvas, Instant::now() + STATUS_FOR);
-            }
-        } else if !self.status.is_empty() && self.status_shown.1.elapsed() >= STATUS_FOR {
+        // a message stays a while, then a frame then takes it away
+        if !self.status.is_empty() && self.status_at.elapsed() >= STATUS_FOR {
             self.status.clear();
-            self.status_shown.0.clear();
             if let Some(canvas) = self.canvas {
                 request_canvas_redraw(canvas);
             }
