@@ -18,7 +18,7 @@ const MAX_WIDTH: f32 = 560.0;
 const PAD: f32 = 10.0;
 
 #[derive(Debug, PartialEq)]
-enum Block {
+pub(crate) enum Block {
     Code(Vec<String>),
     Text(String),
     Heading(String),
@@ -27,7 +27,7 @@ enum Block {
 
 /// markdown into blocks: fences, `---`, headings, paragraphs. links keep
 /// their text, `**` and backticks go.
-fn blocks(markdown: &str) -> Vec<Block> {
+pub(crate) fn blocks(markdown: &str) -> Vec<Block> {
     let mut out = Vec::new();
     let mut code: Option<Vec<String>> = None;
     let mut para = String::new();
@@ -91,7 +91,7 @@ fn blocks(markdown: &str) -> Vec<Block> {
 
 /// markdown marks off a line: `[text](url)` keeps text, `**`, `__` and
 /// backticks go.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     // `[text](url)`: the `[` that goes with a `](` is the last one before it

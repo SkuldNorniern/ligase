@@ -40,6 +40,8 @@ pub enum Node {
         text: String,
         tone: Tone,
     },
+    /// markdown: headings, paragraphs, code blocks, rules.
+    Markdown(String),
     /// a clickable button. `command` is a command id to run; with none the click comes back as an event.
     Button {
         id: String,
@@ -327,6 +329,11 @@ impl Ctx {
                 let text = self.text(table, path, "text", true, true);
                 Some(Node::Heading(text?.to_owned()))
             }
+            "markdown" => {
+                self.keys(table, path, &["kind", "text"]);
+                let text = self.text(table, path, "text", true, true);
+                Some(Node::Markdown(text?.to_owned()))
+            }
             "text" => {
                 self.keys(table, path, &["kind", "text", "tone"]);
                 let text = self.text(table, path, "text", true, true);
@@ -527,7 +534,7 @@ impl Ctx {
             Node::Column(children) | Node::Row(children) => {
                 self.check_children(children, path, depth + 1);
             }
-            Node::Heading(text) | Node::Text { text, .. } => {
+            Node::Heading(text) | Node::Text { text, .. } | Node::Markdown(text) => {
                 self.text_check(&join(path, "text"), text, true);
             }
             Node::Button { id, label, command } => {

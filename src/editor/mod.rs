@@ -5,7 +5,7 @@ pub mod abbrev;
 pub mod cursor;
 pub mod find;
 pub mod fold;
-mod hover;
+pub(crate) mod hover;
 pub mod input;
 pub mod lines;
 pub mod multi;
@@ -56,7 +56,7 @@ const H_SCROLL: u16 = 0;
 const CARET_X: u16 = 0;
 const CARET_Y: u16 = 1;
 
-pub(super) const MONO: &str = if cfg!(windows) {
+pub(crate) const MONO: &str = if cfg!(windows) {
     "Consolas"
 } else if cfg!(target_os = "macos") {
     "Menlo"

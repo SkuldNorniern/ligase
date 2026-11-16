@@ -33,6 +33,48 @@ struct Layout {
     width: f32,
     heights: Vec<f32>,
     lines: HashMap<u16, Vec<String>>,
+    markdown: HashMap<u16, Vec<MdRow>>,
+}
+
+/// one drawn row of a markdown node.
+enum MdRow {
+    Heading(String),
+    Text(String),
+    Code(String),
+    Rule,
+}
+
+const CODE: f32 = 17.0;
+
+impl MdRow {
+    fn height(&self) -> f32 {
+        match self {
+            MdRow::Heading(_) => 24.0,
+            MdRow::Text(_) => LINE,
+            MdRow::Code(_) => CODE,
+            MdRow::Rule => 9.0,
+        }
+    }
+}
+
+/// markdown laid out at `width`: paragraphs wrapped, code kept as lines.
+fn markdown_rows(ui: &mut Ui<'_, Id>, text: &str, width: f32) -> Vec<MdRow> {
+    use crate::editor::hover::{Block, blocks, plain};
+    let small = ui.theme.font(12.0);
+    let mut rows = Vec::new();
+    for block in blocks(text) {
+        match block {
+            Block::Heading(h) => rows.push(MdRow::Heading(plain(&h))),
+            Block::Text(t) => {
+                for line in wrap(&plain(&t), width, |s| ui.text_width(s, &small)) {
+                    rows.push(MdRow::Text(line));
+                }
+            }
+            Block::Code(lines) => rows.extend(lines.into_iter().map(MdRow::Code)),
+            Block::Rule => rows.push(MdRow::Rule),
+        }
+    }
+    rows
 }
 
 /// `text` broken at spaces to fit `width`. a word wider than the width
@@ -80,6 +122,14 @@ fn measure(ui: &mut Ui<'_, Id>, n: &Node, width: f32, layout: &mut Layout) -> f3
             tallest
         }
         Node::Heading(_) => 24.0,
+        Node::Markdown(text) => {
+            let rows = markdown_rows(ui, text, width);
+            let h = rows.iter().map(MdRow::height).sum::<f32>();
+            layout
+                .markdown
+                .insert(u16::try_from(me).unwrap_or(u16::MAX), rows);
+            h
+        }
         Node::Text { text, .. } => {
             let small = ui.theme.font(12.0);
             let lines = wrap(text, width, |s| ui.text_width(s, &small));
@@ -143,6 +193,7 @@ pub fn show(
             width,
             heights: Vec::new(),
             lines: HashMap::new(),
+            markdown: HashMap::new(),
         };
         measure(ui, root, width, &mut layout);
         state.layout = Some(layout);
@@ -233,6 +284,36 @@ fn node(
         Node::Heading(text) => {
             let big = ui.theme.font(14.5);
             ui.text_clipped(text, at, &big, palette.text, Align::Start)?;
+        }
+        Node::Markdown(_) => {
+            let big = ui.theme.font(13.5);
+            let mono = aurea::render::Font::new(crate::editor::MONO, 12.5);
+            let mut y = at.y;
+            for row in layout.markdown.get(&me).map_or(&[][..], Vec::as_slice) {
+                let h = row.height();
+                let line = Rect::new(at.x, y, at.width, h);
+                y += h;
+                if line.bottom() < sight.y || line.y > sight.bottom() {
+                    continue;
+                }
+                match row {
+                    MdRow::Heading(t) => {
+                        ui.text_clipped(t, line, &big, palette.text, Align::Start)?;
+                    }
+                    MdRow::Text(t) => {
+                        ui.text_clipped(t, line, &small, palette.text, Align::Start)?;
+                    }
+                    MdRow::Code(t) => {
+                        // code sits on a faint plate, like the hover's
+                        ui.fill(line, palette.surface)?;
+                        let inner = line.inset_xy(6.0, 0.0);
+                        ui.text_clipped(t, inner, &mono, palette.text, Align::Start)?;
+                    }
+                    MdRow::Rule => {
+                        ui.fill(Rect::new(at.x, line.y + 4.0, at.width, 1.0), palette.border)?;
+                    }
+                }
+            }
         }
         Node::Text { text, tone: t } => {
             let colour = tone(&palette, t);
