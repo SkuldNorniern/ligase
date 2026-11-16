@@ -1928,7 +1928,7 @@ impl App {
         if settings::path().as_deref() != Some(d.path.as_path()) {
             return;
         }
-        let (settings, problems) = settings::parse(&d.buffer.text().to_string());
+        let (settings, problems) = settings::parse(&String::from(d.buffer.text()));
         let clean = problems.is_empty();
         match settings {
             Some(settings) => self.apply_settings(settings, problems),
@@ -2408,7 +2408,7 @@ impl App {
     fn ask_git_hunks(&mut self) {
         for (doc, revision, text, base) in self.docs.git_wanted() {
             self.jobs.run(move || {
-                let now = text.slice(0..text.len()).unwrap_or_default();
+                let now = String::from(&text);
                 Done::GitHunks(doc, revision, crate::git::hunks(&base, &now))
             });
         }

@@ -217,7 +217,7 @@ fn parse(engine: &SyntaxEngine, ask: Ask) -> Parsed {
         let source = sylven::TextSnapshot::new(
             sylven::DocumentId(0),
             sylven::RevisionId(revision.get()),
-            ask.text.to_string(),
+            String::from(&ask.text),
         );
         // a parser bug on some odd file must not end colouring for every
         // file: that one file just stays plain
