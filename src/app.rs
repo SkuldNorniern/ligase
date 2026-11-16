@@ -327,7 +327,7 @@ pub struct App {
     /// the saved session came back, or there was none.
     restored: bool,
     /// a file named on the command line, opened once the layout is back.
-    open_after: Option<PathBuf>,
+    open_after: Option<(PathBuf, Option<usize>)>,
     /// a save is out and the window closes once it is back.
     closing: bool,
     /// the window should close now; main does it.
@@ -403,13 +403,22 @@ impl App {
         app
     }
 
-    /// opens `path` in an editor, after the saved layout when one is still
-    /// being read, so the layout isn't thrown away for it.
-    pub fn open_at_start(&mut self, path: PathBuf) {
+    /// opens `path` in an editor, at `line` (from 0) when given, after the
+    /// saved layout when one is still being read, so it isn't thrown away.
+    pub fn open_at_start(&mut self, path: PathBuf, line: Option<usize>) {
         if self.restored {
-            self.open_file(&path);
+            self.open_line(&path, line);
         } else {
-            self.open_after = Some(path);
+            self.open_after = Some((path, line));
+        }
+    }
+
+    fn open_line(&mut self, path: &Path, line: Option<usize>) {
+        let view = self.open_file(path);
+        if let Some(line) = line
+            && let Some(v) = self.docs.view_mut(view)
+        {
+            v.goto = Some((Point::new(line, 0), Encoding::Utf32));
         }
     }
 
@@ -2424,8 +2433,8 @@ impl App {
                 }
                 Done::Session(text) => {
                     self.restore(text);
-                    if let Some(path) = self.open_after.take() {
-                        self.open_file(&path);
+                    if let Some((path, line)) = self.open_after.take() {
+                        self.open_line(&path, line);
                     }
                 }
                 Done::Wrote(doc, name, point, result) => match result {

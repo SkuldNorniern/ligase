@@ -21,7 +21,7 @@ mod terminal;
 mod workbench;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::{Rc, Weak};
 
@@ -49,6 +49,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// `path:line` split, when the path alone is a file; lines count from 1
+/// there and from 0 back here. anything else stays as it is.
+fn with_line(arg: PathBuf) -> (PathBuf, Option<usize>) {
+    if arg.exists() {
+        return (arg, None);
+    }
+    let text = arg.to_string_lossy();
+    if let Some((path, line)) = text.rsplit_once(':')
+        && let Ok(line) = line.parse::<usize>()
+        && Path::new(path).is_file()
+    {
+        return (PathBuf::from(path), Some(line.saturating_sub(1)));
+    }
+    (arg, None)
+}
+
 fn run() -> AureaResult<()> {
     let arg = std::env::args_os()
         .nth(1)
@@ -56,14 +72,15 @@ fn run() -> AureaResult<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     let arg = std::path::absolute(&arg).unwrap_or(arg);
-    // a file opens in its folder, like `code file.rs`
+    // a file opens in its folder, like `code file.rs`; `file.rs:12` at that line
+    let (arg, line) = with_line(arg);
     let (root, file) = match arg.parent() {
         Some(dir) if arg.is_file() => (dir.to_path_buf(), Some(arg.clone())),
         _ => (arg, None),
     };
     let app = Rc::new(RefCell::new(App::new(&root, Lang::detect(None))));
     if let Some(file) = file {
-        app.borrow_mut().open_at_start(file);
+        app.borrow_mut().open_at_start(file, line);
     }
     let title = app.borrow().title();
     let mut window = Window::new(&title, WIDTH.cast_signed(), HEIGHT.cast_signed())?;
@@ -330,4 +347,23 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
         ],
         shown: vec![false, false, false],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_after_a_file_is_split_off() {
+        let dir = std::env::temp_dir().join(format!("ligase-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "x").unwrap();
+        let with = PathBuf::from(format!("{}:12", file.display()));
+        assert_eq!(with_line(with), (file.clone(), Some(11)));
+        assert_eq!(with_line(file.clone()), (file.clone(), None));
+        let missing = dir.join("b.rs:3");
+        assert_eq!(with_line(missing.clone()), (missing, None), "no such file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
