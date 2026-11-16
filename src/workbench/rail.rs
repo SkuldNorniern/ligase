@@ -1,15 +1,25 @@
-//! the rail at the far left. side bar panels sit at the top, the panels
-//! under the editors and settings at the bottom, so one strip opens every
-//! tool. a click on the lit one folds it away.
+//! the rail: a strip on any edge of the window. side bar panels sit at its
+//! start, the panels under the editors and settings at its end, so one strip
+//! opens every tool. a click on the lit one folds it away.
 
 use aurea::render::{Color, Rect};
-use aurea::ui::{Align, Response, Sense, Ui};
+use aurea::ui::{Align, Response, Sense, Splitter, SplitterStyle, Ui};
 use aurea::{AureaResult, CursorIcon, Keymap};
 
 use crate::app::{Command, Id};
 use crate::lang::Texts;
+use crate::settings::RailPlace;
+use crate::workbench::Side;
 
-pub const WIDTH: f32 = 46.0;
+/// how thick the rail is, across the edge it sits on.
+pub fn thickness(place: RailPlace) -> f32 {
+    match place {
+        RailPlace::Left | RailPlace::Right => 46.0,
+        RailPlace::Top | RailPlace::Bottom => 38.0,
+        RailPlace::Hidden => 0.0,
+    }
+}
+
 const CELL: f32 = 44.0;
 const ICON: f32 = 20.0;
 /// height of the side bar's title row.
@@ -27,46 +37,103 @@ pub struct Item {
     pub badge: usize,
 }
 
-/// draws the rail. gives the command of a clicked button.
+/// draws the rail along `place`'s edge. gives the command of a clicked
+/// button.
 pub fn show(
     ui: &mut Ui<'_, Id>,
     rect: Rect,
+    place: RailPlace,
     (top, bottom): (&[Item], &[Item]),
     texts: &Texts,
     keymap: &Keymap<Command>,
 ) -> AureaResult<Option<Command>> {
     let palette = ui.theme.palette;
     ui.fill(rect, palette.surface)?;
-    ui.fill(
-        Rect::new(rect.right() - 1.0, rect.y, 1.0, rect.height),
-        palette.border,
-    )?;
+    // the line on the side facing the work
+    let line = match place {
+        RailPlace::Right => Rect::new(rect.x, rect.y, 1.0, rect.height),
+        RailPlace::Top => Rect::new(rect.x, rect.bottom() - 1.0, rect.width, 1.0),
+        RailPlace::Bottom => Rect::new(rect.x, rect.y, rect.width, 1.0),
+        _ => Rect::new(rect.right() - 1.0, rect.y, 1.0, rect.height),
+    };
+    ui.fill(line, palette.border)?;
+    let across = matches!(place, RailPlace::Top | RailPlace::Bottom);
+    let (start, end) = if across {
+        (rect.x, rect.right())
+    } else {
+        (rect.y, rect.bottom())
+    };
+    let end_from = end - 6.0 - bottom.len() as f32 * CELL;
+    let at_start = (0..top.len()).map(|i| start + 6.0 + i as f32 * CELL);
+    let at_end = (0..bottom.len()).map(|i| end_from + i as f32 * CELL);
     let mut picked = None;
-    let width = rect.width - 1.0;
-    let bottom_y = rect.bottom() - 6.0 - bottom.len() as f32 * CELL;
-    let at_top = (0..top.len()).map(|i| rect.y + 6.0 + i as f32 * CELL);
-    let at_bottom = (0..bottom.len()).map(|i| bottom_y + i as f32 * CELL);
-    for (part, (item, y)) in top
+    for (part, (item, along)) in top
         .iter()
-        .zip(at_top)
-        .chain(bottom.iter().zip(at_bottom))
+        .zip(at_start)
+        .chain(bottom.iter().zip(at_end))
         .enumerate()
     {
-        let at = Rect::new(rect.x, y, width, CELL);
-        if y + CELL > rect.bottom() {
+        if along + CELL > end || along < start {
             continue;
         }
+        let at = if across {
+            Rect::new(along, rect.y, CELL, rect.height)
+        } else {
+            Rect::new(rect.x, along, rect.width, CELL)
+        };
         let part = u16::try_from(part).unwrap_or(u16::MAX);
-        if cell(ui, at, item, part, (texts, keymap))? {
+        if cell(ui, at, place, item, part, (texts, keymap))? {
             picked = Some(item.command);
         }
     }
     Ok(picked)
 }
 
+/// the side bar's line, dragged to size it. the bar sits on the right of
+/// `work` when `right`. gives the bar's rect, the rest, and the input. the
+/// width only changes by a drag, never because the window got small.
+pub fn split(
+    ui: &mut Ui<'_, Id>,
+    side: &mut Side,
+    right: bool,
+    work: Rect,
+    label: &str,
+) -> AureaResult<(Rect, Rect, Response)> {
+    let thick = SplitterStyle::new(ui.theme).thickness;
+    let mut at = if right {
+        (work.width - side.width - thick).max(0.0)
+    } else {
+        side.width
+    };
+    let (min_first, min_second) = if right {
+        (320.0, 160.0)
+    } else {
+        (160.0, 320.0)
+    };
+    let (first, second, response) = Splitter::new(&mut at)
+        .min(min_first, min_second)
+        .threshold(2.0)
+        .whole_pixels(true)
+        .label(label)
+        .show(ui, Id::SideSplit, work)?;
+    if response.changed {
+        side.width = if right {
+            (work.width - at - thick).max(0.0)
+        } else {
+            at
+        };
+    }
+    Ok(if right {
+        (second, first, response)
+    } else {
+        (first, second, response)
+    })
+}
+
 fn cell(
     ui: &mut Ui<'_, Id>,
     at: Rect,
+    place: RailPlace,
     item: &Item,
     part: u16,
     (texts, keymap): (&Texts, &Keymap<Command>),
@@ -74,17 +141,25 @@ fn cell(
     let palette = ui.theme.palette;
     let input = ui.interact(Id::Rail, part, at, Sense::Click, true);
     let eased = ui.eased(Id::Rail, part, input);
-    let plate = at.inset_xy(5.0, 3.0);
+    let plate = if matches!(place, RailPlace::Top | RailPlace::Bottom) {
+        at.inset_xy(3.0, 4.0)
+    } else {
+        at.inset_xy(5.0, 3.0)
+    };
     if eased.hover > 0.0 || eased.press > 0.0 {
         let tint = palette.hover.mix(palette.pressed, eased.press);
         ui.round(plate, 7.0, tint.fade(eased.hover.max(eased.press)))?;
     }
     if item.lit {
         ui.round(plate, 7.0, palette.accent.fade(0.14))?;
-        ui.fill(
-            Rect::new(at.x, at.y + 10.0, 2.0, at.height - 20.0),
-            palette.accent,
-        )?;
+        // a mark on the rail's outer edge
+        let mark = match place {
+            RailPlace::Right => Rect::new(at.right() - 2.0, at.y + 10.0, 2.0, at.height - 20.0),
+            RailPlace::Top => Rect::new(at.x + 10.0, at.y, at.width - 20.0, 2.0),
+            RailPlace::Bottom => Rect::new(at.x + 10.0, at.bottom() - 2.0, at.width - 20.0, 2.0),
+            _ => Rect::new(at.x, at.y + 10.0, 2.0, at.height - 20.0),
+        };
+        ui.fill(mark, palette.accent)?;
     }
     let colour = if item.lit {
         palette.text

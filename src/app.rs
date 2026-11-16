@@ -9,7 +9,7 @@ use std::time::Instant;
 use aurea::render::{
     CanvasId, DrawingContext, Rect, request_canvas_redraw, request_canvas_redraw_at,
 };
-use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Sense, Splitter, Theme, Ui, UiState};
+use aurea::ui::{Align, DockStyle, DockTabEvent, DockView, Sense, Theme, Ui, UiState};
 use aurea::{AureaResult, Chord, CursorIcon, KeyCode, Keymap, WindowEvent};
 
 use resolvase::{Encoding, Point, Revision, SavePoint};
@@ -27,7 +27,7 @@ use crate::lsp::{self, Lsp};
 use crate::palette::{self, Kind, Palette};
 use crate::problems::{self, Problems};
 use crate::search::{self, Finder};
-use crate::settings::{self, Settings, ThemeChoice};
+use crate::settings::{self, RailPlace, Settings, SidePlace, ThemeChoice};
 use crate::syntax::Syntax;
 use crate::terminal::{self, Shell};
 use crate::workbench::panels::{PaneId, Panel};
@@ -68,6 +68,14 @@ pub enum Id {
     Welcome,
     Rail,
     SideSplit,
+    Settings,
+    SettingsSearch,
+    SettingsFile,
+    SettingsClose,
+    SettingsChip,
+    SettingsList,
+    SettingsReset,
+    SettingsRow(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +126,8 @@ pub enum Command {
     Commands,
     GotoSymbol,
     OpenSettings,
+    /// the settings file itself, in an editor.
+    OpenSettingsFile,
     ReopenClosed,
     ToggleWrap,
     CloseTab,
@@ -187,6 +197,7 @@ const COMMANDS: &[(&str, Command)] = &[
     ("Reset Zoom", Command::ZoomReset),
     ("Reset Layout", Command::ResetLayout),
     ("Settings", Command::OpenSettings),
+    ("Open Settings File", Command::OpenSettingsFile),
 ];
 
 /// a native dialog to show once the frame is done; main shows it.
@@ -276,6 +287,8 @@ enum Done {
     Settings(Option<String>),
     /// the settings file to open, made with every key shown when missing.
     SettingsFile(Result<PathBuf, String>),
+    /// the settings sheet's changes went in; the file's text now.
+    SettingsWrote(Result<String, String>),
     /// a file's text at HEAD; none when git doesn't track it.
     GitBase(DocumentId, PathBuf, Option<std::sync::Arc<str>>),
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
@@ -336,6 +349,10 @@ pub struct App {
     waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
     /// replace all waiting on files to load: the query and what replaces it.
     waiting_replace: Vec<(DocumentId, String, String)>,
+    sheet: settings::view::Sheet,
+    /// sheet changes not yet written, and whether a write is out.
+    settings_writes: Vec<(&'static str, Option<String>)>,
+    settings_writing: bool,
     /// files of tabs closed lately, newest last, for reopen.
     closed: Vec<PathBuf>,
     /// the theme in force is dark.
@@ -435,6 +452,9 @@ impl App {
             closed: Vec::new(),
             waiting_edits: Vec::new(),
             waiting_replace: Vec::new(),
+            sheet: settings::view::Sheet::default(),
+            settings_writes: Vec::new(),
+            settings_writing: false,
             dark: true,
             edit_opts: editor::EditOpts::default(),
             close_after_save: false,
@@ -584,6 +604,26 @@ impl App {
             self.apply_settings(self.settings.clone(), Vec::new());
         }
         if self.ui.popup_open() {
+            return self.ui.handle(event);
+        }
+        if self.sheet.is_open() {
+            // the sheet holds the keys while it is up; escape puts it away
+            if matches!(
+                event,
+                WindowEvent::KeyInput {
+                    key: KeyCode::Escape,
+                    pressed: true,
+                    ..
+                }
+            ) {
+                self.sheet.close();
+                return true;
+            }
+            if let WindowEvent::KeyInput { pressed: true, .. } = event
+                && !self.ui.text_focused()
+            {
+                return self.ui.handle(event) || true;
+            }
             return self.ui.handle(event);
         }
         if self.palette.is_open()
@@ -907,6 +947,12 @@ impl App {
                 return;
             }
             Command::OpenSettings => {
+                self.palette.close();
+                self.sheet.open(&self.settings);
+                self.ui.focus(Id::SettingsSearch, 0);
+                return;
+            }
+            Command::OpenSettingsFile => {
                 let Some(path) = settings::path() else {
                     self.say(self.texts.tr("no config folder for settings").to_owned());
                     return;
@@ -2915,6 +2961,20 @@ impl App {
                         }
                     }
                 }
+                Done::SettingsWrote(result) => {
+                    self.settings_writing = false;
+                    match result {
+                        Ok(text) => match settings::parse(&text) {
+                            (Some(settings), problems) => self.apply_settings(settings, problems),
+                            (None, problems) => self.settings_problem(&problems),
+                        },
+                        Err(why) => self.say(format!(
+                            "{}: {why}",
+                            self.texts.tr("can't save the settings")
+                        )),
+                    }
+                    self.write_settings();
+                }
                 Done::SettingsFile(Ok(path)) => {
                     let view = self.open_file(&path);
                     self.ui.focus(Id::Editor(view), 1);
@@ -3123,6 +3183,7 @@ impl App {
         let rail_items = self.rail_items();
         let side_head = self.side_head(&titles);
         let rail_pick;
+        let sheet_ask;
         let mut side_held = false;
         let mut side_moved = false;
         {
@@ -3257,26 +3318,38 @@ impl App {
                     Ok(())
                 }
             };
-            let (rail_at, work) = main.split_left(workbench::rail::WIDTH, 0.0);
-            rail_pick = workbench::rail::show(
-                &mut ui,
-                rail_at,
-                (&rail_items.0, &rail_items.1),
-                texts,
-                keymap,
-            )?;
+            let rail_place = settings.rail;
+            let thick = rail::thickness(rail_place);
+            let (rail_at, work) = match rail_place {
+                RailPlace::Left => main.split_left(thick, 0.0),
+                RailPlace::Right => main.split_right(thick, 0.0),
+                RailPlace::Top => main.split_top(thick, 0.0),
+                RailPlace::Bottom => main.split_bottom(thick, 0.0),
+                RailPlace::Hidden => (Rect::new(main.x, main.y, 0.0, 0.0), main),
+            };
+            rail_pick = if rail_place == RailPlace::Hidden {
+                None
+            } else {
+                rail::show(
+                    &mut ui,
+                    rail_at,
+                    rail_place,
+                    (&rail_items.0, &rail_items.1),
+                    texts,
+                    keymap,
+                )?
+            };
+            let right = settings.side_bar == SidePlace::Right;
+            let overlay = settings.side_overlay;
+            let side_pane = side.shown.and_then(|p| panels.find(p));
             let mut dock_at = work;
-            if let Some(pane) = side.shown.and_then(|p| panels.find(p)) {
-                let (side_at, rest, split) = Splitter::new(&mut side.width)
-                    .min(160.0, 320.0)
-                    .threshold(2.0)
-                    .whole_pixels(true)
-                    .label(texts.tr("Side Bar"))
-                    .show(&mut ui, Id::SideSplit, work)?;
+            if !overlay && let Some(pane) = side_pane {
+                let (side_at, rest, split) =
+                    rail::split(&mut ui, side, right, work, texts.tr("Side Bar"))?;
                 side_held = split.held;
                 side_moved = split.changed;
-                let (head_at, body) = side_at.split_top(workbench::rail::HEAD, 0.0);
-                workbench::rail::head(&mut ui, head_at, &side_head.0, &side_head.1)?;
+                let (head_at, body) = side_at.split_top(rail::HEAD, 0.0);
+                rail::head(&mut ui, head_at, &side_head.0, &side_head.1)?;
                 content(&mut ui, pane, body)?;
                 dock_at = rest;
             }
@@ -3290,6 +3363,21 @@ impl App {
                 })
                 .show(&mut ui, Id::Dock, dock_at)?;
             changed = response.changed;
+            // floating, the bar goes over the editors after them, so it
+            // takes the pointer where they meet
+            if overlay && let Some(pane) = side_pane {
+                let (side_at, _, split) =
+                    rail::split(&mut ui, side, right, work, texts.tr("Side Bar"))?;
+                side_held = split.held;
+                side_moved = split.changed;
+                let palette = ui.theme.palette;
+                ui.shadow(side_at, 0.0, 22.0, palette.shadow.fade(0.6))?;
+                ui.fill(side_at, palette.surface)?;
+                ui.interact(Id::SideSplit, 1, side_at, Sense::Click, true);
+                let (head_at, body) = side_at.split_top(rail::HEAD, 0.0);
+                rail::head(&mut ui, head_at, &side_head.0, &side_head.1)?;
+                content(&mut ui, pane, body)?;
+            }
             if let Some(view) = bar.view
                 && let Some((_, rect)) = rects.iter().find(|(v, _)| *v == view)
             {
@@ -3306,7 +3394,12 @@ impl App {
             }
             menu_act = self.menu.show(&mut ui, texts, &self.keymap);
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
+            sheet_ask = settings::view::show(&mut ui, &mut self.sheet, settings, main, texts)?;
             status_pick = status_bar(&mut ui, status, self.branch.as_deref(), &message, &place)?;
+        }
+        if self.settings.side_overlay && !pressed.is_empty() {
+            // a click in the code puts the floating bar away
+            self.bench.side.shown = None;
         }
         self.focus = focus;
         if focus.is_some() {
@@ -3317,6 +3410,18 @@ impl App {
         }
         if let Some(ask) = palette_ask {
             self.palette_ask(ask);
+        }
+        match sheet_ask {
+            Some(settings::view::Ask::Set(key, literal)) => {
+                self.settings_writes.push((key, literal));
+                self.write_settings();
+            }
+            Some(settings::view::Ask::OpenFile) => {
+                self.sheet.close();
+                self.run(Command::OpenSettingsFile);
+            }
+            Some(settings::view::Ask::Close) => self.sheet.close(),
+            None => {}
         }
         if let Some(ask) = scm_asked {
             self.scm_ask(ask);
@@ -3444,6 +3549,23 @@ impl App {
 }
 
 impl App {
+    /// sends the sheet's waiting changes to the file, one write at a time
+    /// so none is lost between a read and a write.
+    fn write_settings(&mut self) {
+        if self.settings_writing || self.settings_writes.is_empty() {
+            return;
+        }
+        let Some(path) = settings::path() else {
+            self.settings_writes.clear();
+            self.say(self.texts.tr("no config folder for settings").to_owned());
+            return;
+        };
+        let edits = std::mem::take(&mut self.settings_writes);
+        self.settings_writing = true;
+        self.jobs
+            .run(move || Done::SettingsWrote(write_settings(&path, &edits)));
+    }
+
     /// the rail's buttons: side bar panels on top; the panels under the
     /// editors and settings below.
     fn rail_items(&self) -> (Vec<rail::Item>, Vec<rail::Item>) {
@@ -3603,6 +3725,21 @@ impl App {
 
 /// the settings file, made with every key shown (commented out) when it
 /// isn't there yet. runs on the worker.
+/// puts `edits` into the settings file, made from the starter when
+/// missing, through a temp file. gives the text written. runs on the worker.
+fn write_settings(path: &Path, edits: &[(&str, Option<String>)]) -> Result<String, String> {
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => settings::STARTER.to_owned(),
+        Err(e) => return Err(e.to_string()),
+    };
+    for (key, literal) in edits {
+        text = settings::with_line(&text, key, literal.as_deref());
+    }
+    workbench::write_session(path, &text)?;
+    Ok(text)
+}
+
 fn settings_file(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
         if let Some(dir) = path.parent() {
@@ -3870,6 +4007,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Minus), Command::ZoomOut)
         .bind(Chord::command(KeyCode::Key0), Command::ZoomReset)
         .bind(Chord::command(KeyCode::B), Command::ToggleSidebar)
+        .bind(Chord::command(KeyCode::Comma), Command::OpenSettings)
         .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
