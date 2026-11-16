@@ -94,19 +94,25 @@ fn blocks(markdown: &str) -> Vec<Block> {
 fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open..].find("](").map(|i| open + i) else {
+    // `[text](url)`: the `[` that goes with a `](` is the last one before it
+    while let Some(mid) = rest.find("](") {
+        let Some(open) = rest[..mid].rfind('[') else {
             break;
         };
-        let Some(end) = rest[close..].find(')').map(|i| close + i) else {
+        let Some(end) = rest[mid..].find(')').map(|i| mid + i) else {
             break;
         };
         out.push_str(&rest[..open]);
-        out.push_str(&rest[open + 1..close]);
+        out.push_str(&rest[open + 1..mid]);
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
-    out.replace("**", "").replace("__", "").replace('`', "")
+    // rust's links to names, `[`Vec`]`, read as the name
+    out.replace("[`", "`")
+        .replace("`]", "`")
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
 }
 
 /// words of `text` in lines no wider than `width`.
@@ -277,12 +283,15 @@ pub fn show(
     let mono = Font::new(MONO, (size - 1.0).clamp(10.0, 16.0));
     let code_row = (mono.size * 1.45).round();
     let text_row = 19.0;
-    let max_w = MAX_WIDTH.min(seen.width - 16.0).max(160.0);
+    let max_w = MAX_WIDTH.min(seen.width - 16.0).max(80.0);
     let inner_w = max_w - 2.0 * PAD;
 
     // the blocks as rows, at most a card's worth
     let mut rows: Vec<Row> = Vec::new();
-    for block in blocks(text) {
+    let all = blocks(text);
+    let count = all.len();
+    let mut cut = false;
+    for (b, block) in all.into_iter().enumerate() {
         match block {
             Block::Code(lines) => rows.extend(lines.into_iter().map(Row::Code)),
             Block::Text(t) => rows.extend(wrap(ui, &t, &prose, inner_w).into_iter().map(Row::Text)),
@@ -290,10 +299,10 @@ pub fn show(
             Block::Rule => rows.push(Row::Rule),
         }
         if rows.len() >= MAX_LINES {
+            cut = rows.len() > MAX_LINES || b + 1 < count;
             break;
         }
     }
-    let cut = rows.len() > MAX_LINES;
     rows.truncate(MAX_LINES);
     if rows.is_empty() {
         return Ok(());
@@ -314,8 +323,16 @@ pub fn show(
         content_w = content_w.max(w);
     }
     let width = content_w.min(inner_w) + 2.0 * PAD;
-    let height =
-        rows.iter().map(height_of).sum::<f32>() + 2.0 * PAD + if cut { text_row } else { 0.0 };
+    // each run of code rows gets a little room under its band
+    let code_runs = rows
+        .iter()
+        .zip(rows.iter().skip(1).map(Some).chain([None]))
+        .filter(|(row, next)| matches!(row, Row::Code(_)) && !matches!(next, Some(Row::Code(_))))
+        .count();
+    let height = rows.iter().map(height_of).sum::<f32>()
+        + code_runs as f32 * 4.0
+        + 2.0 * PAD
+        + if cut { text_row } else { 0.0 };
 
     // under the caret when it fits, else over it
     let below = caret.y + caret.height + 6.0;
@@ -407,6 +424,8 @@ mod tests {
             ]
         );
         assert!(blocks("").is_empty());
+        assert_eq!(plain("[`Option`] or [`Vec`](https://x)"), "Option or Vec");
+        assert_eq!(plain("a [b] c"), "a [b] c");
         assert_eq!(
             blocks("```\nopen fence"),
             [Block::Code(vec!["open fence".into()])]
