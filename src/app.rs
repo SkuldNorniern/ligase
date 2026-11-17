@@ -140,6 +140,8 @@ pub enum Command {
     OpenSettings,
     /// the language server of the file in front, stopped and started again.
     RestartServer,
+    /// the file in front, closed and opened again on its server.
+    RestartFile,
     /// back to where the caret jumped from.
     GoBack,
     /// forward again after going back.
@@ -267,6 +269,7 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
         "Restart Language Server",
         Command::RestartServer,
     ),
+    ("editor.restartFile", "Restart File", Command::RestartFile),
     ("go.back", "Go Back", Command::GoBack),
     ("go.forward", "Go Forward", Command::GoForward),
     ("git.openChanges", "Open Changes", Command::OpenChanges),
@@ -1101,6 +1104,20 @@ impl App {
             }
             Command::GoBack | Command::GoForward => {
                 self.walk_trail(command == Command::GoBack);
+                return;
+            }
+            Command::RestartFile => {
+                let doc = focus
+                    .or(self.last_editor)
+                    .and_then(|v| self.docs.view(v))
+                    .map(|v| v.doc);
+                if let Some(doc) = doc
+                    && self.lsp.reopen(doc)
+                {
+                    self.say(self.texts.tr("checking the file again").to_owned());
+                } else {
+                    self.say(self.texts.tr("no language server for this file").to_owned());
+                }
                 return;
             }
             Command::RestartServer => {

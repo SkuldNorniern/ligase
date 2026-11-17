@@ -220,6 +220,22 @@ impl Lsp {
         old
     }
 
+    /// closes `doc` on its server; the next sync opens it again, so the
+    /// server checks it afresh (lean reads changed imports this way).
+    /// false when no server has it.
+    pub fn reopen(&mut self, doc: crate::document::DocumentId) -> bool {
+        let Some(synced) = self.synced.remove(&doc) else {
+            return false;
+        };
+        if let Some(Slot::Running(server, _)) = self.servers.get_mut(synced.language) {
+            server.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": synced.uri } }),
+            );
+        }
+        true
+    }
+
     /// takes the servers packages bring now. a language that had none and
     /// failed to start gets another try with the new one.
     pub fn set_extra(&mut self, specs: Vec<ServerSpec>) {
