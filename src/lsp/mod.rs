@@ -3,6 +3,7 @@
 //! now; every position a server sends is checked and clamped, and read
 //! against the text of the version it was made for.
 
+pub mod action;
 pub mod complete;
 pub mod edit;
 pub mod rpc;
@@ -95,12 +96,24 @@ pub struct Diag {
     pub range: Range<usize>,
     pub severity: Severity,
     pub message: String,
+    /// the server's own fields (`code`, `data` ...) as json, sent back
+    /// when asking for code actions.
+    pub extra: Option<String>,
 }
 
 /// what the app should act on.
 pub enum Event {
     /// diagnostics for a document, in the text of `revision`.
     Diagnostics(crate::document::DocumentId, Revision, Vec<Diag>),
+    /// code actions to pick from, for a document as of a revision.
+    Actions(
+        crate::document::DocumentId,
+        Revision,
+        Seen,
+        &'static str,
+        Vec<action::Action>,
+        Encoding,
+    ),
     /// text the server is still checking, and whether each stopped on a
     /// fatal error (lean's `$/lean/fileProgress`).
     Busy(
@@ -154,6 +167,10 @@ enum Pending {
     Edits(crate::document::DocumentId, Revision, Seen),
     References,
     Complete(ViewId, Revision, crate::document::DocumentId),
+    /// code actions for a document as of a revision.
+    Actions(crate::document::DocumentId, Revision, Seen),
+    /// an action's edit, filled in by the server.
+    Resolved(crate::document::DocumentId, Revision, Seen),
     Feed(u16, ViewId, usize),
 }
 
@@ -375,6 +392,80 @@ impl Lsp {
             .is_some()
     }
 
+    /// asks for code actions over the selection of `view`, with the
+    /// problems it touches.
+    pub fn actions(&mut self, docs: &Documents, view: ViewId) -> bool {
+        let Some(Pending::Edits(id, revision, seen)) = edits_for(docs, view) else {
+            return false;
+        };
+        let (Some(v), Some(doc)) = (docs.view(view), docs.doc(id)) else {
+            return false;
+        };
+        let Some(synced) = self.synced.get(&id) else {
+            return false;
+        };
+        if synced.revision != revision {
+            return false;
+        }
+        let Some(Slot::Running(server, encoding)) = self.servers.get_mut(synced.language) else {
+            return false;
+        };
+        let text = doc.buffer.text();
+        let range = v.sel.range();
+        let Some(at) = range_json(text, range.clone(), *encoding) else {
+            return false;
+        };
+        let diagnostics: Vec<Value> = doc
+            .diags
+            .iter()
+            .filter(|d| d.range.start <= range.end && range.start <= d.range.end)
+            .take(50)
+            .filter_map(|d| {
+                let r = range_json(text, d.range.clone(), *encoding)?;
+                let severity = match d.severity {
+                    Severity::Error => 1,
+                    Severity::Warning => 2,
+                    Severity::Info => 3,
+                    Severity::Hint => 4,
+                };
+                let extra = d
+                    .extra
+                    .as_deref()
+                    .and_then(|e| serde_json::from_str(e).ok());
+                Some(action::diag_json(r, severity, &d.message, extra.as_ref()))
+            })
+            .collect();
+        let params = json!({
+            "textDocument": { "uri": synced.uri },
+            "range": at,
+            "context": { "diagnostics": diagnostics, "triggerKind": 1 },
+        });
+        let language = synced.language;
+        let id_out = server.request("textDocument/codeAction", params);
+        self.pending
+            .insert((language, id_out), Pending::Actions(id, revision, seen));
+        true
+    }
+
+    /// asks the server to fill in the edit of `action`, picked from the
+    /// actions for `doc` at `revision`.
+    pub fn resolve_action(
+        &mut self,
+        language: &'static str,
+        action: Value,
+        doc: crate::document::DocumentId,
+        revision: Revision,
+        seen: Seen,
+    ) -> bool {
+        let Some(Slot::Running(server, _)) = self.servers.get_mut(language) else {
+            return false;
+        };
+        let id = server.request("codeAction/resolve", action);
+        self.pending
+            .insert((language, id), Pending::Resolved(doc, revision, seen));
+        true
+    }
+
     /// asks where the name at the caret is used.
     pub fn references(&mut self, docs: &Documents, view: ViewId) -> bool {
         let extra = json!({ "context": { "includeDeclaration": true } });
@@ -588,6 +679,16 @@ impl Lsp {
                         };
                         events.push(Event::Edits(doc, revision, seen, files, encoding));
                     }
+                    Some(Pending::Actions(doc, revision, seen)) => {
+                        let actions = action::read(&msg["result"]);
+                        events.push(Event::Actions(
+                            doc, revision, seen, language, actions, encoding,
+                        ));
+                    }
+                    Some(Pending::Resolved(doc, revision, seen)) => {
+                        let files = edit::workspace_edit(&msg["result"]["edit"]);
+                        events.push(Event::Edits(doc, revision, seen, files, encoding));
+                    }
                     Some(Pending::References) => {
                         events.push(Event::Locations(edit::locations(&msg["result"]), encoding));
                     }
@@ -683,6 +784,7 @@ impl Lsp {
                     range,
                     severity,
                     message,
+                    extra: action::diag_extra(d).map(|e| e.to_string()),
                 })
             })
             .collect();
@@ -708,6 +810,16 @@ fn point(value: &Value) -> Option<Point> {
     let line = usize::try_from(value["line"].as_u64()?).ok()?;
     let column = usize::try_from(value["character"].as_u64()?).ok()?;
     Some(Point::new(line, column))
+}
+
+/// a byte range as a server range.
+fn range_json(text: &TextSnapshot, range: Range<usize>, encoding: Encoding) -> Option<Value> {
+    let a = text.point(range.start, encoding).ok()?;
+    let b = text.point(range.end, encoding).ok()?;
+    Some(json!({
+        "start": { "line": a.line, "character": a.column },
+        "end": { "line": b.line, "character": b.column },
+    }))
 }
 
 fn range_in(text: &TextSnapshot, range: &Value, encoding: Encoding) -> Option<Range<usize>> {

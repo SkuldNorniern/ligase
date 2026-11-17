@@ -135,6 +135,8 @@ pub enum Command {
     QuickOpen,
     Commands,
     GotoSymbol,
+    /// fixes and changes the server offers at the caret.
+    CodeActions,
     OpenSettings,
     /// the language server of the file in front, stopped and started again.
     RestartServer,
@@ -246,6 +248,7 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("find.inFiles", "Find in Files", Command::FindInFiles),
     ("go.line", "Go to Line", Command::GotoLine),
     ("go.symbol", "Go to Symbol", Command::GotoSymbol),
+    ("editor.codeActions", "Quick Fix", Command::CodeActions),
     ("go.definition", "Go to Definition", Command::GotoDefinition),
     ("editor.showHover", "Show Hover", Command::ShowHover),
     ("editor.renameSymbol", "Rename Symbol", Command::Rename),
@@ -404,6 +407,16 @@ enum Done {
     GitDid(Result<bool, String>),
 }
 
+/// code actions offered for a document as of a revision.
+struct Offered {
+    doc: DocumentId,
+    revision: Revision,
+    seen: lsp::Seen,
+    language: &'static str,
+    list: Vec<lsp::action::Action>,
+    encoding: Encoding,
+}
+
 pub struct App {
     pub ui: UiState<Id>,
     theme: Theme,
@@ -444,6 +457,8 @@ pub struct App {
     complete_for: Option<ViewId>,
     /// the editor that had the keyboard last, even while a field has it.
     last_editor: Option<ViewId>,
+    /// code actions shown in the palette, and what they were made for.
+    actions: Option<Offered>,
     /// places jumped from, for go back and forward.
     trail: crate::trail::Trail,
     /// last key or click in an editor; the caret blinks from there.
@@ -559,6 +574,7 @@ impl App {
             want_complete: None,
             complete_for: None,
             last_editor: None,
+            actions: None,
             trail: crate::trail::Trail::default(),
             typed_at: Instant::now(),
             dialog: None,
@@ -1186,6 +1202,14 @@ impl App {
             Command::Line(op) => {
                 if let Some(view) = focus {
                     editor::line_op(&mut self.docs, view, op);
+                }
+                return;
+            }
+            Command::CodeActions => {
+                if let Some(view) = focus.or(self.last_editor)
+                    && !self.lsp.actions(&self.docs, view)
+                {
+                    self.say(self.texts.tr("no language server for this yet").to_owned());
                 }
                 return;
             }
@@ -2194,6 +2218,32 @@ impl App {
                     self.run(command);
                 }
             }
+            Kind::Actions => {
+                let Some(offered) = self.actions.take() else {
+                    return;
+                };
+                let Some(action) = offered.list.into_iter().nth(item) else {
+                    return;
+                };
+                if let Some(edit) = &action.edit {
+                    let files = lsp::edit::workspace_edit(edit);
+                    self.server_edits(
+                        offered.doc,
+                        offered.revision,
+                        offered.seen,
+                        files,
+                        offered.encoding,
+                    );
+                } else if !self.lsp.resolve_action(
+                    offered.language,
+                    action.raw,
+                    offered.doc,
+                    offered.revision,
+                    offered.seen,
+                ) {
+                    self.say(self.texts.tr("the server is gone").to_owned());
+                }
+            }
             Kind::Symbols => {
                 self.leave();
                 let at = self.palette.symbol_at.get(item).copied();
@@ -3072,6 +3122,30 @@ impl App {
         self.ask_git_hunks();
         for event in self.lsp.poll() {
             match event {
+                lsp::Event::Actions(doc, revision, seen, language, list, encoding) => {
+                    if list.is_empty() {
+                        self.say(self.texts.tr("no fixes here").to_owned());
+                        continue;
+                    }
+                    let items = list
+                        .iter()
+                        .map(|a| palette::Item {
+                            text: a.title.clone(),
+                            note: a.kind.clone(),
+                        })
+                        .collect();
+                    self.palette.set_actions(items);
+                    self.palette.open(Kind::Actions);
+                    self.ui.focus(Id::PaletteField, 0);
+                    self.actions = Some(Offered {
+                        doc,
+                        revision,
+                        seen,
+                        language,
+                        list,
+                        encoding,
+                    });
+                }
                 lsp::Event::Diagnostics(doc, revision, diags) => {
                     self.docs.set_diags(doc, revision, diags);
                 }
@@ -4583,6 +4657,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::P), Command::QuickOpen)
         .bind(Chord::command(KeyCode::P).shift(), Command::Commands)
         .bind(Chord::command(KeyCode::O).shift(), Command::GotoSymbol)
+        .bind(Chord::command(KeyCode::Period), Command::CodeActions)
         .bind(Chord::command(KeyCode::W), Command::CloseTab)
         .bind(Chord::command(KeyCode::T).shift(), Command::ReopenClosed)
         .bind(Chord::key(KeyCode::Z).alt(), Command::ToggleWrap)

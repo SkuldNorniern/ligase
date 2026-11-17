@@ -343,6 +343,7 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut go, "Go to Line", Command::GotoLine)?;
     add(&mut go, "Go to Symbol", Command::GotoSymbol)?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
+    add(&mut go, "Quick Fix", Command::CodeActions)?;
     add(&mut go, "Show Hover", Command::ShowHover)?;
     add(&mut go, "Find References", Command::References)?;
     go.add_separator()?;

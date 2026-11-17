@@ -1013,6 +1013,7 @@ mod tests {
             range: 8..9,
             severity: Severity::Error,
             message: "no y".into(),
+            extra: None,
         };
         docs.set_diags(a, old, vec![diag.clone()]);
         assert_eq!(docs.doc(a).unwrap().diags[0].range, 14..15);

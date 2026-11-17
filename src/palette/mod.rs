@@ -18,6 +18,8 @@ pub enum Kind {
     Symbols,
     /// a line of text asked for (a new file's name, say); no list.
     Prompt,
+    /// code actions the server offers at the caret.
+    Actions,
 }
 
 /// one row: what is shown, and a note on the right like a shortcut.
@@ -46,6 +48,8 @@ pub struct Palette {
     /// symbols of the file in the editor, and where each one starts.
     pub symbols: Vec<Item>,
     pub symbol_at: Vec<usize>,
+    /// code actions to pick from.
+    pub actions: Vec<Item>,
     pub shown: Vec<Shown>,
     pub pick: usize,
     /// first row in sight.
@@ -92,6 +96,12 @@ impl Palette {
         self.generation += 1;
     }
 
+    /// new code actions to pick from; rows are made again.
+    pub fn set_actions(&mut self, actions: Vec<Item>) {
+        self.actions = actions;
+        self.generation += 1;
+    }
+
     /// new symbols for `@`; rows made from the old ones are made again.
     pub fn set_symbols(&mut self, symbols: Vec<Item>, at: Vec<usize>) {
         if self.symbols != symbols {
@@ -115,6 +125,7 @@ impl Palette {
                 let q = self.query.strip_prefix('@').unwrap_or(&self.query);
                 return (Kind::Symbols, q.trim());
             }
+            Some(Kind::Actions) => return (Kind::Actions, self.query.trim()),
             Some(Kind::Files) | None => {}
         }
         if let Some(rest) = self.query.strip_prefix('>') {
@@ -131,6 +142,7 @@ impl Palette {
             Kind::Files => &self.files,
             Kind::Commands => &self.commands,
             Kind::Symbols => &self.symbols,
+            Kind::Actions => &self.actions,
             Kind::Prompt => &[],
         }
     }

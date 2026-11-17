@@ -174,6 +174,18 @@ fn init_params(root: &Path) -> Value {
                 "rename": { "prepareSupport": false },
                 "formatting": {},
                 "references": {},
+                "codeAction": {
+                    "codeActionLiteralSupport": {
+                        "codeActionKind": { "valueSet": [
+                            "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                            "refactor.rewrite", "source", "source.organizeImports",
+                        ] },
+                    },
+                    "isPreferredSupport": true,
+                    "disabledSupport": true,
+                    "dataSupport": true,
+                    "resolveSupport": { "properties": ["edit"] },
+                },
                 "completion": {
                     "completionItem": { "snippetSupport": true, "insertReplaceSupport": true },
                     "contextSupport": true,

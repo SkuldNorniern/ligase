@@ -136,6 +136,7 @@ mod tests {
             range,
             severity,
             message: message.to_owned(),
+            extra: None,
         };
         docs.set_diags(
             doc,
