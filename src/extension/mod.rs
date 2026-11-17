@@ -64,10 +64,37 @@ pub struct Grammar {
 pub struct FeedState {
     /// the editor view, caret and text revision last asked about.
     pub asked: Option<(crate::document::ViewId, usize, resolvase::Revision)>,
-    /// a request is out, since then.
+    /// requests are out, since then.
     pub waiting: Option<std::time::Instant>,
-    /// the body with the answer under it.
+    /// requests still out.
+    pub out: usize,
+    /// each section's text; none while there is nothing.
+    pub answers: Vec<Option<String>>,
+    /// the body with the sections under it.
     pub shown: Option<ui::Node>,
+}
+
+/// the body, then each section: its heading and its text, or its empty
+/// line while it has none.
+pub fn sections(body: &ui::Node, feeds: &[manifest::Feed], answers: &[Option<String>]) -> ui::Node {
+    let mut out = vec![body.clone()];
+    for (i, feed) in feeds.iter().enumerate() {
+        if !feed.title.is_empty() {
+            out.push(ui::Node::Heading(feed.title.clone()));
+        }
+        let text = match answers.get(i).and_then(Option::as_deref) {
+            Some(text) if feed.code => fence(text),
+            Some(text) => text.to_owned(),
+            None => feed.empty.clone(),
+        };
+        out.push(ui::Node::Markdown(text));
+    }
+    ui::Node::Column(out)
+}
+
+/// `text` as a markdown code block; fences inside it can't close it.
+pub fn fence(text: &str) -> String {
+    format!("```\n{}\n```", text.replace("```", "'''"))
 }
 
 /// longest answer shown in a fed view.

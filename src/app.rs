@@ -4014,53 +4014,123 @@ impl App {
         else {
             return;
         };
-        let wanted: Vec<(u16, extension::manifest::Feed, extension::ui::Node)> = self
+        type Wanted = (u16, Vec<extension::manifest::Feed>, extension::ui::Node);
+        let wanted: Vec<Wanted> = self
             .extensions
             .views()
             .filter(|(n, _, _)| {
                 self.shows(Panel::SideView(*n)) || self.shows(Panel::BottomView(*n))
             })
-            .filter_map(|(n, _, v)| v.feed.clone().map(|f| (n, f, v.body.clone())))
+            .filter(|(_, _, v)| !v.feeds.is_empty())
+            .map(|(n, _, v)| (n, v.feeds.clone(), v.body.clone()))
             .collect();
-        for (n, feed, body) in wanted {
+        if wanted.is_empty() {
+            return;
+        }
+        let messages = self.messages_at(view);
+        for (n, feeds, body) in wanted {
             let state = self.feeds.entry(n).or_default();
             if state.shown.is_none() {
-                state.shown = Some(extension::ui::Node::Column(vec![
-                    body,
-                    extension::ui::Node::Markdown(feed.empty.clone()),
-                ]));
+                state.shown = Some(extension::sections(&body, &feeds, &[]));
             }
-            let busy = state
-                .waiting
-                .is_some_and(|since| since.elapsed() < PATIENCE);
+            let busy = state.out > 0
+                && state
+                    .waiting
+                    .is_some_and(|since| since.elapsed() < PATIENCE);
             if busy || state.asked == Some(key) {
                 continue;
             }
-            if self.lsp.feed(&self.docs, view, &feed.request, n) {
+            // every section afresh; requests fill theirs as they come
+            state.answers = vec![None; feeds.len()];
+            state.out = 0;
+            let mut asked_all = true;
+            for (i, feed) in feeds.iter().enumerate() {
+                match &feed.source {
+                    extension::manifest::Source::Messages => {
+                        state.answers[i] = messages.clone();
+                    }
+                    extension::manifest::Source::Request(method) => {
+                        let tag = (u32::from(n) << 8) | u32::try_from(i).unwrap_or(0);
+                        if self.lsp.feed(&self.docs, view, method, tag) {
+                            state.out += 1;
+                        } else {
+                            asked_all = false;
+                        }
+                    }
+                }
+            }
+            // no server yet: ask again next frame; messages show meanwhile
+            if asked_all {
                 state.asked = Some(key);
-                state.waiting = Some(Instant::now());
+            }
+            state.waiting = Some(Instant::now());
+            state.shown = Some(extension::sections(&body, &feeds, &state.answers));
+            if let Some(s) = self.view_states.get_mut(&n) {
+                s.forget_layout();
             }
         }
     }
 
+    /// the problems on the caret's line in `view`, whole, for a messages
+    /// section. none when there are none.
+    fn messages_at(&self, view: ViewId) -> Option<String> {
+        let v = self.docs.view(view)?;
+        let doc = self.docs.doc(v.doc)?;
+        let text = doc.buffer.text();
+        let line = text.line_of(v.sel.head).ok()?;
+        let mut out = String::new();
+        for d in &doc.diags {
+            let (Ok(a), Ok(b)) = (text.line_of(d.range.start), text.line_of(d.range.end)) else {
+                continue;
+            };
+            if !(a..=b).contains(&line) {
+                continue;
+            }
+            let Ok(at) = text.point(d.range.start, Encoding::Utf32) else {
+                continue;
+            };
+            let kind = match d.severity {
+                lsp::Severity::Error => self.texts.tr("error"),
+                lsp::Severity::Warning => self.texts.tr("warning"),
+                lsp::Severity::Info => self.texts.tr("info"),
+                lsp::Severity::Hint => self.texts.tr("hint"),
+            };
+            out.push_str(&format!("{}:{} {kind}\n\n", at.line + 1, at.column + 1));
+            out.push_str(&extension::fence(&d.message));
+            out.push_str("\n\n");
+            if out.len() > extension::MAX_FEED {
+                break;
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// a feed's answer came: shown when it is for where the caret still is.
-    fn fed(&mut self, n: u16, view: ViewId, at: usize, result: &serde_json::Value) {
-        let Some(feed) = self.extensions.view(n).and_then(|(_, v)| v.feed.clone()) else {
+    fn fed(&mut self, tag: u32, view: ViewId, at: usize, result: &serde_json::Value) {
+        let n = u16::try_from(tag >> 8).unwrap_or(u16::MAX);
+        let i = (tag & 0xff) as usize;
+        let Some((feeds, body)) = self
+            .extensions
+            .view(n)
+            .map(|(_, v)| (v.feeds.clone(), v.body.clone()))
+        else {
             return;
         };
-        let body = self.extensions.view(n).map(|(_, v)| v.body.clone());
+        let Some(feed) = feeds.get(i) else {
+            return;
+        };
         let state = self.feeds.entry(n).or_default();
-        state.waiting = None;
+        state.out = state.out.saturating_sub(1);
         if state
             .asked
             .is_none_or(|(v, head, _)| v != view || head != at)
         {
             return;
         }
-        let text = extension::pick(result, &feed.field).unwrap_or(feed.empty);
-        state.shown = body.map(|body| {
-            extension::ui::Node::Column(vec![body, extension::ui::Node::Markdown(text)])
-        });
+        if let Some(slot) = state.answers.get_mut(i) {
+            *slot = extension::pick(result, &feed.field);
+        }
+        state.shown = Some(extension::sections(&body, &feeds, &state.answers));
         if let Some(s) = self.view_states.get_mut(&n) {
             s.forget_layout();
         }

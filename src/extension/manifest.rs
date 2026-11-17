@@ -106,19 +106,36 @@ pub struct View {
     pub icon: String,
     pub body: Node,
     /// a server request whose answer shows under the body.
-    pub feed: Option<Feed>,
+    /// sections under the body, each filled from where the caret is.
+    pub feeds: Vec<Feed>,
 }
 
 /// what feeds a view: a request to the language server of the file in
 /// front, at its caret, the answer's `field` shown as markdown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feed {
-    pub request: String,
+    /// heading over the section; none when empty.
+    pub title: String,
+    pub source: Source,
+    /// the text shown as a code block, not markdown.
+    pub code: bool,
     /// a dotted path into the result; empty for the result itself.
     pub field: String,
     /// shown while there is nothing.
     pub empty: String,
 }
+
+/// where a section's text comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// a server request at the caret, by method name.
+    Request(String),
+    /// the problems on the caret's line, whole.
+    Messages,
+}
+
+/// most sections in one view.
+const MAX_FEEDS: usize = 8;
 
 /// abbreviations for a language: a leader char and a table file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -523,21 +540,47 @@ fn parse_contributions(table: &Table, out: &mut Manifest, report: &mut Report) {
 }
 
 fn parse_feed(table: &Table, path: &str, report: &mut Report) -> Option<Feed> {
-    check_keys(table, path, &["request", "field", "empty"], report);
-    let request = required_string(table, path, "request", report).and_then(|r| {
-        let ok = !r.is_empty()
-            && r.len() <= 100
-            && r.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'/' | b'.' | b'-')
-            });
-        if !ok {
-            report.error(
-                &join(path, "request"),
-                "must be a method name, 1-100 of a-z A-Z 0-9 _ $ / . -",
-            );
+    check_keys(
+        table,
+        path,
+        &["title", "request", "source", "field", "empty", "code"],
+        report,
+    );
+    let source = match (table.get("request"), string(table, path, "source", report)) {
+        (None, Some("messages")) => Some(Source::Messages),
+        (None, Some(_)) => {
+            report.error(&join(path, "source"), "must be messages");
+            None
         }
-        ok.then(|| r.to_owned())
-    });
+        (Some(_), Some(_)) => {
+            report.error(path, "has both request and source; give one");
+            None
+        }
+        (_, None) => parse_request(table, path, report).map(Source::Request),
+    };
+    let title = match string(table, path, "title", report) {
+        None => Some(String::new()),
+        Some(t) if t.chars().count() <= 60 && !has_control(t) => Some(t.to_owned()),
+        Some(_) => {
+            report.error(
+                &join(path, "title"),
+                "must be at most 60 chars, no control chars",
+            );
+            None
+        }
+    };
+    let code = match table.get("code") {
+        None => false,
+        Some(Value::Boolean(b)) => *b,
+        Some(other) => {
+            report.error(
+                &join(path, "code"),
+                &format!("must be true or false, not {}", kind(other)),
+            );
+            false
+        }
+    };
+
     let field = match string(table, path, "field", report) {
         None => Some(String::new()),
         Some(f)
@@ -568,9 +611,28 @@ fn parse_feed(table: &Table, path: &str, report: &mut Report) -> Option<Feed> {
         }
     };
     Some(Feed {
-        request: request?,
+        title: title?,
+        source: source?,
+        code,
         field: field?,
         empty: empty?,
+    })
+}
+
+fn parse_request(table: &Table, path: &str, report: &mut Report) -> Option<String> {
+    required_string(table, path, "request", report).and_then(|r| {
+        let ok = !r.is_empty()
+            && r.len() <= 100
+            && r.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'/' | b'.' | b'-')
+            });
+        if !ok {
+            report.error(
+                &join(path, "request"),
+                "must be a method name, 1-100 of a-z A-Z 0-9 _ $ / . -",
+            );
+        }
+        ok.then(|| r.to_owned())
     })
 }
 
@@ -651,13 +713,39 @@ fn parse_view(table: &Table, path: &str, report: &mut Report) -> Option<View> {
             }
         },
     };
-    let feed = match table.get("feed") {
-        None => Some(None),
-        Some(Value::Table(t)) => parse_feed(t, &join(path, "feed"), report).map(Some),
+    // one table, or a list of them for sections
+    let feeds = match table.get("feed") {
+        None => Some(Vec::new()),
+        Some(Value::Table(t)) => parse_feed(t, &join(path, "feed"), report).map(|f| vec![f]),
+        Some(Value::Array(items)) if items.len() <= MAX_FEEDS => {
+            let mut out = Vec::new();
+            let mut ok = true;
+            for (i, item) in items.iter().enumerate() {
+                let at = format!("{path}.feed[{i}]");
+                match item {
+                    Value::Table(t) => match parse_feed(t, &at, report) {
+                        Some(f) => out.push(f),
+                        None => ok = false,
+                    },
+                    other => {
+                        report.error(&at, &format!("must be a table, not {}", kind(other)));
+                        ok = false;
+                    }
+                }
+            }
+            ok.then_some(out)
+        }
+        Some(Value::Array(_)) => {
+            report.error(
+                &join(path, "feed"),
+                &format!("at most {MAX_FEEDS} sections"),
+            );
+            None
+        }
         Some(other) => {
             report.error(
                 &join(path, "feed"),
-                &format!("must be a table, not {}", kind(other)),
+                &format!("must be a table or a list of them, not {}", kind(other)),
             );
             None
         }
@@ -666,7 +754,7 @@ fn parse_view(table: &Table, path: &str, report: &mut Report) -> Option<View> {
         return None;
     }
     Some(View {
-        feed: feed?,
+        feeds: feeds?,
         id: id?.to_owned(),
         title: title?.to_owned(),
         placement: placement?,
@@ -1446,6 +1534,41 @@ description = "a theorem"
             }
         }
     }
+    #[test]
+    fn views_take_one_feed_or_sections() {
+        let view =
+            "[[contributions.views]]\nid = \"g\"\ntitle = \"G\"\nplacement = \"side\"\nbody = []\n";
+        let one = format!(
+            "{PACKAGE}\n{view}feed = {{ request = \"$/lean/plainGoal\", field = \"rendered\" }}\n"
+        );
+        let m = ok(&one);
+        assert_eq!(m.views[0].feeds.len(), 1);
+        assert_eq!(
+            m.views[0].feeds[0].source,
+            Source::Request("$/lean/plainGoal".into())
+        );
+        let many = format!(
+            "{PACKAGE}\n{view}feed = [{{ title = \"Goals\", request = \"$/lean/plainGoal\" }}, {{ title = \"Expected type\", request = \"$/lean/plainTermGoal\", field = \"goal\", code = true }}, {{ title = \"Messages\", source = \"messages\" }}]\n"
+        );
+        let m = ok(&many);
+        let feeds = &m.views[0].feeds;
+        assert_eq!(feeds.len(), 3);
+        assert!(feeds[1].code);
+        assert_eq!(feeds[2].source, Source::Messages);
+        assert_eq!(feeds[2].title, "Messages");
+        for bad in [
+            "feed = { source = \"weather\" }",
+            "feed = { request = \"a\", source = \"messages\" }",
+            "feed = { request = \"a\", code = 1 }",
+            "feed = [1]",
+            "feed = 3",
+        ] {
+            assert!(manifest_err(&format!("{PACKAGE}\n{view}{bad}\n")), "{bad}");
+        }
+        let nine = ["{ source = \"messages\" }"; 9].join(", ");
+        assert!(manifest_err(&format!("{PACKAGE}\n{view}feed = [{nine}]\n")));
+    }
+
     #[test]
     fn views_read_their_tree_and_say_what_is_wrong() {
         let text = format!(

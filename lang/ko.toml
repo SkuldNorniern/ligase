@@ -247,3 +247,7 @@
 "a fix or change" = "수정 또는 변경"
 "no fixes here" = "여기에는 수정 없음"
 "the server is gone" = "서버가 없음"
+"error" = "오류"
+"warning" = "경고"
+"info" = "정보"
+"hint" = "힌트"

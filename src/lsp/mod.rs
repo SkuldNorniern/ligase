@@ -140,7 +140,7 @@ pub enum Event {
     Completion(ViewId, Revision, Vec<complete::Item>),
     /// what a view's feed asked for at a caret: the feed, the editor view,
     /// the caret, and the server's result as it came.
-    Feed(u16, ViewId, usize, Value),
+    Feed(u32, ViewId, usize, Value),
     Status(String),
 }
 
@@ -171,7 +171,7 @@ enum Pending {
     Actions(crate::document::DocumentId, Revision, Seen),
     /// an action's edit, filled in by the server.
     Resolved(crate::document::DocumentId, Revision, Seen),
-    Feed(u16, ViewId, usize),
+    Feed(u32, ViewId, usize),
 }
 
 /// how a language's server is doing, for the status bar.
@@ -540,7 +540,7 @@ impl Lsp {
 
     /// asks the server of `view`'s file `method` at its caret, for the
     /// view fed by feed `key`. false when there is no server to ask yet.
-    pub fn feed(&mut self, docs: &Documents, view: ViewId, method: &str, key: u16) -> bool {
+    pub fn feed(&mut self, docs: &Documents, view: ViewId, method: &str, key: u32) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
         self.ask(docs, view, method, Pending::Feed(key, view, at), json!({}))
             .is_some()
