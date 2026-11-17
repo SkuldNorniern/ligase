@@ -63,13 +63,11 @@ impl Palette {
         self.kind.is_some()
     }
 
+    /// opens on `kind` with an empty query. commands and symbols opened
+    /// this way stay so: no `>` in the field for the first key to wipe out.
     pub fn open(&mut self, kind: Kind) {
         self.kind = Some(kind);
-        self.query = match kind {
-            Kind::Commands => ">".to_owned(),
-            Kind::Symbols => "@".to_owned(),
-            Kind::Files | Kind::Prompt => String::new(),
-        };
+        self.query = String::new();
         self.pick = 0;
         self.top = 0;
         self.made_for = None;
@@ -103,11 +101,21 @@ impl Palette {
         }
     }
 
-    /// the list asked for by the query: `>` in front means commands, `@`
-    /// the symbols of the open file.
+    /// the list asked for. opened on commands or symbols, it stays there;
+    /// opened on files, `>` in front means commands and `@` the symbols of
+    /// the open file.
     pub fn wanted(&self) -> (Kind, &str) {
-        if self.kind == Some(Kind::Prompt) {
-            return (Kind::Prompt, self.query.trim());
+        match self.kind {
+            Some(Kind::Prompt) => return (Kind::Prompt, self.query.trim()),
+            Some(Kind::Commands) => {
+                let q = self.query.strip_prefix('>').unwrap_or(&self.query);
+                return (Kind::Commands, q.trim());
+            }
+            Some(Kind::Symbols) => {
+                let q = self.query.strip_prefix('@').unwrap_or(&self.query);
+                return (Kind::Symbols, q.trim());
+            }
+            Some(Kind::Files) | None => {}
         }
         if let Some(rest) = self.query.strip_prefix('>') {
             (Kind::Commands, rest.trim_start())
@@ -322,6 +330,16 @@ mod tests {
         assert_eq!((p.pick, p.top), (1, 0), "the wheel leaves the pick");
         p.scroll(9, 1);
         assert_eq!(p.top, 1, "never past the last row");
+        p.open(Kind::Commands);
+        p.query = "sav".into();
+        assert_eq!(
+            p.wanted(),
+            (Kind::Commands, "sav"),
+            "opened on commands, stays"
+        );
+        p.query = ">sav".into();
+        assert_eq!(p.wanted(), (Kind::Commands, "sav"), "a typed > is fine too");
+        p.open(Kind::Files);
         p.query = ">sav".into();
         assert_eq!(p.wanted(), (Kind::Commands, "sav"));
     }
