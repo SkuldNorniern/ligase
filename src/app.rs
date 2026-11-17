@@ -138,6 +138,10 @@ pub enum Command {
     OpenSettings,
     /// the language server of the file in front, stopped and started again.
     RestartServer,
+    /// back to where the caret jumped from.
+    GoBack,
+    /// forward again after going back.
+    GoForward,
     /// the settings file itself, in an editor.
     OpenSettingsFile,
     ReopenClosed,
@@ -260,6 +264,8 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
         "Restart Language Server",
         Command::RestartServer,
     ),
+    ("go.back", "Go Back", Command::GoBack),
+    ("go.forward", "Go Forward", Command::GoForward),
     ("git.openChanges", "Open Changes", Command::OpenChanges),
     ("editor.split", "Split Editor", Command::SplitEditor),
     ("view.zoomIn", "Zoom In", Command::ZoomIn),
@@ -438,6 +444,8 @@ pub struct App {
     complete_for: Option<ViewId>,
     /// the editor that had the keyboard last, even while a field has it.
     last_editor: Option<ViewId>,
+    /// places jumped from, for go back and forward.
+    trail: crate::trail::Trail,
     /// last key or click in an editor; the caret blinks from there.
     typed_at: Instant,
     /// a dialog main should show after this frame.
@@ -551,6 +559,7 @@ impl App {
             want_complete: None,
             complete_for: None,
             last_editor: None,
+            trail: crate::trail::Trail::default(),
             typed_at: Instant::now(),
             dialog: None,
             settings: Settings::default(),
@@ -1072,6 +1081,10 @@ impl App {
                     self.ui.focus(Id::Editor(view), 1);
                     self.last_editor = Some(view);
                 }
+                return;
+            }
+            Command::GoBack | Command::GoForward => {
+                self.walk_trail(command == Command::GoBack);
                 return;
             }
             Command::RestartServer => {
@@ -2152,6 +2165,7 @@ impl App {
             return;
         }
         if let Some((line, column)) = goto {
+            self.leave();
             if let Some(view) = editor
                 && let Some(v) = self.docs.view_mut(view)
             {
@@ -2181,6 +2195,7 @@ impl App {
                 }
             }
             Kind::Symbols => {
+                self.leave();
                 let at = self.palette.symbol_at.get(item).copied();
                 if let (Some(view), Some(at)) = (editor, at)
                     && let Some(v) = self.docs.view_mut(view)
@@ -2378,6 +2393,9 @@ impl App {
                 }
             }
             find::Ask::Goto => {
+                if find::parse_goto(&self.bar.goto).is_some() {
+                    self.leave();
+                }
                 if let Some((line, column)) = find::parse_goto(&self.bar.goto)
                     && let Some(v) = self.docs.view_mut(view)
                 {
@@ -2952,7 +2970,59 @@ impl App {
         }
     }
 
+    /// where the caret of the last editor is, to come back to.
+    fn place_now(&self) -> Option<crate::trail::Place> {
+        let view = self.docs.view(self.last_editor?)?;
+        let doc = self.docs.doc(view.doc)?;
+        if doc.untitled {
+            return None;
+        }
+        let at = doc
+            .buffer
+            .text()
+            .point(view.sel.head, Encoding::Utf32)
+            .ok()?;
+        Some(crate::trail::Place {
+            path: doc.path.clone(),
+            at,
+        })
+    }
+
+    /// a jump is about to move the caret: keep where it was.
+    fn leave(&mut self) {
+        if let Some(place) = self.place_now() {
+            self.trail.leave(place);
+        }
+    }
+
+    /// back or forward along the trail.
+    fn walk_trail(&mut self, back: bool) {
+        let Some(now) = self.place_now() else {
+            return;
+        };
+        let to = if back {
+            self.trail.back(now)
+        } else {
+            self.trail.forward(now)
+        };
+        let Some(to) = to else {
+            return;
+        };
+        let view = self.open_file_quiet(&to.path);
+        if let Some(v) = self.docs.view_mut(view) {
+            v.goto = Some((to.at, Encoding::Utf32));
+        }
+        self.ui.focus(Id::Editor(view), 1);
+        self.last_editor = Some(view);
+    }
+
     fn open_file(&mut self, path: &Path) -> ViewId {
+        self.leave();
+        self.open_file_quiet(path)
+    }
+
+    /// opens `path` without leaving a mark on the trail.
+    fn open_file_quiet(&mut self, path: &Path) -> ViewId {
         let (doc, new) = self.docs.open(path);
         if new {
             self.load(doc, path);
@@ -4461,6 +4531,8 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::C), Command::Copy)
         .bind(Chord::command(KeyCode::V), Command::Paste)
         .bind(Chord::command(KeyCode::A), Command::SelectAll)
+        .bind(Chord::key(KeyCode::Left).alt(), Command::GoBack)
+        .bind(Chord::key(KeyCode::Right).alt(), Command::GoForward)
         .bind(
             Chord::key(KeyCode::Up).alt(),
             Command::Line(LineOp::Move(true)),

@@ -241,3 +241,5 @@
 "restarting the server for" = "서버 다시 시작:"
 "no language server for this file" = "이 파일의 언어 서버 없음"
 "checking" = "검사 중"
+"Go Back" = "뒤로 가기"
+"Go Forward" = "앞으로 가기"

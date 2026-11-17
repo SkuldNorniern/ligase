@@ -20,6 +20,7 @@ mod search;
 mod settings;
 mod syntax;
 mod terminal;
+mod trail;
 mod workbench;
 
 use std::cell::RefCell;
@@ -336,6 +337,9 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     )?;
     add(&mut edit, "Delete Line", Command::Line(LineOp::Delete))?;
     let mut go = bar.add_submenu(a.texts.tr("Go"))?;
+    add(&mut go, "Go Back", Command::GoBack)?;
+    add(&mut go, "Go Forward", Command::GoForward)?;
+    go.add_separator()?;
     add(&mut go, "Go to Line", Command::GotoLine)?;
     add(&mut go, "Go to Symbol", Command::GotoSymbol)?;
     add(&mut go, "Go to Definition", Command::GotoDefinition)?;
