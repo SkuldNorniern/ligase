@@ -8,6 +8,7 @@ pub mod complete;
 pub mod edit;
 pub mod rpc;
 pub mod server;
+pub mod signature;
 pub mod uri;
 
 use std::collections::{HashMap, VecDeque};
@@ -125,6 +126,8 @@ pub enum Event {
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
     Hover(ViewId, usize, String),
+    /// the call the caret is in, as markdown; none when it left the call.
+    Signature(ViewId, Option<String>),
     /// changes to make in files, positions in `Encoding`: a rename or a
     /// format. `revision` is the asking document's, to drop a late one.
     Edits(
@@ -162,6 +165,7 @@ struct Synced {
 enum Pending {
     Definition,
     Hover(ViewId, usize),
+    Signature(ViewId),
     /// a rename or format for a document as of a revision, and every open
     /// document's revision then.
     Edits(crate::document::DocumentId, Revision, Seen),
@@ -189,6 +193,8 @@ pub struct Lsp {
     pending: HashMap<(&'static str, i64), Pending>,
     /// chars that ask for completion, per language, from the server.
     triggers: HashMap<&'static str, Vec<String>>,
+    /// chars that ask for signature help, per language.
+    sig_triggers: HashMap<&'static str, Vec<String>>,
     /// the completion request out now and when it went; one at a time.
     completing: Option<((&'static str, i64), Instant)>,
     /// asked again while one was out: ask once that one is back.
@@ -542,6 +548,25 @@ impl Lsp {
             .is_some_and(|(_, t)| t.iter().any(|t| typed.ends_with(t.as_str())))
     }
 
+    /// asks for the call the caret of `view` is in.
+    pub fn signature(&mut self, docs: &Documents, view: ViewId) -> bool {
+        self.ask(
+            docs,
+            view,
+            "textDocument/signatureHelp",
+            Pending::Signature(view),
+            json!({}),
+        )
+        .is_some()
+    }
+
+    /// `typed` asks `language`'s server for signature help.
+    pub fn sig_trigger(&self, language: Option<&str>, typed: &str) -> bool {
+        language
+            .and_then(|l| self.sig_triggers.get(l))
+            .is_some_and(|t| t.iter().any(|t| t == typed))
+    }
+
     pub fn hover(&mut self, docs: &Documents, view: ViewId) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
         self.ask(
@@ -673,6 +698,17 @@ impl Lsp {
                         })
                         .unwrap_or_default();
                     self.triggers.insert(language, triggers);
+                    let sig = &caps["signatureHelpProvider"];
+                    let sig_triggers = ["triggerCharacters", "retriggerCharacters"]
+                        .iter()
+                        .filter_map(|k| sig[*k].as_array())
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|t| !t.is_empty() && t.len() <= 4)
+                        .take(16)
+                        .map(str::to_owned)
+                        .collect();
+                    self.sig_triggers.insert(language, sig_triggers);
                     server.initialized();
                     return;
                 }
@@ -716,6 +752,9 @@ impl Lsp {
                     Some(Pending::Feed(key, view, at)) => {
                         // an error reply is an empty one: the view says so
                         events.push(Event::Feed(key, view, at, msg["result"].clone()));
+                    }
+                    Some(Pending::Signature(view)) => {
+                        events.push(Event::Signature(view, signature::text(&msg["result"])));
                     }
                     Some(Pending::Hover(view, at)) => {
                         let text = hover_text(&msg["result"]["contents"]);

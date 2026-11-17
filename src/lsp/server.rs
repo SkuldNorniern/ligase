@@ -174,6 +174,13 @@ fn init_params(root: &Path) -> Value {
                 "rename": { "prepareSupport": false },
                 "formatting": {},
                 "references": {},
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"],
+                        "parameterInformation": { "labelOffsetSupport": true },
+                        "activeParameterSupport": true,
+                    },
+                },
                 "codeAction": {
                     "codeActionLiteralSupport": {
                         "codeActionKind": { "valueSet": [

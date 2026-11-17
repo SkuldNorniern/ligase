@@ -436,6 +436,10 @@ pub struct App {
     lsp: Lsp,
     /// hover text for a view, while its caret stays where it was asked.
     hover: Option<(ViewId, usize, String)>,
+    /// the call the caret is in, while typing its arguments.
+    signature: Option<(ViewId, String)>,
+    /// signature help to ask for once the text is synced.
+    want_signature: Option<ViewId>,
     /// a whole line copied with nothing selected; pasting it goes in above.
     line_clip: Option<String>,
     /// editor font size.
@@ -564,6 +568,8 @@ impl App {
             problems: Problems::default(),
             lsp: Lsp::default(),
             hover: None,
+            signature: None,
+            want_signature: None,
             line_clip: None,
             zoom: editor::SIZE,
             bar: Bar::default(),
@@ -865,9 +871,17 @@ impl App {
             if moved {
                 self.completion = None;
                 self.complete_for = None;
+                self.signature = None;
             }
             if let Some(typed) = typed {
                 self.typed_for_completion(view, &typed);
+                // a trigger asks; inside a call shown, every key asks again
+                let language = self.docs.doc_of(view).and_then(|d| d.language);
+                if self.lsp.sig_trigger(language, &typed)
+                    || self.signature.as_ref().is_some_and(|(v, _)| *v == view)
+                {
+                    self.want_signature = Some(view);
+                }
             }
             self.typed_at = Instant::now();
             return true;
@@ -3184,6 +3198,9 @@ impl App {
                     self.completed(view, revision, items);
                 }
                 lsp::Event::Feed(n, view, at, result) => self.fed(n, view, at, &result),
+                lsp::Event::Signature(view, text) => {
+                    self.signature = text.map(|t| (view, t));
+                }
                 lsp::Event::Hover(view, at, text) => {
                     if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
                         self.hover = Some((view, at, text));
@@ -3197,6 +3214,12 @@ impl App {
             self.start_server(language, file);
         }
         self.lsp.sync(&self.docs);
+        if let Some(view) = self.want_signature.take()
+            && !self.lsp.signature(&self.docs, view)
+        {
+            // not synced yet: next frame
+            self.want_signature = Some(view);
+        }
         if let Some(view) = self.lsp.take_again() {
             self.want_complete.get_or_insert(view);
         }
@@ -3597,6 +3620,12 @@ impl App {
         let keymap = &self.keymap;
         let recent = &self.recent;
         let mut recent_pick: Option<PathBuf> = None;
+        // a hover at the caret, else the call being typed
+        let hover_now = self.hover.clone().or_else(|| {
+            let (view, text) = self.signature.clone()?;
+            let at = self.docs.view(view)?.sel.head;
+            Some((view, at, text))
+        });
         let rail_items = self.rail_items();
         let side_head = self.side_head(&titles);
         let rail_pick;
@@ -3607,7 +3636,7 @@ impl App {
             let Workbench { dock, panels, side } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
             let shell = &mut self.shell;
-            let hover = &self.hover;
+            let hover = &hover_now;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
