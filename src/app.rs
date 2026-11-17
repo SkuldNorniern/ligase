@@ -2999,6 +2999,9 @@ impl App {
                 lsp::Event::Diagnostics(doc, revision, diags) => {
                     self.docs.set_diags(doc, revision, diags);
                 }
+                lsp::Event::Busy(doc, revision, busy) => {
+                    self.docs.set_busy(doc, revision, busy);
+                }
                 lsp::Event::Goto(path, at, encoding) => {
                     let view = self.open_file(&path);
                     if let Some(v) = self.docs.view_mut(view) {

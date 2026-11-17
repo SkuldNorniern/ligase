@@ -48,6 +48,9 @@ pub struct Document {
     asked: Option<Revision>,
     /// language server diagnostics, moved along with edits.
     pub diags: Vec<Diag>,
+    /// text the server is still checking, and whether it stopped there on a
+    /// fatal error. moved along with edits.
+    pub busy: Vec<(Range<usize>, bool)>,
     /// the last few edits, to move late results onto the text now.
     recent: VecDeque<ChangeSet>,
     /// the file on disk as last read or written; none before that.
@@ -80,6 +83,27 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
 }
 
 impl Document {
+    /// moves `ranges`, made for the text of `revision`, onto the text now.
+    /// false when that text is too old to follow.
+    fn catch_up<'a>(
+        &self,
+        revision: Revision,
+        ranges: impl Iterator<Item = &'a mut Range<usize>>,
+    ) -> bool {
+        if revision == self.buffer.revision() {
+            return true;
+        }
+        let Some(from) = self.recent.iter().position(|set| set.before == revision) else {
+            return false;
+        };
+        for range in ranges {
+            for set in self.recent.iter().skip(from) {
+                *range = map_range(set, range.clone());
+            }
+        }
+        true
+    }
+
     pub fn name(&self) -> String {
         self.path.file_name().map_or_else(
             || self.path.display().to_string(),
@@ -189,6 +213,7 @@ impl Documents {
                 symbols: Vec::new(),
                 asked: None,
                 diags: Vec::new(),
+                busy: Vec::new(),
                 recent: VecDeque::new(),
                 disk: None,
                 conflict: false,
@@ -371,6 +396,9 @@ impl Documents {
             for diag in &mut d.diags {
                 diag.range = map_range(set, diag.range.clone());
             }
+            for (range, _) in &mut d.busy {
+                *range = map_range(set, range.clone());
+            }
             d.recent.push_back(set.clone());
             if d.recent.len() > RECENT {
                 d.recent.pop_front();
@@ -529,19 +557,28 @@ impl Documents {
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
-        let now = doc.buffer.revision();
-        if revision != now {
-            let Some(from) = doc.recent.iter().position(|set| set.before == revision) else {
-                return;
-            };
-            for set in doc.recent.iter().skip(from) {
-                for diag in &mut diags {
-                    diag.range = map_range(set, diag.range.clone());
-                }
-            }
+        if !doc.catch_up(revision, diags.iter_mut().map(|d| &mut d.range)) {
+            return;
         }
         diags.sort_by_key(|d| (d.range.start, d.severity));
         doc.diags = diags;
+    }
+
+    /// what the server is still checking, as of `revision`.
+    pub fn set_busy(
+        &mut self,
+        id: DocumentId,
+        revision: Revision,
+        mut busy: Vec<(Range<usize>, bool)>,
+    ) {
+        let Some(doc) = self.docs.get_mut(&id) else {
+            return;
+        };
+        if !doc.catch_up(revision, busy.iter_mut().map(|b| &mut b.0)) {
+            return;
+        }
+        busy.sort_by_key(|b| b.0.start);
+        doc.busy = busy;
     }
 
     /// a save is done. ignored when the document was closed meanwhile.

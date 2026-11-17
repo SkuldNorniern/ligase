@@ -24,6 +24,8 @@ use server::Server;
 const MAX_SYNCED: usize = 8 * 1024 * 1024;
 /// old versions kept so late diagnostics land on the right text.
 const KEEP_VERSIONS: usize = 8;
+/// most still-checking ranges kept from one progress note.
+const MAX_BUSY: usize = 1000;
 /// a completion request not answered by then no longer holds up the next.
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -99,6 +101,13 @@ pub struct Diag {
 pub enum Event {
     /// diagnostics for a document, in the text of `revision`.
     Diagnostics(crate::document::DocumentId, Revision, Vec<Diag>),
+    /// text the server is still checking, and whether each stopped on a
+    /// fatal error (lean's `$/lean/fileProgress`).
+    Busy(
+        crate::document::DocumentId,
+        Revision,
+        Vec<(Range<usize>, bool)>,
+    ),
     /// open this file there.
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
@@ -526,6 +535,11 @@ impl Lsp {
                     events.push(event);
                 }
             }
+            (Some("$/lean/fileProgress"), None) => {
+                if let Some(event) = self.progress(&msg["params"]) {
+                    events.push(event);
+                }
+            }
             (Some("window/showMessage"), None) => {
                 if let Some(text) = msg["params"]["message"].as_str() {
                     events.push(Event::Status(text.to_owned()));
@@ -612,10 +626,14 @@ impl Lsp {
         }
     }
 
-    fn diagnostics(&self, params: &Value) -> Option<Event> {
-        let uri = params["uri"].as_str()?;
-        // servers spell uris their own way (`c:` vs `C:`, `%3A`), so match
-        // the paths they name, not the strings
+    /// the synced file `uri` names, the text a reply with `version` was
+    /// made for (the newest when none), and the server's encoding. servers
+    /// spell uris their own way (`c:` vs `C:`, `%3A`), so paths are matched.
+    fn sent_for(
+        &self,
+        uri: &str,
+        version: Option<i64>,
+    ) -> Option<(crate::document::DocumentId, &TextSnapshot, Encoding)> {
         let path = uri::to_path(uri)?;
         let (&doc, synced) = self
             .synced
@@ -624,17 +642,36 @@ impl Lsp {
         let Some(Slot::Running(_, encoding)) = self.servers.get(synced.language) else {
             return None;
         };
-        // the text these were made for: the stated version, else the newest
-        let version = params["version"].as_i64();
         let (_, text) = match version {
             Some(v) => synced.sent.iter().find(|(sent, _)| *sent == v)?,
             None => synced.sent.back()?,
         };
+        Some((doc, text, *encoding))
+    }
+
+    fn progress(&self, params: &Value) -> Option<Event> {
+        let doc = &params["textDocument"];
+        let (id, text, encoding) = self.sent_for(doc["uri"].as_str()?, doc["version"].as_i64())?;
+        let busy = params["processing"]
+            .as_array()?
+            .iter()
+            .take(MAX_BUSY)
+            .filter_map(|p| {
+                let range = range_in(text, &p["range"], encoding)?;
+                Some((range, p["kind"].as_i64() == Some(2)))
+            })
+            .collect();
+        Some(Event::Busy(id, text.revision(), busy))
+    }
+
+    fn diagnostics(&self, params: &Value) -> Option<Event> {
+        let (doc, text, encoding) =
+            self.sent_for(params["uri"].as_str()?, params["version"].as_i64())?;
         let diags = params["diagnostics"]
             .as_array()?
             .iter()
             .filter_map(|d| {
-                let range = range_in(text, &d["range"], *encoding)?;
+                let range = range_in(text, &d["range"], encoding)?;
                 let severity = match d["severity"].as_i64() {
                     Some(1) | None => Severity::Error,
                     Some(2) => Severity::Warning,

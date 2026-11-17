@@ -1372,6 +1372,26 @@ pub fn show(
                     *mark = Some(mark.map_or(diag.severity, |m| m.min(diag.severity)));
                 }
             }
+            // lines the server is still checking: a bar at the gutter's edge
+            for (busy, fatal) in &doc.busy {
+                let (Ok(l0), Ok(l1)) = (text.line_of(busy.start), text.line_of(busy.end)) else {
+                    continue;
+                };
+                if l1 < first_line || l0 > last_line {
+                    continue;
+                }
+                let colour = if *fatal {
+                    palette.danger
+                } else {
+                    palette.warning
+                };
+                for (i, v) in visible.iter().enumerate() {
+                    if (l0..=l1).contains(&v.0) {
+                        let bar = Rect::new(content.x + 1.0, row_y(i), 3.0, line_h);
+                        ui.fill(bar, colour.fade(0.7))?;
+                    }
+                }
+            }
             let small = ui.theme.font(11.0);
             // lines changed since HEAD: a bar by the text, a wedge where lines went
             // hunks are in line order: only the ones from the top line on are looked at
