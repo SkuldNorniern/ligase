@@ -240,3 +240,4 @@
 "Restart Language Server" = "언어 서버 다시 시작"
 "restarting the server for" = "서버 다시 시작:"
 "no language server for this file" = "이 파일의 언어 서버 없음"
+"checking" = "검사 중"

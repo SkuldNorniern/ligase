@@ -4195,15 +4195,24 @@ impl App {
             );
         let indent = format!("{} {}", self.texts.tr("Spaces:"), self.settings.tab_size);
         let eol = if doc.crlf { "CRLF" } else { "LF" };
-        let language = match doc.language {
+        // a click on the language starts its server again
+        let (language, restart) = match doc.language {
             Some(language) => match self.lsp.state(language) {
-                Some(lsp::ServerState::Missing) => {
-                    format!("{language} ({})", self.texts.tr("no language server"))
+                Some(lsp::ServerState::Missing) => (
+                    format!("{language} ({})", self.texts.tr("no language server")),
+                    Some(Command::RestartServer),
+                ),
+                Some(lsp::ServerState::Starting) => (format!("{language} …"), None),
+                Some(lsp::ServerState::Running) if !doc.busy.is_empty() => (
+                    format!("{language} · {}", self.texts.tr("checking")),
+                    Some(Command::RestartServer),
+                ),
+                Some(lsp::ServerState::Running) => {
+                    (language.to_owned(), Some(Command::RestartServer))
                 }
-                Some(lsp::ServerState::Starting) => format!("{language} …"),
-                _ => language.to_owned(),
+                None => (language.to_owned(), None),
             },
-            None => "text".to_owned(),
+            None => ("text".to_owned(), None),
         };
         let mut parts = Vec::new();
         if errors + warnings > 0 {
@@ -4216,7 +4225,7 @@ impl App {
         parts.push((indent, None));
         parts.push(("UTF-8".to_owned(), None));
         parts.push((eol.to_owned(), None));
-        parts.push((language, None));
+        parts.push((language, restart));
         parts
     }
 
