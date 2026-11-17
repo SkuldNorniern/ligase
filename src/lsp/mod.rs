@@ -159,6 +159,22 @@ impl Lsp {
         built_in(language).or_else(|| self.extra.iter().find(|s| s.language == language).cloned())
     }
 
+    /// lets `language`'s server go so the next frame starts it again. the
+    /// files it had open are sent afresh then. gives the old server, to be
+    /// dropped off the ui thread: dropping waits on the process.
+    pub fn restart(&mut self, language: &str) -> Option<Box<Server>> {
+        let old = match self.servers.remove(language) {
+            Some(Slot::Running(server, _)) => Some(server),
+            _ => None,
+        };
+        self.synced.retain(|_, s| s.language != language);
+        self.pending.retain(|(l, _), _| *l != language);
+        if self.completing.is_some_and(|((l, _), _)| l == language) {
+            self.completing = None;
+        }
+        old
+    }
+
     /// takes the servers packages bring now. a language that had none and
     /// failed to start gets another try with the new one.
     pub fn set_extra(&mut self, specs: Vec<ServerSpec>) {

@@ -237,3 +237,6 @@
 "Allow it to start these" = "실행 허용"
 "Allow programs" = "프로그램 실행 허용"
 "wants to start these programs, with your rights, in this folder:" = "이 폴더에서 내 권한으로 다음 프로그램을 실행하려 합니다:"
+"Restart Language Server" = "언어 서버 다시 시작"
+"restarting the server for" = "서버 다시 시작:"
+"no language server for this file" = "이 파일의 언어 서버 없음"

@@ -136,6 +136,8 @@ pub enum Command {
     Commands,
     GotoSymbol,
     OpenSettings,
+    /// the language server of the file in front, stopped and started again.
+    RestartServer,
     /// the settings file itself, in an editor.
     OpenSettingsFile,
     ReopenClosed,
@@ -253,6 +255,11 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("view.problems", "Problems", Command::ToggleProblems),
     ("view.sourceControl", "Source Control", Command::ToggleGit),
     ("view.extensions", "Extensions", Command::ToggleExtensions),
+    (
+        "editor.restartServer",
+        "Restart Language Server",
+        Command::RestartServer,
+    ),
     ("git.openChanges", "Open Changes", Command::OpenChanges),
     ("editor.split", "Split Editor", Command::SplitEditor),
     ("view.zoomIn", "Zoom In", Command::ZoomIn),
@@ -1062,6 +1069,28 @@ impl App {
                     let view = self.open_file(&path);
                     self.ui.focus(Id::Editor(view), 1);
                     self.last_editor = Some(view);
+                }
+                return;
+            }
+            Command::RestartServer => {
+                let language = focus
+                    .or(self.last_editor)
+                    .and_then(|v| self.docs.doc_of(v))
+                    .and_then(|d| d.language);
+                match language {
+                    Some(language) => {
+                        if let Some(old) = self.lsp.restart(language) {
+                            self.jobs.run(move || {
+                                drop(old);
+                                Done::Note(None)
+                            });
+                        }
+                        self.say(format!(
+                            "{} {language}",
+                            self.texts.tr("restarting the server for")
+                        ));
+                    }
+                    None => self.say(self.texts.tr("no language server for this file").to_owned()),
                 }
                 return;
             }
