@@ -30,7 +30,7 @@ use crate::problems::{self, Problems};
 use crate::search::{self, Finder};
 use crate::settings::{self, RailPlace, Settings, SidePlace, ThemeChoice};
 use crate::syntax::Syntax;
-use crate::terminal::{self, Shell};
+use crate::terminal;
 use crate::workbench::panels::{PaneId, Panel};
 use crate::workbench::{self, Refused, Workbench, rail};
 
@@ -61,6 +61,8 @@ pub enum Id {
     ScmList,
     ScmRow(u16),
     ReplaceInFiles,
+    /// a tab of the terminal strip; `u16::MAX` is the add button.
+    TerminalTab(u16),
     /// the breadcrumb over an editor.
     Crumb(ViewId),
     ReplaceAllButton,
@@ -119,6 +121,8 @@ pub enum Command {
     /// an extension's view, by its number.
     ToggleView(u16),
     ToggleTerminal,
+    /// another shell in the terminal panel.
+    NewTerminal,
     ToggleProblems,
     ToggleGit,
     /// the focused file against HEAD.
@@ -263,6 +267,7 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("view.explorer", "Explorer", Command::ToggleExplorer),
     ("view.search", "Search", Command::ToggleSearch),
     ("view.terminal", "Terminal", Command::ToggleTerminal),
+    ("terminal.new", "New Terminal", Command::NewTerminal),
     ("view.problems", "Problems", Command::ToggleProblems),
     ("view.sourceControl", "Source Control", Command::ToggleGit),
     ("view.extensions", "Extensions", Command::ToggleExtensions),
@@ -386,7 +391,7 @@ enum Done {
         SavePoint,
         Result<Option<document::Stamp>, String>,
     ),
-    Shell(Result<vanta::Terminal, String>),
+    Shell(u32, Result<vanta::Terminal, String>),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
@@ -432,7 +437,7 @@ pub struct App {
     explorer: Explorer,
     jobs: Jobs<Done>,
     syntax: Syntax,
-    shell: Shell,
+    shells: terminal::Shells,
     finder: Finder,
     problems: Problems,
     lsp: Lsp,
@@ -565,7 +570,7 @@ impl App {
             explorer: Explorer::new(root),
             jobs: Jobs::default(),
             syntax: Syntax::default(),
-            shell: Shell::default(),
+            shells: terminal::Shells::default(),
             finder: Finder::default(),
             problems: Problems::default(),
             lsp: Lsp::default(),
@@ -897,6 +902,7 @@ impl App {
         match self.keymap.resolve(event, false) {
             Some(
                 command @ (Command::ToggleTerminal
+                | Command::NewTerminal
                 | Command::ToggleSidebar
                 | Command::ToggleExplorer
                 | Command::ToggleSearch
@@ -910,21 +916,21 @@ impl App {
             }
             Some(Command::Paste) => {
                 if let Some(text) = aurea::clipboard::clipboard_text() {
-                    self.shell.paste(&text);
+                    self.shells.current().paste(&text);
                 }
                 return true;
             }
             _ => {}
         }
-        let Some(bytes) = self.shell.bytes(event) else {
+        let Some(bytes) = self.shells.current().bytes(event) else {
             return self.ui.handle(event);
         };
-        if self.shell.state == terminal::State::Ended {
+        if self.shells.current().state == terminal::State::Ended {
             if bytes == "\r" {
                 self.start_shell();
             }
         } else {
-            self.shell.write(&bytes);
+            self.shells.current_mut().write(&bytes);
         }
         true
     }
@@ -956,10 +962,11 @@ impl App {
         }
     }
 
-    /// starts the shell on the worker, in the workspace folder. its output
-    /// wakes the canvas.
+    /// starts the shell in front on the worker, in the workspace folder.
+    /// its output wakes the canvas.
     fn start_shell(&mut self) {
-        self.shell.state = terminal::State::Starting;
+        let id = self.shells.current_id();
+        self.shells.current_mut().state = terminal::State::Starting;
         let root = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
         let job = move || {
@@ -968,10 +975,11 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(terminal::spawn(&root, wake))
+            Done::Shell(id, terminal::spawn(&root, wake))
         };
         if !self.jobs.run(job) {
-            self.shell
+            self.shells
+                .current_mut()
                 .started(Err("the file worker is not running".to_owned()));
         }
     }
@@ -1339,6 +1347,19 @@ impl App {
                 }
             }
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
+            Command::NewTerminal => {
+                if self.shells.add().is_none() {
+                    self.say(
+                        self.texts
+                            .tr("that is all the shells there can be")
+                            .to_owned(),
+                    );
+                }
+                if !self.shows(Panel::Terminal) {
+                    self.bench.toggle(Panel::Terminal);
+                }
+                self.ui.focus(Id::Terminal, 1);
+            }
             Command::ToggleProblems => self.bench.toggle(Panel::Problems),
             Command::OpenChanges => {
                 if let Some(view) = focus.or(self.last_editor) {
@@ -3341,7 +3362,11 @@ impl App {
                         self.after_save(doc, false);
                     }
                 },
-                Done::Shell(result) => self.shell.started(result),
+                Done::Shell(id, result) => {
+                    if let Some(shell) = self.shells.get_mut(id) {
+                        shell.started(result);
+                    }
+                }
                 Done::Found(doc, revision, query, hits) => self.found((doc, revision, query), hits),
                 Done::Files(files) => self.palette.set_files(files),
                 Done::FileOp(Ok(done)) => self.file_done(done),
@@ -3584,6 +3609,7 @@ impl App {
         let mut ime = None;
         let mut pressed: Vec<ViewId> = Vec::new();
         let mut shell_focus = false;
+        let mut tab_ask: Option<terminal::TabAsk> = None;
         self.refilter_completion();
         if self.shows(Panel::Problems) {
             self.problems.gather(&self.docs);
@@ -3638,7 +3664,7 @@ impl App {
         {
             let Workbench { dock, panels, side } = &mut self.bench;
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
-            let shell = &mut self.shell;
+            let shells = &mut self.shells;
             let hover = &hover_now;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
@@ -3780,7 +3806,10 @@ impl App {
                     Ok(())
                 }
                 Some(Panel::Terminal) => {
-                    shell_focus = terminal::show(ui, shell, rect, texts, terminal_size)?;
+                    let (strip, rest) = rect.split_top(terminal::STRIP, 0.0);
+                    tab_ask = terminal::strip(ui, shells, strip)?.or(tab_ask);
+                    shell_focus =
+                        terminal::show(ui, shells.current_mut(), rest, texts, terminal_size)?;
                     Ok(())
                 }
                 Some(Panel::Welcome) | None => {
@@ -3970,8 +3999,26 @@ impl App {
             }
             None => {}
         }
-        // the shell starts the first time its panel is drawn, not before
-        if self.shell.state == terminal::State::NotStarted && self.shows(Panel::Terminal) {
+        match tab_ask {
+            Some(terminal::TabAsk::Pick(i)) => {
+                self.shells.pick(i);
+                self.ui.focus(Id::Terminal, 1);
+            }
+            Some(terminal::TabAsk::Add) => self.run(Command::NewTerminal),
+            Some(terminal::TabAsk::Close(i)) => {
+                // dropping waits on the process: off the ui thread
+                if let Some(old) = self.shells.close(i) {
+                    self.jobs.run(move || {
+                        drop(old);
+                        Done::Note(None)
+                    });
+                }
+            }
+            None => {}
+        }
+        // a shell starts the first time it is in front, not before
+        if self.shells.current().state == terminal::State::NotStarted && self.shows(Panel::Terminal)
+        {
             self.start_shell();
         }
         for view in pressed {
@@ -4816,6 +4863,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Comma), Command::OpenSettings)
         .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
+        .bind(Chord::command(KeyCode::Grave).shift(), Command::NewTerminal)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)

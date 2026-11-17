@@ -5,7 +5,7 @@ use std::path::Path;
 
 use aurea::render::{Color, Font, Rect};
 use aurea::ui::{Align, ScrollArea, ScrollStyle, Sense, Ui};
-use aurea::{AureaResult, KeyCode, Modifiers, WindowEvent};
+use aurea::{AureaResult, CursorIcon, KeyCode, Modifiers, WindowEvent};
 use vanta::vt::Attrs;
 use vanta::{Cell, CellKind, Color as TermColor, SpawnConfig, Terminal};
 
@@ -68,6 +68,167 @@ pub struct Shell {
     app_keys: bool,
     /// lines dropped off the top of scrollback, as of last frame.
     dropped: u64,
+    /// typed while the shell was starting; sent once it runs.
+    early: String,
+}
+
+/// most shells in the panel.
+pub const MAX_SHELLS: usize = 16;
+/// height of the strip of shells over the panel.
+pub const STRIP: f32 = 26.0;
+
+/// the shells of the terminal panel, each with an id that outlives its
+/// place in the strip; one is in front.
+pub struct Shells {
+    list: Vec<(u32, Shell)>,
+    at: usize,
+    next: u32,
+}
+
+impl Default for Shells {
+    fn default() -> Self {
+        Self {
+            list: vec![(0, Shell::default())],
+            at: 0,
+            next: 1,
+        }
+    }
+}
+
+/// what a click on the strip asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabAsk {
+    Pick(usize),
+    Close(usize),
+    Add,
+}
+
+impl Shells {
+    pub fn current(&self) -> &Shell {
+        &self.list[self.at].1
+    }
+
+    pub fn current_mut(&mut self) -> &mut Shell {
+        &mut self.list[self.at].1
+    }
+
+    /// the id of the shell in front.
+    pub fn current_id(&self) -> u32 {
+        self.list[self.at].0
+    }
+
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut Shell> {
+        self.list.iter_mut().find(|(i, _)| *i == id).map(|(_, s)| s)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    /// a new shell in front, not started yet. none past the cap.
+    pub fn add(&mut self) -> Option<u32> {
+        if self.list.len() >= MAX_SHELLS {
+            return None;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.list.push((id, Shell::default()));
+        self.at = self.list.len() - 1;
+        Some(id)
+    }
+
+    pub fn pick(&mut self, i: usize) {
+        if i < self.list.len() {
+            self.at = i;
+        }
+    }
+
+    /// takes the shell at `i` out, to be dropped off the ui thread. the
+    /// last one going leaves a fresh one in its place.
+    pub fn close(&mut self, i: usize) -> Option<Shell> {
+        if i >= self.list.len() {
+            return None;
+        }
+        let (_, shell) = self.list.remove(i);
+        if self.list.is_empty() {
+            self.list.push((self.next, Shell::default()));
+            self.next += 1;
+        }
+        if self.at >= i && self.at > 0 {
+            self.at -= 1;
+        }
+        self.at = self.at.min(self.list.len() - 1);
+        Some(shell)
+    }
+}
+
+/// the strip over the panel: a tab per shell with a close mark, and `+`.
+pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Option<TabAsk>> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(12.0);
+    ui.fill(
+        Rect::new(rect.x, rect.y + rect.height - 1.0, rect.width, 1.0),
+        palette.border,
+    )?;
+    let mut ask = None;
+    let mut x = rect.x + 8.0;
+    for (i, (_, shell)) in shells.list.iter().enumerate() {
+        let n = u16::try_from(i).unwrap_or(u16::MAX);
+        let label = format!("{}", i + 1);
+        let w = ui.text_width(&label, &font) + 34.0;
+        let tab = Rect::new(x, rect.y + 3.0, w, rect.height - 6.0);
+        let front = i == shells.at;
+        let input = ui.interact(Id::TerminalTab(n), 0, tab, Sense::Click, false);
+        if front {
+            ui.round(tab, 5.0, palette.raised)?;
+        } else if input.hovered {
+            ui.round(tab, 5.0, palette.hover)?;
+        }
+        let colour = match shell.state {
+            State::Ended | State::Failed(_) => palette.faint,
+            _ if front => palette.text,
+            _ => palette.dim,
+        };
+        let text = Rect::new(tab.x + 10.0, tab.y, w - 30.0, tab.height);
+        ui.text(&label, text, &font, colour, Align::Start)?;
+        // the close mark, only when there is more than one
+        let close = Rect::new(
+            tab.x + w - 20.0,
+            tab.y + (tab.height - 16.0) / 2.0,
+            16.0,
+            16.0,
+        );
+        let shut = shells.list.len() > 1
+            && ui
+                .interact(Id::TerminalTab(n), 1, close, Sense::Click, false)
+                .clicked;
+        if shells.list.len() > 1 && (input.hovered || front) {
+            ui.text("×", close, &font, palette.dim, Align::Center)?;
+        }
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        if shut {
+            ask = Some(TabAsk::Close(i));
+        } else if input.clicked {
+            ask = Some(TabAsk::Pick(i));
+        }
+        x += w + 4.0;
+    }
+    if shells.list.len() < MAX_SHELLS {
+        let add = Rect::new(x, rect.y + 3.0, 24.0, rect.height - 6.0);
+        let input = ui.interact(Id::TerminalTab(u16::MAX), 0, add, Sense::Click, false);
+        if input.hovered {
+            ui.round(add, 5.0, palette.hover)?;
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        ui.text("+", add, &font, palette.dim, Align::Center)?;
+        if input.clicked {
+            ask = Some(TabAsk::Add);
+        }
+    }
+    Ok(ask)
 }
 
 /// starts a shell in `root`. runs on the worker; `wake` runs on vanta's
@@ -85,6 +246,9 @@ impl Shell {
     pub fn started(&mut self, result: Result<Terminal, String>) {
         match result {
             Ok(term) => {
+                if !self.early.is_empty() {
+                    let _ = term.write_str(&std::mem::take(&mut self.early));
+                }
                 self.term = Some(term);
                 self.state = State::Running;
                 self.size = (0, 0);
@@ -95,9 +259,14 @@ impl Shell {
     }
 
     /// sends typed bytes to the shell.
-    pub fn write(&self, bytes: &str) {
-        if let Some(term) = &self.term {
-            let _ = term.write_str(bytes);
+    pub fn write(&mut self, bytes: &str) {
+        match &self.term {
+            Some(term) => {
+                let _ = term.write_str(bytes);
+            }
+            // a few lines at most; past that typing ahead is a mistake
+            None if self.early.len() < 4096 => self.early.push_str(bytes),
+            None => {}
         }
     }
 
@@ -310,9 +479,13 @@ pub fn show(
         ui.text(text, rect, &small, palette.dim, Align::Center)
     };
     match &shell.state {
+        // the panel keeps the keyboard while the shell starts
         State::NotStarted | State::Starting => {
+            let focused = ui
+                .interact(Id::Terminal, 1, rect, Sense::Click, true)
+                .focused;
             hint(ui, texts.tr("starting the shell"))?;
-            return Ok(false);
+            return Ok(focused);
         }
         State::Failed(why) => {
             hint(ui, &format!("{}: {why}", texts.tr("can't start the shell")))?;
@@ -402,6 +575,31 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shells_add_pick_and_close() {
+        let mut s = Shells::default();
+        assert_eq!((s.len(), s.current_id()), (1, 0));
+        assert_eq!(s.add(), Some(1));
+        assert_eq!(s.add(), Some(2));
+        assert_eq!(s.current_id(), 2);
+        s.pick(0);
+        assert_eq!(s.current_id(), 0);
+        assert!(s.close(0).is_some());
+        assert_eq!(s.current_id(), 1, "the next one comes to the front");
+        s.pick(1);
+        assert!(s.close(1).is_some());
+        assert_eq!(s.current_id(), 1);
+        assert!(s.close(0).is_some());
+        assert_eq!(s.len(), 1, "never none");
+        assert_ne!(s.current_id(), 1);
+        assert!(s.close(5).is_none());
+        for _ in 0..40 {
+            s.add();
+        }
+        assert_eq!(s.len(), MAX_SHELLS);
+        assert!(s.get_mut(9999).is_none());
+    }
 
     fn key(key: KeyCode, modifiers: Modifiers) -> WindowEvent {
         WindowEvent::KeyInput {
