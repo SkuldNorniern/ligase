@@ -908,13 +908,24 @@ pub struct Look<'a> {
 /// height of the strip naming the file above the text.
 const CRUMBS: f32 = 24.0;
 
-/// the file's path above the text, folders dim and the file itself bright.
-fn crumbs(ui: &mut Ui<'_, Id>, path: &str, strip: Rect) -> AureaResult<()> {
+/// the file's path above the text, folders dim and the file itself bright,
+/// then the symbol the caret is in with its kind.
+fn crumbs(
+    ui: &mut Ui<'_, Id>,
+    path: &str,
+    symbol: Option<&crate::syntax::Symbol>,
+    strip: Rect,
+) -> AureaResult<()> {
     let palette = ui.theme.palette;
     let font = ui.theme.font(12.0);
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     let mut x = strip.x + 12.0;
     let end = strip.x + strip.width - 12.0;
+    let sep = |ui: &mut Ui<'_, Id>, x: &mut f32| {
+        let at = Rect::new(*x, strip.y, 16.0, strip.height);
+        *x += 16.0;
+        ui.text("›", at, &font, palette.faint, Align::Center)
+    };
     for (i, part) in parts.iter().enumerate() {
         let last = i + 1 == parts.len();
         let w = ui.text_width(part, &font);
@@ -922,12 +933,29 @@ fn crumbs(ui: &mut Ui<'_, Id>, path: &str, strip: Rect) -> AureaResult<()> {
         let colour = if last { palette.text } else { palette.dim };
         ui.text_clipped(part, room, &font, colour, Align::Start)?;
         x += w;
-        if last || x >= end {
-            break;
+        if x >= end {
+            return Ok(());
         }
-        let sep = Rect::new(x, strip.y, 16.0, strip.height);
-        ui.text("›", sep, &font, palette.faint, Align::Center)?;
-        x += 16.0;
+        if !last {
+            sep(ui, &mut x)?;
+        }
+    }
+    if let Some(symbol) = symbol
+        && x + 40.0 < end
+    {
+        sep(ui, &mut x)?;
+        let tag = ui.text_width(symbol.kind, &font) + 8.0;
+        let room = Rect::new(x, strip.y, tag, strip.height);
+        ui.text(
+            symbol.kind,
+            room,
+            &font,
+            palette.accent.fade(0.8),
+            Align::Start,
+        )?;
+        x += tag;
+        let room = Rect::new(x, strip.y, (end - x).max(0.0), strip.height);
+        ui.text_clipped(&symbol.name, room, &font, palette.text, Align::Start)?;
     }
     Ok(())
 }
@@ -1068,7 +1096,14 @@ pub fn show(
     let rect = match look.crumbs.filter(|_| settings.breadcrumbs) {
         Some(path) => {
             let (strip, rest) = rect.split_top(CRUMBS, 0.0);
-            crumbs(ui, path, strip)?;
+            // the named thing the caret is in, or last passed, ends the path
+            let head = view.sel.head;
+            let symbol = doc
+                .symbols
+                .iter()
+                .filter(|s| s.at <= head)
+                .max_by_key(|s| s.at);
+            crumbs(ui, path, symbol, strip)?;
             rest
         }
         None => rect,
