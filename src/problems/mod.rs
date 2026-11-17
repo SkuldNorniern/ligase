@@ -51,7 +51,7 @@ impl Problems {
                     severity: diag.severity,
                     line: at.line,
                     column: at.column,
-                    message: diag.message.lines().next().unwrap_or_default().to_owned(),
+                    message: one_line(&diag.message),
                 });
                 if rows.len() >= MAX_ROWS {
                     break;
@@ -119,8 +119,36 @@ pub fn show(
         .and_then(|i| problems.rows.get(i).cloned()))
 }
 
+/// a message on one line: its lines joined, blank ones dropped, cut short.
+pub fn one_line(message: &str) -> String {
+    let mut out = String::new();
+    for line in message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+        if out.len() > 500 {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn messages_join_onto_one_line() {
+        assert_eq!(
+            super::one_line(
+                "Try this:
+  [apply] exact h
+
+"
+            ),
+            "Try this: [apply] exact h"
+        );
+    }
+
     use super::*;
     use crate::lsp::Diag;
     use std::path::Path;
@@ -151,8 +179,8 @@ mod tests {
         problems.gather(&docs);
         assert_eq!(problems.rows.len(), 2);
         assert_eq!(
-            problems.rows[0].message, "e",
-            "first line only, errors first"
+            problems.rows[0].message, "e more",
+            "lines joined, errors first"
         );
         assert_eq!((problems.rows[0].line, problems.rows[0].column), (2, 0));
         assert_eq!(problems.rows[1].severity, Severity::Warning);

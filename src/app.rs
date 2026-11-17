@@ -4386,7 +4386,7 @@ impl App {
             .iter()
             .filter(|d| d.range.start <= at && at <= d.range.end)
             .min_by_key(|d| d.severity)
-            .map(|d| d.message.lines().next().unwrap_or_default().to_owned())
+            .map(|d| crate::problems::one_line(&d.message))
             .unwrap_or_default()
     }
 }
