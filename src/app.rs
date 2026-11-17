@@ -61,6 +61,8 @@ pub enum Id {
     ScmList,
     ScmRow(u16),
     ReplaceInFiles,
+    /// the breadcrumb over an editor.
+    Crumb(ViewId),
     ReplaceAllButton,
     DiffOpen(DocumentId),
     DiffList(DocumentId),
@@ -3576,6 +3578,7 @@ impl App {
         let status_pick: Option<Command>;
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
+        let mut crumb: Option<(editor::Crumb, ViewId)> = None;
         let menu_act;
         let mut focus = None;
         let mut ime = None;
@@ -3708,6 +3711,9 @@ impl App {
                         }
                         if let Some(at) = shown.menu {
                             editor_menu = Some((at, view));
+                        }
+                        if let Some(c) = shown.crumb {
+                            crumb = Some((c, view));
                         }
                     }
                     if let Some(v) = docs.view_mut(view) {
@@ -4008,6 +4014,19 @@ impl App {
                 None => Target::Root,
             });
             self.menu.ask(at, context_menu::explorer(on_entry));
+        }
+        if let Some((c, view)) = crumb {
+            self.last_editor = Some(view);
+            match c {
+                editor::Crumb::Symbols => self.run(Command::GotoSymbol),
+                editor::Crumb::Folder(folder) => {
+                    // quick open, narrowed to that folder
+                    self.palette.open(Kind::Files);
+                    self.palette.query = folder;
+                    self.list_files();
+                    self.ui.focus(Id::PaletteField, 0);
+                }
+            }
         }
         if let Some((at, view)) = editor_menu {
             self.menu_target = Some(Target::Editor(view));

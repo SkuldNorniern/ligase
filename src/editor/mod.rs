@@ -731,6 +731,17 @@ pub struct Shown {
     pub definition: bool,
     /// a right click: where, for the menu.
     pub menu: Option<Point>,
+    /// a part of the breadcrumb was clicked.
+    pub crumb: Option<Crumb>,
+}
+
+/// what a click on the breadcrumb asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Crumb {
+    /// the files under this folder, `/` at the end; empty for the root.
+    Folder(String),
+    /// the symbols of the file.
+    Symbols,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -912,10 +923,24 @@ const CRUMBS: f32 = 24.0;
 /// then the symbol the caret is in with its kind.
 fn crumbs(
     ui: &mut Ui<'_, Id>,
+    id: ViewId,
     path: &str,
     symbol: Option<&crate::syntax::Symbol>,
     strip: Rect,
-) -> AureaResult<()> {
+) -> AureaResult<Option<Crumb>> {
+    let mut picked = None;
+    // a part lights up under the pointer; a click on it is the ask
+    let mut hit = |ui: &mut Ui<'_, Id>, n: u16, at: Rect, ask: Crumb| {
+        let input = ui.interact(Id::Crumb(id), n, at, Sense::Click, true);
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+            ui.round(at.inset_xy(-3.0, 3.0), 4.0, ui.theme.palette.hover)?;
+        }
+        if input.clicked {
+            picked = Some(ask);
+        }
+        AureaResult::Ok(())
+    };
     let palette = ui.theme.palette;
     let font = ui.theme.font(12.0);
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -930,11 +955,23 @@ fn crumbs(
         let last = i + 1 == parts.len();
         let w = ui.text_width(part, &font);
         let room = Rect::new(x, strip.y, (end - x).max(0.0), strip.height);
+        // a folder lists its files; the file name lists its neighbours
+        let folder: String = parts[..if last { i } else { i + 1 }]
+            .iter()
+            .map(|p| format!("{p}/"))
+            .collect();
+        let n = u16::try_from(i).unwrap_or(u16::MAX - 1);
+        hit(
+            ui,
+            n,
+            Rect::new(x, strip.y, w.min(room.width), strip.height),
+            Crumb::Folder(folder),
+        )?;
         let colour = if last { palette.text } else { palette.dim };
         ui.text_clipped(part, room, &font, colour, Align::Start)?;
         x += w;
         if x >= end {
-            return Ok(());
+            return Ok(picked);
         }
         if !last {
             sep(ui, &mut x)?;
@@ -946,6 +983,13 @@ fn crumbs(
         sep(ui, &mut x)?;
         let tag = ui.text_width(symbol.kind, &font) + 8.0;
         let room = Rect::new(x, strip.y, tag, strip.height);
+        let w = tag + ui.text_width(&symbol.name, &font);
+        hit(
+            ui,
+            u16::MAX,
+            Rect::new(x, strip.y, w.min(end - x), strip.height),
+            Crumb::Symbols,
+        )?;
         ui.text(
             symbol.kind,
             room,
@@ -957,7 +1001,7 @@ fn crumbs(
         let room = Rect::new(x, strip.y, (end - x).max(0.0), strip.height);
         ui.text_clipped(&symbol.name, room, &font, palette.text, Align::Start)?;
     }
-    Ok(())
+    Ok(picked)
 }
 
 /// where problems and find hits are in the whole file, in the strip the
@@ -1103,7 +1147,7 @@ pub fn show(
                 .iter()
                 .filter(|s| s.at <= head)
                 .max_by_key(|s| s.at);
-            crumbs(ui, path, symbol, strip)?;
+            shown.crumb = crumbs(ui, id, path, symbol, strip)?;
             rest
         }
         None => rect,
