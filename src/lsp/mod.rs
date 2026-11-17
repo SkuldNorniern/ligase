@@ -126,6 +126,8 @@ pub enum Event {
     Goto(PathBuf, Point, Encoding),
     /// hover text for the caret of a view, if it is still at `at`.
     Hover(ViewId, usize, String),
+    /// what the server says about the offset the pointer rests on.
+    Peek(ViewId, usize, String),
     /// the call the caret is in, as markdown; none when it left the call.
     Signature(ViewId, Option<String>),
     /// changes to make in files, positions in `Encoding`: a rename or a
@@ -165,6 +167,8 @@ struct Synced {
 enum Pending {
     Definition,
     Hover(ViewId, usize),
+    /// a hover asked by the pointer resting at an offset.
+    Peek(ViewId, usize),
     Signature(ViewId),
     /// a rename or format for a document as of a revision, and every open
     /// document's revision then.
@@ -567,6 +571,19 @@ impl Lsp {
             .is_some_and(|t| t.iter().any(|t| t == typed))
     }
 
+    /// asks about `at` in `view`, for the card at the pointer.
+    pub fn peek(&mut self, docs: &Documents, view: ViewId, at: usize) -> bool {
+        self.ask_at(
+            docs,
+            view,
+            at,
+            "textDocument/hover",
+            Pending::Peek(view, at),
+            json!({}),
+        )
+        .is_some()
+    }
+
     pub fn hover(&mut self, docs: &Documents, view: ViewId) -> bool {
         let at = docs.view(view).map_or(0, |v| v.sel.head);
         self.ask(
@@ -596,6 +613,20 @@ impl Lsp {
         kind: Pending,
         extra: Value,
     ) -> Option<(&'static str, i64)> {
+        let at = docs.view(view)?.sel.head;
+        self.ask_at(docs, view, at, method, kind, extra)
+    }
+
+    /// like `ask`, at `at` instead of the caret.
+    fn ask_at(
+        &mut self,
+        docs: &Documents,
+        view: ViewId,
+        at: usize,
+        method: &str,
+        kind: Pending,
+        extra: Value,
+    ) -> Option<(&'static str, i64)> {
         let v = docs.view(view)?;
         let synced = self.synced.get(&v.doc)?;
         let doc = docs.doc(v.doc)?;
@@ -606,7 +637,7 @@ impl Lsp {
         let Some(Slot::Running(server, encoding)) = self.servers.get_mut(synced.language) else {
             return None;
         };
-        let at = doc.buffer.text().point(v.sel.head, *encoding).ok()?;
+        let at = doc.buffer.text().point(at, *encoding).ok()?;
         let mut params = json!({
             "textDocument": { "uri": synced.uri },
             "position": { "line": at.line, "character": at.column },
@@ -755,6 +786,10 @@ impl Lsp {
                     }
                     Some(Pending::Signature(view)) => {
                         events.push(Event::Signature(view, signature::text(&msg["result"])));
+                    }
+                    Some(Pending::Peek(view, at)) => {
+                        let text = hover_text(&msg["result"]["contents"]);
+                        events.push(Event::Peek(view, at, text));
                     }
                     Some(Pending::Hover(view, at)) => {
                         let text = hover_text(&msg["result"]["contents"]);

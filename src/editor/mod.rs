@@ -49,6 +49,8 @@ const CARET_RATE: f32 = 38.0;
 const PART_H: u16 = 2;
 const PART_CARET: u16 = 3;
 const PART_HOVER: u16 = 4;
+/// the card for what the pointer rests on.
+const PART_PEEK: u16 = 5;
 /// sticky lines take parts from here, one each.
 const PART_STICKY: u16 = 16;
 /// at most this many sticky lines.
@@ -733,6 +735,8 @@ pub struct Shown {
     pub menu: Option<Point>,
     /// a part of the breadcrumb was clicked.
     pub crumb: Option<Crumb>,
+    /// the text offset under the pointer, and where the pointer is.
+    pub pointing: Option<(usize, Point)>,
 }
 
 /// what a click on the breadcrumb asks for.
@@ -905,6 +909,8 @@ pub struct Look<'a> {
     pub idle: Duration,
     /// language server hover text, while the caret stays where it was asked.
     pub hover: Option<&'a str>,
+    /// the card for what the pointer rests on, and where it rests.
+    pub peek: Option<(&'a str, Point)>,
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
@@ -1327,6 +1333,14 @@ pub fn show(
                 }
                 hit
             };
+            // over the text, not dragging: what is under the pointer
+            if input.hovered
+                && !input.held
+                && let Some(p) = ui.pointer()
+                && p.x >= text_x
+            {
+                shown.pointing = Some((hit_test(ui, p), p));
+            }
             let mut pull = 0.0;
             // the fold arrow column: a press there folds or opens
             let arrows = Rect::new(content.x + gutter - 24.0, seen.y, 14.0, seen.height);
@@ -1886,6 +1900,14 @@ pub fn show(
             }
             // no scrolling far past the longest line in sight
             hscroll = hscroll.min((widest - area.width * 0.5).max(0.0));
+            if let Some((text, p)) = look.peek {
+                // under the pointer's line, so the word stays in sight
+                let line = Rect::new(p.x, p.y - line_h / 2.0, 1.0, line_h);
+                let alpha = ui.animate(Id::Editor(id), PART_PEEK, Channel::Custom(0), 1.0, 14.0);
+                hover::show(ui, text, line, seen, alpha, (look.dark, look.size))?;
+            } else {
+                ui.set_animated(Id::Editor(id), PART_PEEK, Channel::Custom(0), 0.0);
+            }
             if let (Some(text), Some(caret)) = (look.hover, shown.caret) {
                 let alpha = ui.animate(Id::Editor(id), PART_HOVER, Channel::Custom(0), 1.0, 14.0);
                 hover::show(ui, text, caret, seen, alpha, (look.dark, look.size))?;

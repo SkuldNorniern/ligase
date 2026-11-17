@@ -445,6 +445,10 @@ pub struct App {
     hover: Option<(ViewId, usize, String)>,
     /// the call the caret is in, while typing its arguments.
     signature: Option<(ViewId, String)>,
+    /// the word under the pointer, where the pointer is, since when.
+    pointing: Option<(ViewId, Range<usize>, aurea::render::Point, Instant)>,
+    /// the card shown for the word the pointer rests on.
+    peek: Option<Peek>,
     /// signature help to ask for once the text is synced.
     want_signature: Option<ViewId>,
     /// a whole line copied with nothing selected; pasting it goes in above.
@@ -576,6 +580,8 @@ impl App {
             lsp: Lsp::default(),
             hover: None,
             signature: None,
+            pointing: None,
+            peek: None,
             want_signature: None,
             line_clip: None,
             zoom: editor::SIZE,
@@ -3224,6 +3230,7 @@ impl App {
                 lsp::Event::Signature(view, text) => {
                     self.signature = text.map(|t| (view, t));
                 }
+                lsp::Event::Peek(view, at, text) => self.peeked(view, at, &text),
                 lsp::Event::Hover(view, at, text) => {
                     if self.docs.view(view).is_some_and(|v| v.sel.head == at) {
                         self.hover = Some((view, at, text));
@@ -3604,6 +3611,7 @@ impl App {
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let mut crumb: Option<(editor::Crumb, ViewId)> = None;
+        let mut pointer: Option<(ViewId, usize, aurea::render::Point)> = None;
         let menu_act;
         let mut focus = None;
         let mut ime = None;
@@ -3666,6 +3674,7 @@ impl App {
             let (explorer, docs, texts) = (&mut self.explorer, &mut self.docs, &self.texts);
             let shells = &mut self.shells;
             let hover = &hover_now;
+            let peek_now = &self.peek;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
@@ -3716,6 +3725,10 @@ impl App {
                             size: zoom,
                             idle,
                             hover,
+                            peek: peek_now
+                                .as_ref()
+                                .filter(|k| k.view == view && !k.text.is_empty())
+                                .map(|k| (k.text.as_str(), k.at)),
                             found,
                             current,
                         };
@@ -3740,6 +3753,9 @@ impl App {
                         }
                         if let Some(c) = shown.crumb {
                             crumb = Some((c, view));
+                        }
+                        if let Some((at, p)) = shown.pointing {
+                            pointer = Some((view, at, p));
                         }
                     }
                     if let Some(v) = docs.view_mut(view) {
@@ -4062,6 +4078,7 @@ impl App {
             });
             self.menu.ask(at, context_menu::explorer(on_entry));
         }
+        self.point_at(pointer);
         if let Some((c, view)) = crumb {
             self.last_editor = Some(view);
             match c {
@@ -4215,6 +4232,102 @@ impl App {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// the pointer is over `at` in a view, or over no text. resting on one
+    /// word a while asks what it is; leaving the word drops the card.
+    fn point_at(&mut self, pointer: Option<(ViewId, usize, aurea::render::Point)>) {
+        const REST: std::time::Duration = std::time::Duration::from_millis(450);
+        let Some((view, at, p)) = pointer else {
+            self.pointing = None;
+            self.peek = None;
+            return;
+        };
+        let word = self
+            .docs
+            .doc_of(view)
+            .map_or(at..at, |d| word_around(d.buffer.text(), at));
+        if self
+            .peek
+            .as_ref()
+            .is_some_and(|k| k.view != view || !touches(&k.word, at))
+        {
+            self.peek = None;
+        }
+        // nothing to rest on: blank space past a line end
+        if word.is_empty() && !self.diag_at(view, at) {
+            self.pointing = None;
+            return;
+        }
+        let same = self
+            .pointing
+            .as_ref()
+            .is_some_and(|(v, w, _, _)| *v == view && *w == word);
+        if !same {
+            self.pointing = Some((view, word, p, Instant::now()));
+            if let Some(canvas) = self.canvas {
+                request_canvas_redraw_at(canvas, Instant::now() + REST);
+            }
+            return;
+        }
+        let Some((_, word, p, since)) = self.pointing.clone() else {
+            return;
+        };
+        if since.elapsed() < REST || self.peek.as_ref().is_some_and(|k| k.word == word) {
+            return;
+        }
+        // asked once per rest: the card comes when the server answers, or
+        // at once with just the problem when there is no server
+        self.peek = Some(Peek {
+            view,
+            word: word.clone(),
+            at: p,
+            text: self.diag_text(view, at),
+        });
+        if !self.lsp.peek(&self.docs, view, at)
+            && self.peek.as_ref().is_some_and(|k| k.text.is_empty())
+        {
+            self.peek = None;
+        }
+    }
+
+    /// the server's answer for the pointer: under the problems, if any.
+    fn peeked(&mut self, view: ViewId, at: usize, text: &str) {
+        let Some(peek) = self
+            .peek
+            .as_mut()
+            .filter(|k| k.view == view && touches(&k.word, at))
+        else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        if !peek.text.is_empty() {
+            peek.text.push_str("\n\n---\n\n");
+        }
+        peek.text.push_str(text);
+    }
+
+    fn diag_at(&self, view: ViewId, at: usize) -> bool {
+        self.docs
+            .doc_of(view)
+            .is_some_and(|d| d.diags.iter().any(|g| touches(&g.range, at)))
+    }
+
+    /// the problems at `at`, whole, for the pointer's card.
+    fn diag_text(&self, view: ViewId, at: usize) -> String {
+        let Some(doc) = self.docs.doc_of(view) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for d in doc.diags.iter().filter(|d| touches(&d.range, at)).take(5) {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&extension::fence(&d.message));
+        }
+        out
     }
 
     /// a feed's answer came: shown when it is for where the caret still is.
@@ -4774,6 +4887,55 @@ fn status_bar(
     Ok(picked)
 }
 
+/// the card for what the pointer rests on.
+struct Peek {
+    view: ViewId,
+    /// the word it is about; leaving it drops the card.
+    word: Range<usize>,
+    at: aurea::render::Point,
+    /// markdown; problems first, then what the server said.
+    text: String,
+}
+
+/// `at` is in `range`, its end counted in.
+fn touches(range: &Range<usize>, at: usize) -> bool {
+    range.start <= at && at <= range.end
+}
+
+/// the word chars around `at`; empty when there are none.
+fn word_around(text: &resolvase::TextSnapshot, at: usize) -> Range<usize> {
+    // mid char (a server or the pointer): its start; a utf-8 char is at
+    // most four bytes
+    let Some(line) = (0..4)
+        .filter_map(|back| at.checked_sub(back))
+        .find_map(|a| text.line_of(a).ok())
+    else {
+        return at..at;
+    };
+    let Ok(span) = text.line_range(line) else {
+        return at..at;
+    };
+    let Ok(row) = text.slice(span.clone()) else {
+        return at..at;
+    };
+    let rel = at.saturating_sub(span.start).min(row.len());
+    let rel = (0..=rel)
+        .rev()
+        .find(|i| row.is_char_boundary(*i))
+        .unwrap_or(0);
+    let start = row[..rel]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| completion::is_word(*c))
+        .last()
+        .map_or(rel, |(i, _)| i);
+    let end = row[rel..]
+        .char_indices()
+        .find(|(_, c)| !completion::is_word(*c))
+        .map_or(row.len(), |(i, _)| rel + i);
+    span.start + start..span.start + end
+}
+
 fn keymap() -> Keymap<Command> {
     let mut map = Keymap::new();
     map.bind(Chord::command(KeyCode::S), Command::Save)
@@ -4875,6 +5037,23 @@ fn keymap() -> Keymap<Command> {
 mod tests {
     use super::*;
     use aurea::dialog::MessageChoice;
+
+    #[test]
+    fn the_word_under_the_pointer() {
+        let t = resolvase::TextBuffer::from_text(
+            "let x_1 = 가나 + y;
+(z)",
+        )
+        .snapshot();
+        assert_eq!(word_around(&t, 5), 4..7, "inside x_1");
+        assert_eq!(word_around(&t, 4), 4..7, "at its start");
+        assert_eq!(word_around(&t, 7), 4..7, "at its end");
+        assert!(word_around(&t, 8).is_empty() || word_around(&t, 8) == (8..8));
+        assert_eq!(word_around(&t, 11), 10..16, "korean, mid char");
+        assert_eq!(word_around(&t, 23), 23..24);
+        assert_eq!(word_around(&t, 999), 999..999, "past the end");
+        assert!(touches(&(2..4), 4) && !touches(&(2..4), 5));
+    }
 
     #[test]
     fn command_ids_are_unique() {
