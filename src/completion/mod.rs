@@ -151,6 +151,7 @@ mod tests {
             sort: sort.to_owned(),
             insert: label.to_owned(),
             caret: label.len(),
+            stops: Vec::new(),
             start: None,
         }
     }

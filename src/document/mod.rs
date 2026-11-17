@@ -151,6 +151,8 @@ pub struct View {
     pub page: usize,
     /// where to put the caret once the text is loaded.
     pub goto: Option<(Point, Encoding)>,
+    /// tab stops of the snippet just put in; tab walks them.
+    pub snippet: Option<crate::editor::snippet::Session>,
 }
 
 #[derive(Default)]
@@ -322,6 +324,7 @@ impl Documents {
                 reveal: false,
                 page: 20,
                 goto: None,
+                snippet: None,
             },
         );
         id
@@ -411,6 +414,9 @@ impl Documents {
                 *fold = map_range(set, fold.clone());
             }
             v.folded.retain(|f| !f.is_empty());
+            if let Some(snippet) = &mut v.snippet {
+                snippet.follow(set);
+            }
             v.sel.anchor = set.map(v.sel.anchor, bias);
             v.sel.head = set.map(v.sel.head, bias);
             for s in &mut v.extra {

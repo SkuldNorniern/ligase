@@ -11,6 +11,7 @@ pub mod lines;
 pub mod multi;
 pub mod pairs;
 pub mod rows;
+pub mod snippet;
 
 use std::ops::Range;
 use std::time::Duration;
@@ -97,6 +98,13 @@ pub fn act_with(docs: &mut Documents, view: ViewId, action: Action, opts: &EditO
         return false;
     };
     let text = doc.buffer.snapshot();
+    match action {
+        Action::Indent | Action::Outdent if snippet::step(v, action == Action::Outdent) => {
+            return true;
+        }
+        Action::Collapse => v.snippet = None,
+        _ => {}
+    }
     match action {
         Action::Move(motion, extend) => {
             let before = v.sel;
@@ -1145,6 +1153,10 @@ pub fn show(
     }
     let mut sel = view.sel;
     let mut extras = view.extra.clone();
+    // the snippet's stops not under a caret, outlined
+    let stops: Vec<(Range<usize>, bool)> = view.snippet.as_ref().map_or_else(Vec::new, |s| {
+        s.ranges().map(|(r, now)| (r.clone(), now)).collect()
+    });
     let mut column = view.column;
     let mut folded = view.folded.clone();
     let mut preedit = view.preedit.clone();
@@ -1529,6 +1541,20 @@ pub fn show(
                             let mark = Rect::new(body.x + x0, y + 1.0, x1 - x0, line_h - 2.0);
                             ui.round(mark, 3.0, palette.selection.fade(0.4))?;
                         }
+                    }
+                    for (stop, now) in &stops {
+                        if stop.end < span.start || stop.start > span.end || *now {
+                            continue;
+                        }
+                        let x0 = laid.x_of(ui, &font, stop.start.max(span.start));
+                        let x1 = laid.x_of(ui, &font, stop.end.min(span.end));
+                        let mark = Rect::new(
+                            body.x + x0 - 1.0,
+                            y + 1.0,
+                            (x1 - x0).max(2.0) + 2.0,
+                            line_h - 2.0,
+                        );
+                        ui.border(mark, 3.0, 1.0, palette.accent.fade(0.6))?;
                     }
                     let from = look.found.partition_point(|h| h.end <= span.start);
                     for hit in look.found[from..].iter().take_while(|h| h.start < span.end) {

@@ -1748,20 +1748,25 @@ impl App {
         if let Some((doc, _)) = self.docs.editable(popup.view) {
             doc.buffer.break_join();
         }
-        editor::apply(&mut self.docs, popup.view, change, false);
+        if editor::apply(&mut self.docs, popup.view, change, false)
+            && let Some(v) = self.docs.view_mut(popup.view)
+        {
+            editor::snippet::start(v, from, &item.stops);
+        }
         self.typed_at = Instant::now();
     }
 
     /// extension snippets for `view`'s language, as completion items.
     fn snippet_items(&self, view: ViewId) -> Vec<crate::lsp::complete::Item> {
-        use crate::lsp::complete::{Item, Kind, plain_snippet};
+        use crate::lsp::complete::{Item, Kind, parse_snippet};
         let Some(language) = self.docs.doc_of(view).and_then(|d| d.language) else {
             return Vec::new();
         };
         self.extensions
             .snippets(language)
             .map(|s| {
-                let (insert, caret) = plain_snippet(&s.body);
+                let snippet = parse_snippet(&s.body);
+                let caret = snippet.caret();
                 let detail = if s.description.is_empty() {
                     self.texts.tr("snippet").to_owned()
                 } else {
@@ -1773,8 +1778,9 @@ impl App {
                     kind: Kind::Snippet,
                     filter: s.prefix.clone(),
                     sort: s.prefix.clone(),
-                    insert,
+                    insert: snippet.text,
                     caret,
+                    stops: snippet.stops,
                     start: None,
                 }
             })
