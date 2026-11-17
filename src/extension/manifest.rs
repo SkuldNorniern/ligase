@@ -35,6 +35,7 @@ const MAX_SERVERS: usize = 5;
 const MAX_ABBREV_SETS: usize = 10;
 const MAX_ARGS: usize = 20;
 const MAX_ARG: usize = 200;
+const MAX_ROOTS: usize = 8;
 const MAX_PATH: usize = 200;
 const MAX_VIEW_ID: usize = 64;
 const MAX_TITLE: usize = 40;
@@ -138,6 +139,9 @@ pub struct Server {
     pub args: Vec<String>,
     /// the id sent with each file; the language when not given.
     pub language_id: String,
+    /// file names that mark a project's folder. the server starts in the
+    /// nearest folder above the file holding one; the workspace when none.
+    pub roots: Vec<String>,
 }
 
 impl Server {
@@ -957,7 +961,7 @@ fn parse_server(table: &Table, path: &str, report: &mut Report) -> Option<Server
     check_keys(
         table,
         path,
-        &["language", "command", "args", "language_id"],
+        &["language", "command", "args", "language_id", "roots"],
         report,
     );
     let mut ok = true;
@@ -1005,6 +1009,22 @@ fn parse_server(table: &Table, path: &str, report: &mut Report) -> Option<Server
             }
         }
     }
+    let mut roots = Vec::new();
+    if let Some(items) = list(table, path, "roots", MAX_ROOTS, report) {
+        for (i, item) in items.iter().enumerate() {
+            let at = format!("{path}.roots[{i}]");
+            let Some(name) = item_string(item, &at, report) else {
+                ok = false;
+                continue;
+            };
+            if package_path_ok(name) && !name.contains('/') {
+                roots.push(name.to_owned());
+            } else {
+                report.error(&at, "must be a file name: a-z A-Z 0-9 _ . -, no path");
+                ok = false;
+            }
+        }
+    }
     let language = language?;
     if !ok {
         return None;
@@ -1014,6 +1034,7 @@ fn parse_server(table: &Table, path: &str, report: &mut Report) -> Option<Server
         language,
         command: command?,
         args,
+        roots,
     })
 }
 
@@ -1462,6 +1483,25 @@ description = "a theorem"
         for bad in ["../lake", "C:\\\\x\\\\lake.exe", "lake serve", ""] {
             let text = format!(
                 "{PACKAGE}[permissions]\nspawn_process = true\n[[contributions.servers]]\nlanguage = \"lean4\"\ncommand = \"{bad}\"\n"
+            );
+            assert!(manifest_err(&text), "{bad}");
+        }
+        let marked = format!(
+            "{PACKAGE}[permissions]
+spawn_process = true
+{server}roots = [\"lakefile.toml\", \"lean-toolchain\"]
+"
+        );
+        assert_eq!(
+            ok(&marked).servers[0].roots,
+            ["lakefile.toml", "lean-toolchain"]
+        );
+        for bad in ["../lakefile.toml", "a/b", "", "x y"] {
+            let text = format!(
+                "{PACKAGE}[permissions]
+spawn_process = true
+{server}roots = [\"{bad}\"]
+"
             );
             assert!(manifest_err(&text), "{bad}");
         }

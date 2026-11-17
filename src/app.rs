@@ -885,12 +885,13 @@ impl App {
         true
     }
 
-    /// starts a language server on the worker, in the workspace folder.
-    fn start_server(&mut self, language: &'static str) {
+    /// starts a language server on the worker, in the project folder of
+    /// `file` when the server names its marks, else the workspace folder.
+    fn start_server(&mut self, language: &'static str, file: PathBuf) {
         let Some(spec) = self.lsp.server_for(language) else {
             return;
         };
-        let root = self.explorer.root().to_path_buf();
+        let workspace = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
         let job = move || {
             let wake = move || {
@@ -898,6 +899,7 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
+            let root = lsp::root_for(&file, &spec.roots, &workspace);
             let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
             Done::Server(
                 language,
@@ -3021,8 +3023,8 @@ impl App {
             }
         }
         self.find_again();
-        for language in self.lsp.wanted(&self.docs) {
-            self.start_server(language);
+        for (language, file) in self.lsp.wanted(&self.docs) {
+            self.start_server(language, file);
         }
         self.lsp.sync(&self.docs);
         if let Some(view) = self.lsp.take_again() {

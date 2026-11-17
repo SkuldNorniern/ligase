@@ -11,7 +11,7 @@ pub mod uri;
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use resolvase::{Encoding, Point, Revision, TextSnapshot};
@@ -38,6 +38,24 @@ pub struct ServerSpec {
     pub language_id: String,
     /// the package that declared it; none for the ones ligase knows.
     pub package: Option<String>,
+    /// file names that mark the folder to start in; see [`root_for`].
+    pub roots: Vec<String>,
+}
+
+/// most folders walked up looking for a root mark.
+const MAX_UP: usize = 64;
+
+/// the folder a server for `file` starts in: the nearest one above it that
+/// holds one of `marks`, else `workspace`. reads the disk: worker only.
+pub fn root_for(file: &Path, marks: &[String], workspace: &Path) -> PathBuf {
+    if !marks.is_empty() {
+        for dir in file.ancestors().skip(1).take(MAX_UP) {
+            if marks.iter().any(|m| dir.join(m).is_file()) {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    workspace.to_path_buf()
 }
 
 /// servers ligase knows: sylven language, program, args, lsp language id.
@@ -58,6 +76,7 @@ fn built_in(language: &str) -> Option<ServerSpec> {
             args: args.iter().map(|a| (*a).to_owned()).collect(),
             language_id: (*id).to_owned(),
             package: None,
+            roots: Vec::new(),
         })
 }
 
@@ -188,8 +207,9 @@ impl Lsp {
         self.extra = specs;
     }
 
-    /// languages that want a server and have none yet. marks them starting.
-    pub fn wanted(&mut self, docs: &Documents) -> Vec<&'static str> {
+    /// languages that want a server and have none yet, with the file that
+    /// asked. marks them starting.
+    pub fn wanted(&mut self, docs: &Documents) -> Vec<(&'static str, PathBuf)> {
         let mut out = Vec::new();
         for doc in docs.all() {
             let Some(language) = doc.language else {
@@ -200,7 +220,7 @@ impl Lsp {
             }
             if !self.servers.contains_key(language) {
                 self.servers.insert(language, Slot::Starting);
-                out.push(language);
+                out.push((language, doc.path.clone()));
             }
         }
         out
@@ -728,6 +748,24 @@ mod tests {
     use resolvase::TextBuffer;
 
     #[test]
+    fn servers_start_in_the_nearest_marked_folder() {
+        let dir = std::env::temp_dir().join(format!("ligase-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj/Sub/Deep")).unwrap();
+        std::fs::write(dir.join("proj/lakefile.toml"), "").unwrap();
+        let file = dir.join("proj/Sub/Deep/A.lean");
+        let marks = vec!["lakefile.lean".to_owned(), "lakefile.toml".to_owned()];
+        assert_eq!(
+            root_for(&file, &marks, &dir.join("proj/Sub")),
+            dir.join("proj")
+        );
+        assert_eq!(root_for(&file, &[], &dir), dir, "no marks, the workspace");
+        let none = vec!["Cargo.toml".to_owned()];
+        assert_eq!(root_for(&file, &none, &dir), dir, "no mark found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn positions_are_clamped_onto_text() {
         let text = TextBuffer::from_text("a😀b\nxy").snapshot();
         assert_eq!(offset_near(&text, Point::new(0, 1), Encoding::Utf16), 1);
@@ -795,7 +833,7 @@ mod tests {
         let view = docs.add_view(doc);
         docs.loaded(doc, crate::document::read_text(&main));
         let mut lsp = Lsp::default();
-        assert_eq!(lsp.wanted(&docs), ["rust"]);
+        assert_eq!(lsp.wanted(&docs), [("rust", main.clone())]);
         let server = Server::spawn("rust-analyzer", &[], &dir, || {}).unwrap();
         assert!(lsp.started("rust", Ok(server)).is_none());
 

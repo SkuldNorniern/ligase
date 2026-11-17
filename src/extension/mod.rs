@@ -342,6 +342,7 @@ impl Extensions {
                     command: s.command.clone(),
                     args: s.args.clone(),
                     language_id: s.language_id.clone(),
+                    roots: s.roots.clone(),
                     package: Some(m.id.clone()),
                 })
             })
