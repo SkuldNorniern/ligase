@@ -191,7 +191,7 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
         let w = ui.text_width(&label, &font) + 34.0;
         let tab = Rect::new(x, rect.y + 3.0, w, rect.height - 6.0);
         let front = i == shells.at;
-        let input = ui.interact(Id::TerminalTab(n), 0, tab, Sense::Click, false);
+        let input = ui.interact(Id::TerminalTab(n), 0, tab, Sense::Click, true);
         if front {
             ui.round(tab, 5.0, palette.raised)?;
         } else if input.hovered {
@@ -213,7 +213,7 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
         );
         let shut = shells.list.len() > 1
             && ui
-                .interact(Id::TerminalTab(n), 1, close, Sense::Click, false)
+                .interact(Id::TerminalTab(n), 1, close, Sense::Click, true)
                 .clicked;
         if shells.list.len() > 1 && (input.hovered || front) {
             ui.text("×", close, &font, palette.dim, Align::Center)?;
@@ -230,7 +230,7 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
     }
     if shells.list.len() < MAX_SHELLS {
         let add = Rect::new(x, rect.y + 3.0, 24.0, rect.height - 6.0);
-        let input = ui.interact(Id::TerminalTab(u16::MAX), 0, add, Sense::Click, false);
+        let input = ui.interact(Id::TerminalTab(u16::MAX), 0, add, Sense::Click, true);
         if input.hovered {
             ui.round(add, 5.0, palette.hover)?;
             ui.set_cursor(CursorIcon::Pointer);
