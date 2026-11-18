@@ -9,7 +9,7 @@ use aurea::ui::{Align, Button, ListView, Response, Sense, Splitter, TextField, U
 use aurea::{AureaResult, CursorIcon};
 
 use super::graph;
-use super::{Change, Status, Tracking};
+use super::{Change, RepoSummary, Status, Tracking};
 use crate::app::Id;
 use crate::icons;
 use crate::lang::Texts;
@@ -40,7 +40,6 @@ pub enum Ask {
 }
 
 /// the panel's own state.
-#[derive(Default)]
 pub struct Scm {
     pub message: String,
     /// a fetch, pull, push or switch is out; the app sets this.
@@ -57,6 +56,27 @@ pub struct Scm {
     graph_at: Option<f32>,
     /// the commit picked in the graph, in full once read.
     pub detail: Option<super::graph::Detail>,
+    /// the repositories section is open; shut, only the one worked in shows.
+    pub repos_open: bool,
+    repo_scroll: f32,
+}
+
+impl Default for Scm {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            busy: false,
+            scroll: 0.0,
+            picked: None,
+            graph_scroll: 0.0,
+            graph_picked: None,
+            filter: String::new(),
+            graph_at: None,
+            detail: None,
+            repos_open: true,
+            repo_scroll: 0.0,
+        }
+    }
 }
 
 /// lane colours, by lane, round and round.
@@ -461,83 +481,150 @@ fn sync_row(
     Ok(ask)
 }
 
-/// the repositories as pills, each with how many files changed; the one
-/// worked in lit. gives the one clicked.
-fn repo_pills(
-    ui: &mut Ui<'_, Id>,
-    repos: &[(PathBuf, usize)],
-    current: Option<&Path>,
-    rect: Rect,
-) -> AureaResult<Option<PathBuf>> {
-    let palette = ui.theme.palette;
-    let small = ui.theme.font(11.5);
-    let mut x = rect.x;
-    let mut y = rect.y;
-    let mut picked = None;
-    for (i, (path, count)) in repos.iter().enumerate() {
-        let name = path.file_name().map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let label = if *count > 0 {
-            format!("{name}  {count}")
-        } else {
-            name
-        };
-        let w = ui.text_width(&label, &small) + 18.0;
-        if x + w > rect.right() && x > rect.x {
-            x = rect.x;
-            y += 26.0;
-        }
-        let pill = Rect::new(x, y, w.min(rect.width), 22.0);
-        let part = u16::try_from(i).unwrap_or(u16::MAX);
-        let input = ui.interact(Id::ScmRepo(part), 0, pill, Sense::Click, true);
-        let lit = current.is_some_and(|c| c == path.as_path());
-        let fill = if lit {
-            palette.accent.fade(0.22)
-        } else if input.hovered {
-            palette.hover
-        } else {
-            palette.raised
-        };
-        ui.round(pill, 11.0, fill)?;
-        let ink = if lit { palette.text } else { palette.dim };
-        ui.text(&label, pill, &small, ink, Align::Center)?;
-        if input.hovered {
-            ui.set_cursor(CursorIcon::Pointer);
-        }
-        if input.clicked {
-            picked = Some(path.clone());
-        }
-        x += w + 6.0;
-    }
-    Ok(picked)
+/// most repository rows shown before the section scrolls.
+const REPO_SHOWN: usize = 6;
+const REPO_ROW: f32 = 24.0;
+/// the section's header and its list, as ids past any repository's row.
+const REPO_HEAD: u16 = u16::MAX - 1;
+const REPO_LIST: u16 = u16::MAX;
+
+/// how tall the repositories section takes with `count` repositories.
+fn repo_section_height(scm: &Scm, count: usize) -> f32 {
+    let rows = if scm.repos_open {
+        count.min(REPO_SHOWN)
+    } else {
+        1
+    };
+    ROW + rows as f32 * REPO_ROW
 }
 
-/// how tall the pills take for `repos` at `width`.
-fn pills_height(ui: &mut Ui<'_, Id>, repos: &[(PathBuf, usize)], width: f32) -> f32 {
-    let small = ui.theme.font(11.5);
-    let mut x = 0.0;
-    let mut rows = 1.0;
-    for (path, count) in repos {
-        let name = path
-            .file_name()
-            .map_or(0.0, |n| ui.text_width(&n.to_string_lossy(), &small));
-        let w = name + if *count > 0 { 30.0 } else { 0.0 } + 18.0;
-        if x + w > width && x > 0.0 {
-            x = 0.0;
-            rows += 1.0;
-        }
-        x += w + 6.0;
+/// one repository: its icon, folder name, branch dim after it, then on the
+/// right the ahead and behind counts and the changes badge.
+fn repo_row(
+    ui: &mut Ui<'_, Id>,
+    rect: Rect,
+    repo: &RepoSummary,
+    lit: bool,
+    hovered: bool,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(13.0);
+    let small = ui.theme.font(12.0);
+    let back = rect.inset_xy(2.0, 1.0);
+    if lit {
+        ui.round(back, 6.0, palette.selection)?;
+    } else if hovered {
+        ui.round(back, 6.0, palette.hover)?;
     }
-    rows * 26.0
+    let inner = rect.inset_xy(8.0, 0.0);
+    let (icon_at, rest) = inner.split_left(16.0, 6.0);
+    let icon_box = Rect::new(icon_at.x, rect.y + (REPO_ROW - 16.0) / 2.0, 16.0, 16.0);
+    icons::draw(ui, "source-control", icon_box, palette.dim)?;
+    // the right side first, the name takes what is left
+    let mut right = rest.right();
+    if repo.changes > 0 {
+        let text = repo.changes.to_string();
+        let w = (ui.text_width(&text, &small) + 12.0).max(20.0);
+        let at = Rect::new(right - w, rect.y + 4.0, w, rect.height - 8.0);
+        ui.round(at, at.height / 2.0, palette.accent.fade(0.22))?;
+        ui.text(&text, at, &small, palette.accent, Align::Center)?;
+        right = at.x - 6.0;
+    }
+    let mut sync = Vec::new();
+    if repo.ahead > 0 {
+        sync.push(format!("↑{}", repo.ahead));
+    }
+    if repo.behind > 0 {
+        sync.push(format!("↓{}", repo.behind));
+    }
+    if !sync.is_empty() {
+        let text = sync.join(" ");
+        let w = ui.text_width(&text, &small);
+        let at = Rect::new(right - w, rect.y, w, rect.height);
+        ui.text(&text, at, &small, palette.dim, Align::End)?;
+        right = at.x - 8.0;
+    }
+    let name_room = Rect::new(rest.x, rect.y, (right - rest.x).max(0.0), rect.height);
+    let name = repo.path.file_name().map_or_else(
+        || repo.path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let name_w = ui.text_width(&name, &font).min(name_room.width);
+    let (name_at, after) = name_room.split_left(name_w, 8.0);
+    ui.text_clipped(&name, name_at, &font, palette.text, Align::Start)?;
+    if !repo.branch.is_empty() {
+        ui.text_clipped(&repo.branch, after, &small, palette.dim, Align::Start)?;
+    }
+    Ok(())
+}
+
+/// the repositories section: a header that folds it, then a row a repo, the
+/// one worked in (`shown`) lit. folded, only that one row. gives the repo
+/// picked to work in.
+fn repo_section(
+    ui: &mut Ui<'_, Id>,
+    scm: &mut Scm,
+    repos: &[RepoSummary],
+    shown: usize,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let small = ui.theme.font(12.0);
+    let (head, body) = rect.split_top(ROW, 0.0);
+    let hit = ui.interact(Id::ScmRepo(REPO_HEAD), 0, head, Sense::Click, true);
+    if hit.hovered {
+        ui.round(head.inset_xy(2.0, 1.0), 6.0, palette.hover)?;
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    let label = format!("{}  {}", texts.tr("Repositories"), repos.len());
+    let label_at = Rect::new(head.x + 4.0, head.y, (head.width - 24.0).max(0.0), ROW);
+    ui.text_clipped(&label, label_at, &small, palette.dim, Align::Start)?;
+    let chevron = if scm.repos_open {
+        "chevron-down"
+    } else {
+        "chevron-right"
+    };
+    let chevron_at = Rect::new(head.right() - 16.0, head.y + (ROW - 12.0) / 2.0, 12.0, 12.0);
+    icons::draw(ui, chevron, chevron_at, palette.dim)?;
+    if hit.clicked {
+        scm.repos_open = !scm.repos_open;
+    }
+    if !scm.repos_open {
+        // folded: the one worked in, and a click opens the rest
+        let row = Rect::new(body.x, body.y, body.width, REPO_ROW);
+        let on = ui.interact(Id::ScmRepo(shown as u16), 0, row, Sense::Click, true);
+        if on.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        repo_row(ui, row, &repos[shown], true, on.hovered)?;
+        if on.clicked {
+            scm.repos_open = true;
+        }
+        return Ok(None);
+    }
+    let response = ListView::new(&mut scm.repo_scroll, repos.len(), REPO_ROW).show(
+        ui,
+        Id::ScmRepo(REPO_LIST),
+        body,
+        |ui, row| {
+            let Some(repo) = repos.get(row.index) else {
+                return Ok(());
+            };
+            repo_row(ui, row.rect, repo, row.index == shown, row.hovered)
+        },
+    )?;
+    Ok(response
+        .row_clicked
+        .and_then(|i| repos.get(i))
+        .map(|repo| Ask::Repo(repo.path.clone())))
 }
 
 pub fn show(
     ui: &mut Ui<'_, Id>,
     scm: &mut Scm,
     status: Option<&Status>,
-    repos: &[(PathBuf, usize)],
+    repos: &[RepoSummary],
     rect: Rect,
     texts: &Texts,
 ) -> AureaResult<Option<Ask>> {
@@ -545,13 +632,20 @@ pub fn show(
     let font = ui.theme.font(13.0);
     let small = ui.theme.font(12.0);
     let mut inner = rect.inset(PAD);
-    // several repositories: pills to switch between them on top
+    // several repositories: a section to switch between them on top
     if repos.len() > 1 {
-        let h = pills_height(ui, repos, inner.width);
-        let (pills, rest) = inner.split_top(h, 6.0);
-        if let Some(path) = repo_pills(ui, repos, status.map(|s| s.top.as_path()), pills)? {
-            return Ok(Some(Ask::Repo(path)));
+        let shown = status
+            .and_then(|s| repos.iter().position(|r| r.path == s.top))
+            .unwrap_or(0);
+        let h = repo_section_height(scm, repos.len());
+        let (section, rest) = inner.split_top(h, 6.0);
+        if let Some(ask) = repo_section(ui, scm, repos, shown, section, texts)? {
+            return Ok(Some(ask));
         }
+        ui.fill(
+            Rect::new(section.x, section.y + h + 2.0, section.width, 1.0),
+            palette.border,
+        )?;
         inner = rest;
     }
     let Some(status) = status else {

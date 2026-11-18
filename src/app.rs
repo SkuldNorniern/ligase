@@ -62,7 +62,7 @@ pub enum Id {
     ScmRow(u16),
     /// the commit graph in source control.
     ScmGraph,
-    /// a repository's pill in source control.
+    /// a repository row in source control.
     ScmRepo(u16),
     /// the branch pill and the sync buttons in source control.
     ScmBranch,
@@ -470,8 +470,8 @@ enum Done {
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
     Branch(Option<String>),
     Recent(Vec<PathBuf>),
-    /// the picked repository's state, and every repository's change count.
-    Changes(Option<crate::git::Status>, Vec<(PathBuf, usize)>),
+    /// the picked repository's state, and every repository's summary.
+    Changes(Option<crate::git::Status>, Vec<crate::git::RepoSummary>),
     Diff(DocumentId, Revision, Vec<crate::git::DiffLine>),
     /// stage, unstage or commit came back; a commit says so.
     GitDid(Result<bool, String>),
@@ -627,8 +627,8 @@ pub struct App {
     /// the repository's changed files, for the source control panel; none
     /// outside a repository.
     changes: Option<crate::git::Status>,
-    /// every repository in the workspace and how many files changed in it.
-    repos: Vec<(PathBuf, usize)>,
+    /// every repository in the workspace, with its branch and change count.
+    repos: Vec<crate::git::RepoSummary>,
     /// the repository picked to work in; none for the first one.
     repo_pick: Option<PathBuf>,
     /// git was asked for `changes` and answered, at least once.
@@ -3039,20 +3039,31 @@ impl App {
         let graph = self.shows(Panel::Git);
         let pick = self.repo_pick.clone();
         self.changes_asked = self.jobs.run(move || {
+            // past this many, only the picked one reads its branch
+            const TRACKED: usize = 12;
             let tops = crate::git::repos(&root);
-            let mut counts = Vec::with_capacity(tops.len());
+            let many = tops.len() > TRACKED;
+            let mut repos = Vec::with_capacity(tops.len());
             let mut status = None;
-            for top in &tops {
+            let mut shown = None;
+            for (i, top) in tops.iter().enumerate() {
                 let s = crate::git::status(top);
-                counts.push((top.clone(), s.as_ref().map_or(0, |s| s.changes.len())));
+                let changes = s.as_ref().map_or(0, |s| s.changes.len());
                 let wanted = pick.as_ref().map_or(status.is_none(), |p| p == top);
                 if wanted {
                     status = s;
+                    shown = Some(i);
                 }
+                repos.push(crate::git::RepoSummary {
+                    path: top.clone(),
+                    changes,
+                    ..Default::default()
+                });
             }
             // the picked one went away: the first one
-            if status.is_none() {
-                status = tops.first().and_then(|t| crate::git::status(t));
+            if let Some(t) = tops.first().filter(|_| status.is_none()) {
+                status = crate::git::status(t);
+                shown = Some(0);
             }
             if let Some(s) = &mut status {
                 s.tracking = crate::git::tracking(&s.top);
@@ -3061,7 +3072,21 @@ impl App {
                     s.rows = crate::git::graph::layout(&s.history);
                 }
             }
-            Done::Changes(status, counts)
+            for (i, repo) in repos.iter_mut().enumerate() {
+                let tracking = if Some(i) == shown {
+                    status.as_ref().and_then(|s| s.tracking.clone())
+                } else if many {
+                    None
+                } else {
+                    crate::git::tracking(&repo.path)
+                };
+                if let Some(t) = tracking {
+                    repo.branch = t.branch;
+                    repo.ahead = t.ahead;
+                    repo.behind = t.behind;
+                }
+            }
+            Done::Changes(status, repos)
         });
     }
 
@@ -4913,7 +4938,7 @@ impl App {
         let Some(top) = self
             .repos
             .iter()
-            .map(|(p, _)| p)
+            .map(|r| &r.path)
             .filter(|p| doc.path.starts_with(p))
             .max_by_key(|p| p.components().count())
             .cloned()
@@ -5259,7 +5284,7 @@ impl App {
         let changes = if self.repos.is_empty() {
             self.changes.as_ref().map_or(0, |s| s.changes.len())
         } else {
-            self.repos.iter().map(|(_, n)| n).sum()
+            self.repos.iter().map(|r| r.changes).sum()
         };
         let problems: usize = self.docs.all().map(|d| d.diags.len()).sum();
         let mut top = vec![

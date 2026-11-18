@@ -192,6 +192,18 @@ pub struct Status {
     pub tracking: Option<Tracking>,
 }
 
+/// one repository in the workspace, as the panel lists it. branch and counts
+/// are empty for the ones not read (see the app's status refresh).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepoSummary {
+    pub path: PathBuf,
+    /// changed files in it.
+    pub changes: usize,
+    pub branch: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
 /// most repositories found under a workspace.
 pub const MAX_REPOS: usize = 32;
 /// how deep below the workspace repositories are looked for.
