@@ -12,13 +12,16 @@ use crate::app::Id;
 use crate::document::ViewId;
 use crate::markdown;
 
+mod table;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Markdown,
+    Table,
 }
 
 /// which languages have a preview, and of what kind.
-const KINDS: &[(&str, Kind)] = &[("markdown", Kind::Markdown)];
+const KINDS: &[(&str, Kind)] = &[("markdown", Kind::Markdown), ("csv", Kind::Table)];
 
 /// the preview kind for files in `language`; none when there is none.
 pub fn kind_for(language: Option<&str>) -> Option<Kind> {
@@ -38,17 +41,20 @@ pub enum Ask {
 /// a kind's parse of the text, made on the worker.
 pub enum Parsed {
     Markdown(Vec<(usize, markdown::parse::Block)>),
+    Table(table::Table),
 }
 
 /// parses `text` for `kind`. runs on the worker.
 pub fn parse(kind: Kind, text: &str) -> Parsed {
     match kind {
         Kind::Markdown => Parsed::Markdown(markdown::parse::parse(text)),
+        Kind::Table => Parsed::Table(table::parse(text)),
     }
 }
 
 enum Page {
     Markdown(markdown::read::Reader),
+    Table(table::TableState),
 }
 
 /// one view's preview.
@@ -70,6 +76,11 @@ impl Preview {
                 reader.reveal_line = line;
                 Page::Markdown(reader)
             }
+            Kind::Table => {
+                let mut table = table::TableState::default();
+                table.reveal_line = line;
+                Page::Table(table)
+            }
         };
         Self {
             kind,
@@ -84,6 +95,9 @@ impl Preview {
         self.made_from = Some(revision);
         match (&mut self.page, parsed) {
             (Page::Markdown(reader), Parsed::Markdown(blocks)) => reader.set(blocks),
+            (Page::Table(table), Parsed::Table(parsed)) => table.set(parsed),
+            // a parse is always of the kind the page was made for
+            _ => {}
         }
     }
 
@@ -91,6 +105,7 @@ impl Preview {
     pub fn top_line(&self) -> Option<usize> {
         match &self.page {
             Page::Markdown(reader) => reader.top_line(),
+            Page::Table(table) => table.top_line(),
         }
     }
 
@@ -103,6 +118,7 @@ impl Preview {
     ) -> AureaResult<Option<Ask>> {
         match &mut self.page {
             Page::Markdown(reader) => markdown::read::show(ui, view, reader, rect),
+            Page::Table(table) => table::show(ui, view, table, rect),
         }
     }
 }
@@ -117,6 +133,7 @@ mod tests {
     #[test]
     fn kinds_by_language() {
         assert_eq!(kind_for(Some("markdown")), Some(Kind::Markdown));
+        assert_eq!(kind_for(Some("csv")), Some(Kind::Table));
         assert_eq!(kind_for(Some("rust")), None);
         assert_eq!(kind_for(None), None);
     }

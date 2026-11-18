@@ -55,6 +55,7 @@ const LANGUAGES: &[(&str, &[&str])] = &[
     ("html", &["html", "htm", "xhtml", "vue", "svelte"]),
     ("xml", &["xml", "svg", "xaml", "csproj", "plist", "xsd"]),
     ("sql", &["sql"]),
+    ("csv", &["csv", "tsv"]),
     (
         "ini",
         &[
