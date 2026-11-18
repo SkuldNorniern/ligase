@@ -17,6 +17,7 @@ mod lsp;
 mod markdown;
 mod palette;
 mod problems;
+mod remote;
 mod search;
 mod settings;
 mod syntax;
