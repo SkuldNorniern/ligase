@@ -78,7 +78,7 @@ pub fn show(
     let small = ui.theme.font(12.0);
     let inner = rect.inset(PAD);
     if problems.rows.is_empty() {
-        let hint = texts.tr("no problems in the open files");
+        let hint = texts.tr("No problems");
         ui.text(hint, inner, &small, palette.dim, Align::Center)?;
         return Ok(None);
     }

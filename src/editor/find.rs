@@ -179,7 +179,7 @@ pub fn show(
         let (field, hint, done, max) = if mode == Mode::Goto {
             (
                 &mut bar.goto,
-                texts.tr("line, or line:column"),
+                texts.tr("Go to line or line:column"),
                 Ask::Goto,
                 32,
             )

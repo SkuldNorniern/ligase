@@ -278,7 +278,7 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("terminal.new", "New Terminal", Command::NewTerminal),
     (
         "terminal.newRemote",
-        "New Remote Shell (ssh)",
+        "New Remote Terminal (SSH)",
         Command::NewRemoteShell,
     ),
     ("markdown.read", "Toggle Preview", Command::TogglePreview),
@@ -1056,7 +1056,10 @@ impl App {
                 let spawned = std::env::current_exe()
                     .and_then(|exe| std::process::Command::new(exe).arg(NEW_WINDOW).spawn());
                 if let Err(e) = spawned {
-                    self.say(format!("{}: {e}", self.texts.tr("can't open a new window")));
+                    self.say(format!(
+                        "{}: {e}",
+                        self.texts.tr("Couldn't open a new window")
+                    ));
                 }
                 return;
             }
@@ -1166,9 +1169,9 @@ impl App {
                 if let Some(doc) = doc
                     && self.lsp.reopen(doc)
                 {
-                    self.say(self.texts.tr("checking the file again").to_owned());
+                    self.say(self.texts.tr("Rechecking file").to_owned());
                 } else {
-                    self.say(self.texts.tr("no language server for this file").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1187,10 +1190,10 @@ impl App {
                         }
                         self.say(format!(
                             "{} {language}",
-                            self.texts.tr("restarting the server for")
+                            self.texts.tr("Restarting language server:")
                         ));
                     }
-                    None => self.say(self.texts.tr("no language server for this file").to_owned()),
+                    None => self.say(self.texts.tr("No language server").to_owned()),
                 }
                 return;
             }
@@ -1202,7 +1205,7 @@ impl App {
             }
             Command::OpenSettingsFile => {
                 let Some(path) = settings::path() else {
-                    self.say(self.texts.tr("no config folder for settings").to_owned());
+                    self.say(self.texts.tr("No settings folder").to_owned());
                     return;
                 };
                 self.jobs
@@ -1278,7 +1281,7 @@ impl App {
                 if let Some(view) = focus.or(self.last_editor)
                     && !self.lsp.actions(&self.docs, view)
                 {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1286,7 +1289,7 @@ impl App {
                 if let Some(view) = focus
                     && !self.lsp.definition(&self.docs, view)
                 {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1317,7 +1320,7 @@ impl App {
                 if let Some(view) = focus.or(self.last_editor)
                     && !self.lsp.format(&self.docs, view, self.settings.tab_size)
                 {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1325,7 +1328,7 @@ impl App {
                 if let Some(view) = focus.or(self.last_editor)
                     && !self.lsp.references(&self.docs, view)
                 {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1333,7 +1336,7 @@ impl App {
                 if let Some(view) = focus
                     && !self.lsp.hover(&self.docs, view)
                 {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
                 return;
             }
@@ -1377,7 +1380,7 @@ impl App {
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::NewRemoteShell => {
                 self.prompt_for = Some(PromptFor::RemoteShell);
-                let hint = self.texts.tr("user@host, as ssh takes it").to_owned();
+                let hint = self.texts.tr("user@host").to_owned();
                 self.palette.prompt(hint, String::new());
                 self.ui.focus(Id::PaletteField, 0);
                 return;
@@ -1399,7 +1402,7 @@ impl App {
                     return;
                 };
                 let Some(kind) = crate::preview::kind_for(doc.language) else {
-                    self.say(self.texts.tr("this file has no preview").to_owned());
+                    self.say(self.texts.tr("No preview for this file").to_owned());
                     return;
                 };
                 let line = self
@@ -1412,11 +1415,7 @@ impl App {
             }
             Command::NewTerminal => {
                 if self.shells.add().is_none() {
-                    self.say(
-                        self.texts
-                            .tr("that is all the shells there can be")
-                            .to_owned(),
-                    );
+                    self.say(self.texts.tr("Shell limit reached").to_owned());
                 }
                 if !self.shows(Panel::Terminal) {
                     self.bench.toggle(Panel::Terminal);
@@ -1494,7 +1493,7 @@ impl App {
                     .is_some_and(|d| d.buffer.revision() != *r)
             });
         if moved {
-            self.say(self.texts.tr("the text changed, try again").to_owned());
+            self.say(self.texts.tr("Text changed, try again").to_owned());
             return;
         }
         let mut open = Vec::new();
@@ -1509,7 +1508,7 @@ impl App {
         if closed.len() > MAX_OPENED_BY_EDIT {
             self.say(format!(
                 "{} ({})",
-                self.texts.tr("too many files to change here"),
+                self.texts.tr("Too many files to change"),
                 open.len() + closed.len()
             ));
             return;
@@ -1527,7 +1526,7 @@ impl App {
                         .unwrap_or_default();
                     self.say(format!(
                         "{} {name}",
-                        self.texts.tr("the server's edits don't fit")
+                        self.texts.tr("Server edits don't apply")
                     ));
                     return;
                 }
@@ -1705,9 +1704,9 @@ impl App {
             }
             Act::NewFile | Act::NewFolder => {
                 let hint = if act == Act::NewFile {
-                    self.texts.tr("new file's name")
+                    self.texts.tr("File name")
                 } else {
-                    self.texts.tr("new folder's name")
+                    self.texts.tr("Folder name")
                 };
                 self.prompt_for = Some(if act == Act::NewFile {
                     PromptFor::NewFile(folder)
@@ -1800,15 +1799,11 @@ impl App {
         if let PromptFor::RemoteShell = prompt {
             let host = answer.trim();
             if !terminal::host_ok(host) {
-                self.say(self.texts.tr("that host name won't do").to_owned());
+                self.say(self.texts.tr("Invalid host name").to_owned());
                 return;
             }
             if self.shells.add_remote(host).is_none() {
-                self.say(
-                    self.texts
-                        .tr("that is all the shells there can be")
-                        .to_owned(),
-                );
+                self.say(self.texts.tr("Shell limit reached").to_owned());
                 return;
             }
             if !self.shows(Panel::Terminal) {
@@ -1818,7 +1813,7 @@ impl App {
             return;
         }
         let Some(name) = explorer::plain_name(answer) else {
-            self.say(self.texts.tr("that name won't do").to_owned());
+            self.say(self.texts.tr("Invalid name").to_owned());
             return;
         };
         let name = name.to_owned();
@@ -2133,7 +2128,7 @@ impl App {
             }
             Dialog::ConfirmTrust => {
                 let (id, lines) = self.trust_asked.clone().unwrap_or_default();
-                let title = self.texts.tr("Allow programs").to_owned();
+                let title = self.texts.tr("Allow Programs").to_owned();
                 let shown: Vec<String> = lines.iter().map(|l| l.join(" ")).collect();
                 let text = format!(
                     "{id}\n\n{}\n\n{}",
@@ -2147,7 +2142,7 @@ impl App {
                 let title = self.texts.tr("Discard changes").to_owned();
                 let text = format!(
                     "{}\n\n{}",
-                    self.texts.tr("the edits in these files are lost for good:"),
+                    self.texts.tr("Unsaved edits in these files will be lost:"),
                     self.discard_rels.join("\n")
                 );
                 DialogStart::Confirm(title, text)
@@ -2174,7 +2169,7 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
-                let mut text = format!("{}\n\n{name}", self.texts.tr("delete this for good?"));
+                let mut text = format!("{}\n\n{name}", self.texts.tr("Delete permanently?"));
                 if !dirty.is_empty() {
                     text.push_str(&format!(
                         "\n\n{} {}",
@@ -2193,7 +2188,7 @@ impl App {
                 let title = self.texts.tr("Unsaved changes").to_owned();
                 let text = format!(
                     "{}\n\n{}",
-                    self.texts.tr("save the changes before closing?"),
+                    self.texts.tr("Save changes before closing?"),
                     list.join("\n")
                 );
                 DialogStart::Message(title, text)
@@ -2390,7 +2385,7 @@ impl App {
                     offered.revision,
                     offered.seen,
                 ) {
-                    self.say(self.texts.tr("the server is gone").to_owned());
+                    self.say(self.texts.tr("Language server stopped").to_owned());
                 }
             }
             Kind::Symbols => {
@@ -2566,11 +2561,7 @@ impl App {
                     return;
                 }
                 if hits.len() >= find::MAX_HITS {
-                    self.say(
-                        self.texts
-                            .tr("too many matches to replace at once")
-                            .to_owned(),
-                    );
+                    self.say(self.texts.tr("Too many matches to replace").to_owned());
                     return;
                 }
                 let count = hits.len();
@@ -2588,7 +2579,7 @@ impl App {
                     return;
                 }
                 if !self.lsp.rename(&self.docs, view, &name) {
-                    self.say(self.texts.tr("no language server for this yet").to_owned());
+                    self.say(self.texts.tr("No language server").to_owned());
                 }
             }
             find::Ask::Goto => {
@@ -2802,7 +2793,7 @@ impl App {
                     .all_with_ids()
                     .any(|(id, d)| id != doc && d.path == path);
                 if taken {
-                    self.say(self.texts.tr("that file is open in another tab").to_owned());
+                    self.say(self.texts.tr("File is open in another tab").to_owned());
                     return;
                 }
                 self.docs.set_path(doc, &path);
@@ -2879,7 +2870,7 @@ impl App {
         if !self.jobs.run(job) {
             self.say(format!(
                 "{}: the file worker is not running",
-                self.texts.tr("can't save")
+                self.texts.tr("Save failed")
             ));
         }
     }
@@ -2944,7 +2935,7 @@ impl App {
         if paths.len() > MAX_OPENED_BY_EDIT {
             self.say(format!(
                 "{} ({})",
-                self.texts.tr("too many files to change here"),
+                self.texts.tr("Too many files to change"),
                 paths.len()
             ));
             return;
@@ -3090,7 +3081,7 @@ impl App {
             Ask::Commit => {
                 let message = self.scm.message.trim().to_owned();
                 if message.is_empty() {
-                    self.say(self.texts.tr("write a commit message first").to_owned());
+                    self.say(self.texts.tr("Commit message is empty").to_owned());
                     return;
                 }
                 self.jobs
@@ -3139,7 +3130,7 @@ impl App {
             if now.is_none() {
                 // gone: keep the text, a save puts the file back
                 self.docs.mark_conflict(id);
-                self.say(format!("{name}: {}", self.texts.tr("deleted on disk")));
+                self.say(format!("{name}: {}", self.texts.tr("Deleted on disk")));
                 continue;
             }
             if self.docs.changed_on_disk(id) {
@@ -3153,8 +3144,7 @@ impl App {
             } else {
                 self.say(format!(
                     "{name}: {}",
-                    self.texts
-                        .tr("changed on disk, save again to write over it")
+                    self.texts.tr("Changed on disk. Save again to overwrite")
                 ));
             }
         }
@@ -3280,7 +3270,7 @@ impl App {
             match event {
                 lsp::Event::Actions(doc, revision, seen, language, list, encoding) => {
                     if list.is_empty() {
-                        self.say(self.texts.tr("no fixes here").to_owned());
+                        self.say(self.texts.tr("No quick fixes").to_owned());
                         continue;
                     }
                     let items = list
@@ -3411,7 +3401,7 @@ impl App {
                                 self.commit_server_edits(view, ranges);
                             }
                             None => {
-                                self.say(self.texts.tr("the server's edits don't fit").to_owned());
+                                self.say(self.texts.tr("Server edits don't apply").to_owned());
                             }
                         }
                     }
@@ -3440,8 +3430,7 @@ impl App {
                     self.docs.arm_overwrite(doc, now);
                     self.say(format!(
                         "{name}: {}",
-                        self.texts
-                            .tr("changed on disk, save again to write over it")
+                        self.texts.tr("Changed on disk. Save again to overwrite")
                     ));
                 }
                 Done::Session(text) => {
@@ -3454,7 +3443,7 @@ impl App {
                     Ok(disk) => {
                         self.docs.saved(doc, point);
                         self.docs.set_disk(doc, disk);
-                        self.say(format!("{} {name}", self.texts.tr("saved")));
+                        self.say(format!("{} {name}", self.texts.tr("Saved")));
                         self.settings_saved(doc);
                         // save as or a first save may have put it in a repository
                         self.ask_git_base(doc);
@@ -3462,7 +3451,7 @@ impl App {
                         self.after_save(doc, true);
                     }
                     Err(why) => {
-                        self.say(format!("{} {name}: {why}", self.texts.tr("can't save")));
+                        self.say(format!("{} {name}: {why}", self.texts.tr("Save failed")));
                         self.after_save(doc, false);
                     }
                 },
@@ -3500,7 +3489,7 @@ impl App {
                     match result {
                         Ok(true) => {
                             self.scm.message.clear();
-                            self.say(self.texts.tr("committed").to_owned());
+                            self.say(self.texts.tr("Committed").to_owned());
                             // HEAD moved: every file's marks start over
                             self.refresh_git();
                         }
@@ -3534,7 +3523,7 @@ impl App {
                         },
                         Err(why) => self.say(format!(
                             "{}: {why}",
-                            self.texts.tr("can't save the settings")
+                            self.texts.tr("Couldn't save settings")
                         )),
                     }
                     self.write_settings();
@@ -3547,7 +3536,7 @@ impl App {
                 Done::SettingsFile(Err(why)) => {
                     self.say(format!(
                         "{}: {why}",
-                        self.texts.tr("can't open the settings")
+                        self.texts.tr("Couldn't open settings")
                     ));
                 }
                 Done::Server(language, result) => {
@@ -3557,7 +3546,7 @@ impl App {
                 }
                 Done::Saved(result) => {
                     if let Err(why) = result {
-                        self.say(format!("{}: {why}", self.texts.tr("can't save the layout")));
+                        self.say(format!("{}: {why}", self.texts.tr("Couldn't save layout")));
                     }
                     if self.closing {
                         self.close_now = true;
@@ -4059,7 +4048,7 @@ impl App {
                 match command_by_id(&id) {
                     // a view can't open more views or itself in a loop
                     Some(command) => self.run(command),
-                    None => self.say(format!("{}: {id}", self.texts.tr("no such command"))),
+                    None => self.say(format!("{}: {id}", self.texts.tr("Unknown command"))),
                 }
             }
             // events go to the view's owner; declarative views have none yet
@@ -4110,7 +4099,7 @@ impl App {
         if let Some(view) = definition
             && !self.lsp.definition(&self.docs, view)
         {
-            self.say(self.texts.tr("no language server for this yet").to_owned());
+            self.say(self.texts.tr("No language server").to_owned());
         }
         self.shell_focus = shell_focus;
         match found {
@@ -4451,7 +4440,7 @@ impl App {
         let url = url.trim();
         if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
             if aurea::files::open_url(url).is_err() {
-                self.say(format!("{} {url}", self.texts.tr("can't open")));
+                self.say(format!("{} {url}", self.texts.tr("Open failed")));
             }
             return;
         }
@@ -4594,7 +4583,7 @@ impl App {
         if broken > 0 {
             self.say(format!(
                 "{} {broken}",
-                self.texts.tr("extensions that could not load:")
+                self.texts.tr("Failed to load extensions:")
             ));
         }
     }
@@ -4644,7 +4633,7 @@ impl App {
         }
         let Some(path) = settings::path() else {
             self.settings_writes.clear();
-            self.say(self.texts.tr("no config folder for settings").to_owned());
+            self.say(self.texts.tr("No settings folder").to_owned());
             return;
         };
         let edits = std::mem::take(&mut self.settings_writes);
@@ -4820,7 +4809,7 @@ impl App {
         let (language, restart) = match doc.language {
             Some(language) => match self.lsp.state(language) {
                 Some(lsp::ServerState::Missing) => (
-                    format!("{language} ({})", self.texts.tr("no language server")),
+                    format!("{language} ({})", self.texts.tr("No language server")),
                     Some(Command::RestartServer),
                 ),
                 Some(lsp::ServerState::Starting) => (format!("{language} …"), None),
@@ -4943,7 +4932,7 @@ fn welcome(
     )?;
     y += 44.0;
     let note = Rect::new(x + 10.0, y, width, 20.0);
-    let line = texts.tr("open a file from the explorer");
+    let line = texts.tr("Open a file from Explorer");
     ui.text(line, note, &font, palette.dim, Align::Start)?;
     y += 28.0;
     let mut picked = None;

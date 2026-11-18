@@ -192,7 +192,7 @@ pub fn show(
     let small = ui.theme.font(12.0);
     let inner = rect.inset(PAD);
     let Some(status) = status else {
-        let hint = texts.tr("not a git repository");
+        let hint = texts.tr("Not a Git repository");
         ui.text(hint, inner, &small, palette.dim, Align::Center)?;
         return Ok(None);
     };

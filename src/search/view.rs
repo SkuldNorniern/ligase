@@ -38,7 +38,7 @@ pub fn show(
 
     let mut ask = None;
     let typed = TextField::new(&mut finder.query)
-        .placeholder(texts.tr("find in files"))
+        .placeholder(texts.tr("Search in files"))
         .max_chars(500)
         .show(ui, Id::SearchField, field)?;
     if typed.submitted {
@@ -60,7 +60,7 @@ pub fn show(
     }
 
     let status = if finder.searching() {
-        format!("{} ({})", texts.tr("searching"), finder.hits.len())
+        format!("{} ({})", texts.tr("Searching…"), finder.hits.len())
     } else if let Some((files, capped)) = finder.done {
         let mut line = format!(
             "{} {} / {} {}",
@@ -70,7 +70,7 @@ pub fn show(
             texts.tr("files")
         );
         if capped {
-            line.push_str(&format!(" ({})", texts.tr("stopped at the limit")));
+            line.push_str(&format!(" ({})", texts.tr("Limit reached")));
         }
         line
     } else {

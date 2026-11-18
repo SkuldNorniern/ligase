@@ -101,11 +101,11 @@ pub fn show(
     let inner = card.inset(PAD);
     let (field, list) = inner.split_top(FIELD, PAD);
     let hint = match palette.kind {
-        Some(Kind::Commands) => texts.tr("type a command"),
-        Some(Kind::Symbols) => texts.tr("a name in this file"),
-        Some(Kind::Actions) => texts.tr("a fix or change"),
+        Some(Kind::Commands) => texts.tr("Search commands"),
+        Some(Kind::Symbols) => texts.tr("Search symbols"),
+        Some(Kind::Actions) => texts.tr("Quick fixes"),
         Some(Kind::Prompt) => palette.hint.as_str(),
-        _ => texts.tr("file name, > for commands, : for a line"),
+        _ => texts.tr("Search files by name (> commands, : line)"),
     };
     let typed = TextField::new(&mut palette.query)
         .placeholder(hint)
@@ -122,7 +122,7 @@ pub fn show(
         if palette.listing && palette.wanted().0 == Kind::Files {
             let note = Rect::new(field.x, field.y + FIELD, field.width, ROW);
             ui.text(
-                texts.tr("listing files"),
+                texts.tr("Loading files"),
                 note,
                 &small,
                 colours.dim,

@@ -149,7 +149,7 @@ pub fn show(
     }
     if ext.packages.is_empty() {
         let hint = texts
-            .tr("no extensions yet: put a folder with an extension.toml in the extensions folder");
+            .tr("No extensions installed. Add a folder with an extension.toml to the extensions folder.");
         let at = Rect::new(list.x, list.y + 8.0, list.width, 40.0);
         ui.text_clipped(hint, at, &small, palette.dim, Align::Start)?;
         return Ok(ask);
@@ -247,9 +247,9 @@ pub fn show(
                     let at = Rect::new(rest.x, line_y + 4.0, rest.width.min(220.0), CONTROL);
                     let on = allowed.get(i).copied().unwrap_or(false);
                     let label = if on {
-                        texts.tr("Allowed: take it back")
+                        texts.tr("Revoke")
                     } else {
-                        texts.tr("Allow it to start these")
+                        texts.tr("Allow Programs")
                     };
                     let part = u16::try_from(i + 2).unwrap_or(u16::MAX);
                     let button = Button::new(label);

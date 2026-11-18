@@ -57,7 +57,7 @@ pub fn show(
     }
     let Some(rows) = rows else {
         // a file git doesn't have never gets rows
-        let note = if tracked { "loading" } else { "not in git" };
+        let note = if tracked { "loading" } else { "Untracked" };
         ui.text(texts.tr(note), list, &small, palette.dim, Align::Center)?;
         return Ok(ask);
     };

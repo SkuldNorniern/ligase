@@ -1195,7 +1195,7 @@ pub fn show(
             return Ok(shown);
         }
         Load::Failed(why) => {
-            let line = format!("{}: {why}", texts.tr("can't open"));
+            let line = format!("{}: {why}", texts.tr("Open failed"));
             ui.text(&line, rect, &font, palette.danger, Align::Center)?;
             return Ok(shown);
         }

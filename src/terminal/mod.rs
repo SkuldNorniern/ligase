@@ -520,11 +520,11 @@ pub fn show(
             let focused = ui
                 .interact(Id::Terminal, 1, rect, Sense::Click, true)
                 .focused;
-            hint(ui, texts.tr("starting the shell"))?;
+            hint(ui, texts.tr("Starting shell…"))?;
             return Ok(focused);
         }
         State::Failed(why) => {
-            hint(ui, &format!("{}: {why}", texts.tr("can't start the shell")))?;
+            hint(ui, &format!("{}: {why}", texts.tr("Shell failed to start")))?;
             return Ok(false);
         }
         State::Running | State::Ended => {}
@@ -583,7 +583,7 @@ pub fn show(
                 let row = Rect::new(x0, y, content.width, line_h);
                 let small = ui.theme.font(12.0);
                 ui.text(
-                    texts.tr("the shell ended, press enter for a new one"),
+                    texts.tr("Shell exited. Press Enter to start a new one."),
                     row,
                     &small,
                     palette.dim,

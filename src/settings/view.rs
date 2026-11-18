@@ -174,7 +174,7 @@ pub fn show(
     if typed.changed {
         sheet.scroll = 0.0;
     }
-    if Button::new(texts.tr("Open settings file"))
+    if Button::new(texts.tr("Open Settings File"))
         .quiet()
         .show(ui, Id::SettingsFile, file)?
         .clicked
@@ -228,7 +228,7 @@ pub fn show(
     if rows.is_empty() {
         let small = ui.theme.font(13.0);
         ui.text(
-            texts.tr("no setting matches"),
+            texts.tr("No matching settings"),
             list,
             &small,
             colours.dim,
@@ -293,7 +293,7 @@ fn row(
             ui.set_cursor(CursorIcon::Pointer);
             ui.tooltip_at(
                 Point::new(hit.x, hit.bottom()),
-                texts.tr("put the default back"),
+                texts.tr("Reset to default"),
             );
         }
         if input.clicked {
