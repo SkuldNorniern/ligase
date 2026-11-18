@@ -50,9 +50,22 @@ pub struct Explorer {
     rows: Vec<usize>,
     pub scroll: f32,
     pub selected: Option<usize>,
+    /// letters typed to jump to a row, and when the last one came.
+    pub typed: (String, Option<std::time::Instant>),
 }
 
 impl Explorer {
+    /// the first row from `from` on (round the end) whose name starts with
+    /// `prefix`, any case.
+    pub fn find_from(&self, from: usize, prefix: &str) -> Option<usize> {
+        let n = self.len();
+        let prefix = prefix.to_lowercase();
+        (0..n).map(|k| (from + k) % n).find(|&i| {
+            self.row(i)
+                .is_some_and(|r| r.name.to_lowercase().starts_with(&prefix))
+        })
+    }
+
     /// a tree with the root folder open and waiting for its scan.
     pub fn new(root: &Path) -> Self {
         let name = root.file_name().map_or_else(
@@ -72,6 +85,7 @@ impl Explorer {
             rows: Vec::new(),
             scroll: 0.0,
             selected: None,
+            typed: (String::new(), None),
         };
         explorer.rebuild();
         explorer
@@ -331,6 +345,25 @@ mod tests {
         (0..explorer.len())
             .map(|i| explorer.row(i).unwrap().name.to_owned())
             .collect()
+    }
+
+    #[test]
+    fn typed_letters_find_rows_round_the_end() {
+        let root = Path::new("proj");
+        let mut explorer = Explorer::new(root);
+        explorer.listed(
+            root,
+            vec![
+                ("src".into(), true),
+                ("Cargo.toml".into(), false),
+                ("cargo.lock".into(), false),
+            ],
+        );
+        assert_eq!(explorer.find_from(0, "c"), Some(2));
+        assert_eq!(explorer.find_from(3, "c"), Some(3));
+        assert_eq!(explorer.find_from(4, "c"), Some(2), "round the end");
+        assert_eq!(explorer.find_from(0, "CARGO.L"), Some(3), "any case");
+        assert_eq!(explorer.find_from(0, "zz"), None);
     }
 
     #[test]

@@ -20,6 +20,51 @@ pub struct Shown {
     pub menu: Option<(Point, Option<usize>)>,
 }
 
+/// the char a letter or digit key types, for jumping by name.
+fn letter(key: KeyCode) -> Option<char> {
+    use KeyCode::*;
+    let c = match key {
+        A => 'a',
+        B => 'b',
+        C => 'c',
+        D => 'd',
+        E => 'e',
+        F => 'f',
+        G => 'g',
+        H => 'h',
+        I => 'i',
+        J => 'j',
+        K => 'k',
+        L => 'l',
+        M => 'm',
+        N => 'n',
+        O => 'o',
+        P => 'p',
+        Q => 'q',
+        R => 'r',
+        S => 's',
+        T => 't',
+        U => 'u',
+        V => 'v',
+        W => 'w',
+        X => 'x',
+        Y => 'y',
+        Z => 'z',
+        Key0 => '0',
+        Key1 => '1',
+        Key2 => '2',
+        Key3 => '3',
+        Key4 => '4',
+        Key5 => '5',
+        Key6 => '6',
+        Key7 => '7',
+        Key8 => '8',
+        Key9 => '9',
+        _ => return None,
+    };
+    Some(c)
+}
+
 /// draws the tree. a click on a row comes back for the app to act on.
 /// `active` is the file in the editor with the keyboard; its row is marked.
 pub fn show(
@@ -83,7 +128,52 @@ pub fn show(
                 | KeyCode::End
         )
     });
-    let acted = (selected != before && !keyed) || response.activated;
+    // letters jump to the next row starting with what was typed; a pause
+    // starts over
+    let letters: String = ui
+        .keys()
+        .filter(|(_, m)| !m.ctrl && !m.alt && !m.meta)
+        .filter_map(|(key, _)| letter(key))
+        .collect();
+    let mut jumped = false;
+    if !letters.is_empty() {
+        let now = std::time::Instant::now();
+        let fresh = explorer
+            .typed
+            .1
+            .is_none_or(|t| now.duration_since(t) > std::time::Duration::from_millis(900));
+        if fresh {
+            explorer.typed.0.clear();
+        }
+        explorer.typed.0.push_str(&letters);
+        explorer.typed.1 = Some(now);
+        // the same letter again steps on to the next match
+        let one = explorer
+            .typed
+            .0
+            .chars()
+            .all(|c| explorer.typed.0.starts_with(c));
+        let prefix = if one {
+            explorer.typed.0.chars().take(1).collect::<String>()
+        } else {
+            explorer.typed.0.clone()
+        };
+        let from = match explorer.selected {
+            Some(i) if one || fresh => i + 1,
+            Some(i) => i,
+            None => 0,
+        };
+        if let Some(i) = explorer.find_from(from, &prefix) {
+            explorer.selected = Some(i);
+            // into sight
+            let top = i as f32 * ROW;
+            if top < explorer.scroll || top + ROW > explorer.scroll + rect.height {
+                explorer.scroll = (top - rect.height / 3.0).max(0.0);
+            }
+            jumped = true;
+        }
+    }
+    let acted = (selected != before && !keyed && !jumped) || response.activated;
     let menu = ui
         .secondary_at(Id::Explorer, 1)
         .or_else(|| ui.secondary_at(Id::Explorer, 0))
