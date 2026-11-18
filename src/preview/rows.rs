@@ -1,7 +1,7 @@
 //! big csv and tsv files read in place: an index of where each row starts,
 //! made in one pass, then only the rows in sight read from disk.
 
-#![allow(dead_code)] // used by the big table preview, next
+#![allow(dead_code)] // `split` is only used by the tests
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};

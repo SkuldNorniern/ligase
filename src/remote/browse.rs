@@ -283,7 +283,8 @@ mod tests {
         };
         let s = p.to_string_lossy();
         assert!(
-            p.components().all(|c| !matches!(c, std::path::Component::ParentDir)),
+            p.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir)),
             "{s}"
         );
         assert!(s.ends_with("pass_wd"), "{s}");

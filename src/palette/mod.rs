@@ -167,7 +167,11 @@ impl Palette {
         } else if query.is_empty() {
             // commands used lately first, then the rest in their order
             let recent: Vec<usize> = if kind == Kind::Commands {
-                self.recent.iter().copied().filter(|&i| i < items.len()).collect()
+                self.recent
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < items.len())
+                    .collect()
             } else {
                 Vec::new()
             };

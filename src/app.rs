@@ -442,6 +442,8 @@ enum Done {
     ),
     /// a previewed view's text, parsed for its kind.
     Preview(ViewId, Revision, crate::preview::Parsed),
+    /// rows of a big table's file, read on the worker for its window.
+    PreviewRows(ViewId, Range<usize>, Result<Vec<Vec<String>>, String>),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
@@ -1461,7 +1463,7 @@ impl App {
                     .view(view)
                     .and_then(|v| doc.buffer.text().line_of(v.sel.head).ok());
                 self.previews
-                    .insert(view, crate::preview::Preview::new(kind, line));
+                    .insert(view, crate::preview::Preview::new(kind, line, &self.texts));
                 return;
             }
             Command::NewTerminal => {
@@ -3436,6 +3438,21 @@ impl App {
                 }
                 Done::Loaded(doc, result, disk) => {
                     self.docs.loaded(doc, result);
+                    // a csv too big to load opens as its table, read from the file
+                    let too_big = self
+                        .docs
+                        .doc(doc)
+                        .filter(|d| {
+                            matches!(&d.load, document::Load::Failed(why) if why.starts_with("file is over"))
+                        })
+                        .and_then(|d| crate::preview::kind_for(d.language).map(|k| (k, d.path.clone())));
+                    if let Some((kind, path)) = too_big
+                        && let Some(view) = self.view_of_path(&path)
+                        && !self.previews.contains_key(&view)
+                    {
+                        self.previews
+                            .insert(view, crate::preview::Preview::new(kind, None, &self.texts));
+                    }
                     self.docs.set_disk(doc, disk);
                     self.ask_git_base(doc);
                     self.replace_waiting(doc);
@@ -3562,10 +3579,23 @@ impl App {
                     });
                 }
                 Done::Preview(view, revision, parsed) => {
+                    // an index reads the file, not the text: its revision does not matter
+                    let indexed = matches!(
+                        parsed,
+                        crate::preview::Parsed::Indexed(_) | crate::preview::Parsed::Failed(_)
+                    );
                     if let Some(preview) = self.previews.get_mut(&view)
-                        && preview.asked == Some(revision)
+                        && (preview.asked == Some(revision) || indexed)
                     {
                         preview.set(revision, parsed);
+                    }
+                }
+                Done::PreviewRows(view, range, result) => {
+                    if let Some(preview) = self.previews.get_mut(&view) {
+                        match result {
+                            Ok(rows) => preview.got_rows(range, rows),
+                            Err(why) => preview.rows_failed(why),
+                        }
                     }
                 }
                 Done::Shell(id, result) => {
@@ -4685,27 +4715,76 @@ impl App {
     }
 
     /// pages whose text moved on are parsed again on the worker; pages of
-    /// closed views go.
+    /// closed views go. a big table is indexed once, and its rows are read
+    /// from the file a window at a time, one read out per page.
     fn ask_pages(&mut self) {
         let docs = &self.docs;
         self.previews.retain(|v, _| docs.view(*v).is_some());
         let mut jobs = Vec::new();
+        let mut indexes = Vec::new();
+        let mut reads = Vec::new();
         for (&view, reader) in &mut self.previews {
             let Some(doc) = self.docs.doc_of(view) else {
                 continue;
             };
             let revision = doc.buffer.revision();
-            if reader.made_from == Some(revision) || reader.asked == Some(revision) {
-                continue;
+            let failed = matches!(doc.load, document::Load::Failed(_));
+            let big = crate::preview::big(reader.kind, failed, doc.buffer.len());
+            if !reader.is_big() && big {
+                let (progress, stop) = reader.start_big();
+                indexes.push((view, revision, doc.path.clone(), progress, stop));
+            } else if !reader.is_big()
+                && reader.made_from != Some(revision)
+                && reader.asked != Some(revision)
+            {
+                reader.asked = Some(revision);
+                jobs.push((view, revision, reader.kind, doc.buffer.snapshot()));
             }
-            reader.asked = Some(revision);
-            jobs.push((view, revision, reader.kind, doc.buffer.snapshot()));
+            if let Some(source) = reader.rows_source()
+                && let Some(range) = reader.wants_rows()
+            {
+                reads.push((view, range, source));
+            }
         }
         for (view, revision, kind, snap) in jobs {
             self.jobs.run(move || {
                 let text = snap.slice(0..snap.len()).unwrap_or_default();
                 Done::Preview(view, revision, crate::preview::parse(kind, &text))
             });
+        }
+        for (view, revision, path, progress, stop) in indexes {
+            let canvas = self.canvas;
+            let job = move || {
+                let wake = move || {
+                    if let Some(id) = canvas {
+                        request_canvas_redraw(id);
+                    }
+                };
+                let parsed = crate::preview::index(&path, &progress, &stop, wake);
+                // a preview closed meanwhile takes no news of its index
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Done::Note(None);
+                }
+                Done::Preview(view, revision, parsed)
+            };
+            if !self.jobs.run(job)
+                && let Some(preview) = self.previews.get_mut(&view)
+            {
+                let why = "the file worker is not running".to_owned();
+                preview.set(revision, crate::preview::Parsed::Failed(why));
+            }
+        }
+        for (view, range, (index, slot)) in reads {
+            let job_range = range.clone();
+            let job = move || {
+                let rows = crate::preview::read_rows(&index, &slot, job_range.clone());
+                Done::PreviewRows(view, job_range, rows)
+            };
+            if !self.jobs.run(job)
+                && let Some(preview) = self.previews.get_mut(&view)
+            {
+                preview.rows_failed("the file worker is not running".to_owned());
+            }
         }
     }
 

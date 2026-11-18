@@ -1,5 +1,11 @@
 //! csv and tsv as a table to read: a sticky header, zebra rows, columns
 //! sized by their text, numbers on the right. only the rows in sight are drawn.
+//! a big file is read through its index instead, a few rows at a time.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aurea::render::{Font, FontWeight, Rect};
 use aurea::ui::{Align, ScrollArea, Sense, Ui};
@@ -7,10 +13,12 @@ use aurea::{AureaResult, CursorIcon};
 
 use crate::app::Id;
 use crate::document::ViewId;
-use crate::preview::Ask;
+use crate::lang::Texts;
+use crate::preview::{Ask, ReaderSlot, rows};
 
-/// input past this many bytes is not read; the table ends where it is cut.
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// input past this many bytes is not read in memory; a bigger file is read
+/// through its index.
+pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 /// records kept, the header included.
 const MAX_ROWS: usize = 10_000;
 const MAX_COLS: usize = 256;
@@ -22,6 +30,12 @@ const HEAD_H: f32 = 28.0;
 const ROW_H: f32 = 24.0;
 /// the strip above the table, with the way back to the text.
 const BAR_H: f32 = 34.0;
+/// the strip under a big table, with its row count.
+const FOOT_H: f32 = 24.0;
+/// rows of a big table kept in memory at most, around the rows in sight.
+const MAX_CACHE: usize = 5000;
+/// screens read past each side of the rows in sight.
+const SCREENS: usize = 2;
 /// text inset in a cell, each side.
 const PAD: f32 = 10.0;
 const MIN_COL: f32 = 60.0;
@@ -160,6 +174,24 @@ impl Records {
     }
 }
 
+/// the words a table draws, in the language of the app.
+#[derive(Clone, Debug, Default)]
+pub struct Labels {
+    pub edit: String,
+    pub indexing: String,
+    pub rows: String,
+}
+
+impl Labels {
+    pub fn new(texts: &Texts) -> Self {
+        Self {
+            edit: texts.tr("Edit").to_owned(),
+            indexing: texts.tr("Indexing…").to_owned(),
+            rows: texts.tr("rows").to_owned(),
+        }
+    }
+}
+
 /// one view's table and how it is scrolled.
 #[derive(Default)]
 pub struct TableState {
@@ -171,6 +203,7 @@ pub struct TableState {
     laid: Option<Laid>,
     /// a source line to bring into sight at the next draw.
     pub reveal_line: Option<usize>,
+    pub labels: Labels,
 }
 
 /// the columns at draw time.
@@ -196,6 +229,119 @@ impl TableState {
         self.rows
             .get(i.min(self.rows.len() - 1))
             .map(|(line, _)| *line)
+    }
+}
+
+/// a big table: the file read through its index. only the rows near the
+/// view are kept, and a row not read yet draws as a bar.
+pub struct BigState {
+    labels: Labels,
+    /// bytes indexed so far, written by the index job.
+    progress: Arc<AtomicU64>,
+    index: Option<Arc<rows::Index>>,
+    /// the reader, opened by the first read on the worker.
+    slot: ReaderSlot,
+    /// data rows: the index rows less the header.
+    count: usize,
+    /// index row to its cells. row 0 is the header.
+    cache: HashMap<usize, Vec<String>>,
+    /// a read is out.
+    busy: bool,
+    /// why the table can't be read; shown in place of the rows.
+    error: Option<String>,
+    pub scroll: f32,
+    hscroll: f32,
+    laid: Option<Laid>,
+    /// data rows in sight at the last draw.
+    seen_rows: Range<usize>,
+}
+
+/// the index rows to keep read for the data rows `seen` out of `count`: the
+/// rows in sight plus `screens` screens of each side. index row 0 is the
+/// header, so data row k is index row k + 1.
+pub fn window(seen: Range<usize>, count: usize, screens: usize) -> Range<usize> {
+    if seen.is_empty() {
+        return 0..0;
+    }
+    let span = seen.len().saturating_mul(screens);
+    let lo = seen.start.saturating_sub(span).min(count);
+    let hi = seen.end.saturating_add(span).min(count);
+    (lo + 1)..(hi + 1)
+}
+
+impl BigState {
+    pub fn new(labels: Labels, progress: Arc<AtomicU64>) -> Self {
+        Self {
+            labels,
+            progress,
+            index: None,
+            slot: ReaderSlot::default(),
+            count: 0,
+            cache: HashMap::new(),
+            busy: false,
+            error: None,
+            scroll: 0.0,
+            hscroll: 0.0,
+            laid: None,
+            seen_rows: 0..0,
+        }
+    }
+
+    /// the index is in; the rows are read from the file from now on.
+    pub fn set_index(&mut self, index: Arc<rows::Index>) {
+        self.count = index.rows().saturating_sub(1);
+        self.index = Some(index);
+        self.slot = ReaderSlot::default();
+        self.cache.clear();
+        self.busy = false;
+        self.laid = None;
+    }
+
+    /// the table can't be read.
+    pub fn fail(&mut self, why: String) {
+        self.busy = false;
+        self.error = Some(why);
+    }
+
+    /// the index and the reader slot, for a read on the worker.
+    pub fn source(&self) -> Option<(Arc<rows::Index>, ReaderSlot)> {
+        let index = self.index.as_ref()?;
+        Some((Arc::clone(index), Arc::clone(&self.slot)))
+    }
+
+    /// the index rows to read next: the header first, then the rows near
+    /// the view that are not kept yet. none while a read is out.
+    pub fn want(&mut self) -> Option<Range<usize>> {
+        let index = self.index.as_ref()?;
+        if self.busy || self.error.is_some() || index.rows() == 0 {
+            return None;
+        }
+        if !self.cache.contains_key(&0) {
+            self.busy = true;
+            return Some(0..1);
+        }
+        let near = window(self.seen_rows.clone(), self.count, SCREENS);
+        let lo = near.clone().find(|i| !self.cache.contains_key(i))?;
+        let hi = near.rev().find(|i| !self.cache.contains_key(i))?;
+        self.busy = true;
+        Some(lo..hi + 1)
+    }
+
+    /// rows read for `range`, index rows from its start.
+    pub fn got(&mut self, range: Range<usize>, rows: Vec<Vec<String>>) {
+        self.busy = false;
+        if range.start <= SAMPLE {
+            // the column widths come from the first rows
+            self.laid = None;
+        }
+        for (i, cells) in range.zip(rows) {
+            self.cache.insert(i, cells);
+        }
+        if self.cache.len() > MAX_CACHE {
+            let mid = self.seen_rows.start + self.seen_rows.len() / 2 + 1;
+            let half = MAX_CACHE / 2;
+            self.cache.retain(|&i, _| i == 0 || i.abs_diff(mid) <= half);
+        }
     }
 }
 
@@ -230,17 +376,30 @@ fn numeric(text: &str) -> bool {
     t.bytes().any(|b| b.is_ascii_digit()) && t.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
-fn lay(ui: &mut Ui<'_, Id>, fonts: &Fonts, head: &[String], rows: &[(usize, Vec<String>)]) -> Laid {
-    let cols = std::iter::once(head.len())
-        .chain(rows.iter().map(|(_, r)| r.len()))
+/// columns of the header and `rows`, at most MAX_COLS.
+fn columns<'a>(head: &[String], rows: impl Iterator<Item = &'a [String]>) -> usize {
+    std::iter::once(head.len())
+        .chain(rows.map(|r| r.len()))
         .max()
         .unwrap_or(0)
-        .min(MAX_COLS);
+        .min(MAX_COLS)
+}
+
+/// column widths from the text of the header and the first `SAMPLE` of `rows`,
+/// and the gutter for `count` row numbers.
+fn lay<'a>(
+    ui: &mut Ui<'_, Id>,
+    fonts: &Fonts,
+    head: &[String],
+    cols: usize,
+    rows: impl Iterator<Item = &'a [String]>,
+    count: usize,
+) -> Laid {
     let mut want = vec![0.0_f32; cols];
     for (c, cell) in head.iter().enumerate().take(cols) {
         want[c] = want[c].max(ui.text_width(&flat(cell), &fonts.bold));
     }
-    for (_, row) in rows.iter().take(SAMPLE) {
+    for row in rows.take(SAMPLE) {
         for (c, cell) in row.iter().enumerate().take(cols) {
             want[c] = want[c].max(ui.text_width(&flat(cell), &fonts.prose));
         }
@@ -249,7 +408,7 @@ fn lay(ui: &mut Ui<'_, Id>, fonts: &Fonts, head: &[String], rows: &[(usize, Vec<
         .iter()
         .map(|w| (w + 2.0 * PAD).clamp(MIN_COL, MAX_COL))
         .collect();
-    let digits = rows.len().max(1).to_string().len();
+    let digits = count.max(1).to_string().len();
     let gutter = ui.text_width(&"9".repeat(digits), &fonts.mono) + 20.0;
     Laid { widths, gutter }
 }
@@ -270,11 +429,22 @@ pub fn show(
         hscroll,
         laid,
         reveal_line,
+        labels,
     } = state;
     let head = &head[..];
     let rows = &rows[..];
     let fonts = Fonts::new(ui);
-    let laid = laid.get_or_insert_with(|| lay(ui, &fonts, head, rows));
+    let laid = laid.get_or_insert_with(|| {
+        let cols = columns(head, rows.iter().map(|(_, r)| r.as_slice()));
+        lay(
+            ui,
+            &fonts,
+            head,
+            cols,
+            rows.iter().map(|(_, r)| r.as_slice()),
+            rows.len(),
+        )
+    });
     if let Some(line) = reveal_line.take() {
         let i = rows.partition_point(|(l, _)| *l <= line).saturating_sub(1);
         *scroll = i as f32 * ROW_H;
@@ -291,16 +461,119 @@ pub fn show(
     ScrollArea::new(scroll, height)
         .sideways(hscroll, width)
         .show(ui, Id::Reader(view), body, |ui, content, seen| {
-            draw(ui, &fonts, laid, head, rows, content, seen)
+            draw(
+                ui,
+                &fonts,
+                laid,
+                head,
+                |i| rows.get(i).map(|(_, r)| r.as_slice()),
+                rows.len(),
+                content,
+                seen,
+            )
+            .map(|_| ())
         })?;
-    // the way back to the text, in the strip above the table
+    bar(ui, view, rect, &labels.edit)
+}
+
+/// draws a big table in `rect`. gives what a click asked for.
+pub fn show_big(
+    ui: &mut Ui<'_, Id>,
+    view: ViewId,
+    state: &mut BigState,
+    rect: Rect,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    ui.fill(rect, palette.background)?;
+    let fonts = Fonts::new(ui);
+    let BigState {
+        labels,
+        progress,
+        index,
+        count,
+        cache,
+        error,
+        scroll,
+        hscroll,
+        laid,
+        seen_rows,
+        ..
+    } = state;
+    let cache: &HashMap<usize, Vec<String>> = cache;
+    let count = *count;
+    let body = Rect::new(
+        rect.x,
+        rect.y + BAR_H,
+        rect.width,
+        (rect.height - BAR_H - FOOT_H).max(0.0),
+    );
+    let font = ui.theme.font(CELL);
+    let notice = match (error.as_ref(), index.is_some()) {
+        (Some(why), _) => Some((why.clone(), palette.danger)),
+        (None, false) => {
+            let mb = progress.load(Ordering::Relaxed) >> 20;
+            Some((format!("{} {mb} MB", labels.indexing), palette.dim))
+        }
+        (None, true) => None,
+    };
+    if let Some((text, color)) = notice {
+        ui.text(&text, body, &font, color, Align::Center)?;
+    } else {
+        let sample = move || {
+            (1..=SAMPLE)
+                .filter_map(|i| cache.get(&i))
+                .map(Vec::as_slice)
+        };
+        if laid.is_none()
+            && let Some(head) = cache.get(&0)
+        {
+            let cols = columns(head, sample());
+            *laid = Some(lay(ui, &fonts, head, cols, sample(), count));
+        }
+        if let (Some(laid), Some(head)) = (laid.as_ref(), cache.get(&0)) {
+            let width = laid.gutter + laid.widths.iter().sum::<f32>() + PAD;
+            let height = HEAD_H + count as f32 * ROW_H + PAD;
+            let (_, shown) = ScrollArea::new(scroll, height)
+                .sideways(hscroll, width)
+                .show(ui, Id::Reader(view), body, |ui, content, seen| {
+                    draw(
+                        ui,
+                        &fonts,
+                        laid,
+                        head,
+                        |k| cache.get(&(k + 1)).map(Vec::as_slice),
+                        count,
+                        content,
+                        seen,
+                    )
+                })?;
+            *seen_rows = shown;
+        }
+    }
+    let foot = Rect::new(rect.x, rect.bottom() - FOOT_H, rect.width, FOOT_H);
+    ui.fill(Rect::new(rect.x, foot.y, rect.width, 1.0), palette.border)?;
+    if index.is_some() {
+        let status = format!("{} {}", grouped(count as u64), labels.rows);
+        let at = Rect::new(
+            foot.x + PAD,
+            foot.y,
+            (foot.width - 2.0 * PAD).max(0.0),
+            FOOT_H,
+        );
+        ui.text(&status, at, &font, palette.dim, Align::Start)?;
+    }
+    bar(ui, view, rect, &labels.edit)
+}
+
+/// the strip above a table: the way back to the text, as an Edit chip.
+fn bar(ui: &mut Ui<'_, Id>, view: ViewId, rect: Rect, edit: &str) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
     ui.fill(
         Rect::new(rect.x, rect.y + BAR_H - 1.0, rect.width, 1.0),
         palette.border,
     )?;
     let font = ui.theme.font(11.5);
-    let label = "Edit";
-    let w = ui.text_width(label, &font) + 22.0;
+    let w = ui.text_width(edit, &font) + 22.0;
     let at = Rect::new(rect.x + rect.width - w - 22.0, rect.y + 5.0, w, 24.0);
     let input = ui.interact(Id::Reader(view), 1, at, Sense::Click, true);
     let fill = if input.hovered {
@@ -309,30 +582,34 @@ pub fn show(
         palette.raised
     };
     ui.round(at, 12.0, fill)?;
-    ui.text(label, at, &font, palette.dim, Align::Center)?;
+    ui.text(edit, at, &font, palette.dim, Align::Center)?;
     if input.hovered {
         ui.set_cursor(CursorIcon::Pointer);
     }
     Ok(input.clicked.then_some(Ask::Edit))
 }
 
-/// the rows in sight, the sticky header, then the row numbers over the left edge.
-fn draw(
+/// the rows in sight, the sticky header, then the row numbers over the left
+/// edge. `row` gives data row `i` when it is read; a bar stands in for one
+/// that is not. gives the data rows drawn.
+#[allow(clippy::too_many_arguments)]
+fn draw<'a>(
     ui: &mut Ui<'_, Id>,
     fonts: &Fonts,
     laid: &Laid,
     head: &[String],
-    rows: &[(usize, Vec<String>)],
+    row: impl Fn(usize) -> Option<&'a [String]>,
+    count: usize,
     content: Rect,
     seen: Rect,
-) -> AureaResult<()> {
+) -> AureaResult<Range<usize>> {
     let palette = ui.theme.palette;
     let x0 = content.x + laid.gutter;
     let top = content.y + HEAD_H;
     let first = ((seen.y - top) / ROW_H).floor().max(0.0) as usize;
-    let last = (((seen.bottom() - top) / ROW_H).ceil().max(0.0) as usize).min(rows.len());
+    let last = (((seen.bottom() - top) / ROW_H).ceil().max(0.0) as usize).min(count);
     let first = first.min(last);
-    for (i, (_, cells)) in rows.iter().enumerate().take(last).skip(first) {
+    for i in first..last {
         let y = top + i as f32 * ROW_H;
         if i % 2 == 1 {
             ui.fill(
@@ -340,7 +617,10 @@ fn draw(
                 palette.raised.fade(0.4),
             )?;
         }
-        cells_row(ui, fonts, laid, cells, (x0, y, ROW_H), seen, false)?;
+        match row(i) {
+            Some(cells) => cells_row(ui, fonts, laid, cells, (x0, y, ROW_H), seen, false)?,
+            None => placeholder(ui, laid, (x0, y), seen)?,
+        }
     }
     ui.fill(
         Rect::new(seen.x, seen.y, seen.width, HEAD_H),
@@ -365,6 +645,30 @@ fn draw(
         let num = (i + 1).to_string();
         let at = Rect::new(seen.x, y, laid.gutter - 8.0, ROW_H);
         ui.text(&num, at, &fonts.mono, palette.dim, Align::End)?;
+    }
+    Ok(first..last)
+}
+
+/// a row not read yet: a faint bar in each column.
+fn placeholder(
+    ui: &mut Ui<'_, Id>,
+    laid: &Laid,
+    (x0, y): (f32, f32),
+    seen: Rect,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let mut x = x0;
+    for w in &laid.widths {
+        let cx = x;
+        x += *w;
+        if cx + w < seen.x || cx > seen.right() {
+            continue;
+        }
+        let bar_w = ((w - 2.0 * PAD) * 0.5).max(0.0);
+        ui.fill(
+            Rect::new(cx + PAD, y + (ROW_H - 8.0) / 2.0, bar_w, 8.0),
+            palette.dim.fade(0.2),
+        )?;
     }
     Ok(())
 }
@@ -412,9 +716,29 @@ fn cells_row(
     Ok(())
 }
 
+/// `n` with a comma every three digits, so big counts read at a glance.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_read_in_groups() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_800_000), "1,800,000");
+    }
 
     fn rows(t: &Table) -> Vec<Vec<&str>> {
         t.rows
@@ -546,5 +870,71 @@ mod tests {
         assert_eq!(state.top_line(), Some(3));
         state.scroll = 99.0 * ROW_H;
         assert_eq!(state.top_line(), Some(3), "clamped to the last row");
+    }
+
+    #[test]
+    fn window_is_the_sight_plus_margin_in_index_rows() {
+        assert_eq!(window(10..20, 100, 2), 1..41);
+        assert_eq!(window(0..5, 100, 2), 1..16, "clipped at the top");
+        assert_eq!(window(95..100, 100, 2), 86..101, "clipped at the end");
+        assert_eq!(window(0..0, 100, 2), 0..0, "nothing in sight");
+        assert_eq!(window(3..4, 0, 2), 1..1, "no data rows");
+    }
+
+    /// a csv file of `n` data rows under a header, removed on drop.
+    struct Csv(std::path::PathBuf);
+
+    impl Drop for Csv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn csv(name: &str, n: usize) -> Csv {
+        let path =
+            std::env::temp_dir().join(format!("ligase_table_{}_{name}.csv", std::process::id()));
+        let mut text = String::from("name,qty\n");
+        for i in 0..n {
+            text.push_str(&format!("row {i},{i}\n"));
+        }
+        std::fs::write(&path, text).unwrap();
+        Csv(path)
+    }
+
+    fn big_of(csv: &Csv) -> BigState {
+        let index =
+            rows::Index::build(&csv.0, |_| {}, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let mut big = BigState::new(Labels::default(), Arc::new(AtomicU64::new(0)));
+        big.set_index(Arc::new(index));
+        big
+    }
+
+    #[test]
+    fn big_reads_the_header_then_the_rows_in_sight() {
+        let file = csv("plan", 100);
+        let mut big = big_of(&file);
+        assert_eq!(big.want(), Some(0..1), "the header first");
+        assert_eq!(big.want(), None, "one read at a time");
+        big.got(0..1, vec![vec!["name".into(), "qty".into()]]);
+
+        big.seen_rows = 10..20;
+        assert_eq!(big.want(), Some(1..41));
+        assert_eq!(big.want(), None, "asked already");
+        big.got(1..41, vec![vec!["r".into()]; 40]);
+        assert_eq!(big.want(), None, "all kept");
+
+        // the view moved on: only the rows past the kept ones are read
+        big.seen_rows = 50..60;
+        assert_eq!(big.want(), Some(41..81));
+    }
+
+    #[test]
+    fn big_stops_asking_after_an_error() {
+        let file = csv("err", 10);
+        let mut big = big_of(&file);
+        assert_eq!(big.want(), Some(0..1));
+        big.fail("file changed".into());
+        assert_eq!(big.want(), None);
+        assert!(big.source().is_some());
     }
 }
