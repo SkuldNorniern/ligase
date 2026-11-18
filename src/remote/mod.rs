@@ -3,6 +3,8 @@
 // used by the remote workspace, next
 #![allow(dead_code)]
 
+pub mod browse;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};

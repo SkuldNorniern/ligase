@@ -14,6 +14,8 @@ pub enum Panel {
     Git,
     /// packages found in the extensions folder.
     Extensions,
+    /// a folder on another machine, over ssh.
+    Remote,
     /// an extension's view in the side bar, by its place in the view list.
     SideView(u16),
     /// an extension's view with the terminal.
@@ -38,7 +40,12 @@ impl Panel {
     pub fn is_side(self) -> bool {
         matches!(
             self,
-            Panel::Explorer | Panel::Search | Panel::Git | Panel::Extensions | Panel::SideView(_)
+            Panel::Explorer
+                | Panel::Search
+                | Panel::Git
+                | Panel::Extensions
+                | Panel::Remote
+                | Panel::SideView(_)
         )
     }
 }

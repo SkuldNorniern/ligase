@@ -148,6 +148,7 @@ impl Workbench {
                 | Panel::Search
                 | Panel::Git
                 | Panel::Extensions
+                | Panel::Remote
                 | Panel::SideView(_)
                 | Panel::BottomView(_)
                 | Panel::Terminal
@@ -314,6 +315,8 @@ impl Workbench {
                     Panel::Search => "search".to_owned(),
                     Panel::Git => "git".to_owned(),
                     Panel::Extensions => "extensions".to_owned(),
+                    // a link isn't kept across runs
+                    Panel::Remote => "remote".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Problems => "problems".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
