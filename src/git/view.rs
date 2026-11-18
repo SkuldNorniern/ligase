@@ -27,6 +27,8 @@ pub enum Ask {
     /// throw away the working tree's edits, after asking.
     Discard(Vec<String>),
     Commit,
+    /// read this commit in full.
+    Show(String),
 }
 
 /// the panel's own state.
@@ -40,6 +42,8 @@ pub struct Scm {
     /// where the changes end and the graph starts, from the list's top;
     /// none until dragged.
     graph_at: Option<f32>,
+    /// the commit picked in the graph, in full once read.
+    pub detail: Option<super::graph::Detail>,
 }
 
 /// lane colours, by lane, round and round.
@@ -59,7 +63,7 @@ fn graph(
     status: &Status,
     rect: Rect,
     texts: &Texts,
-) -> AureaResult<()> {
+) -> AureaResult<Option<Ask>> {
     let palette = ui.theme.palette;
     let font = ui.theme.font(12.5);
     let small = ui.theme.font(11.0);
@@ -83,8 +87,22 @@ fn graph(
         .unwrap_or(1)
         .max(1);
     let lanes_w = widest as f32 * LANE + 8.0;
+    // the picked commit's card takes the bottom of the graph
+    let (list, card) = match &scm.detail {
+        Some(d) if status.history.iter().any(|c| c.id == d.id) => {
+            let h = (list.height * 0.5).clamp(ROW * 4.0, 260.0);
+            // split_bottom gives the cut-off bottom part first: the card
+            let (card, rest) = list.split_bottom(h, 4.0);
+            (rest, Some(card))
+        }
+        _ => (list, None),
+    };
+    if let (Some(card), Some(d)) = (card, &scm.detail) {
+        detail_card(ui, d, card, now)?;
+    }
     let mut picked = scm.graph_picked;
-    ListView::new(&mut scm.graph_scroll, status.history.len(), ROW)
+    let before = picked;
+    let response = ListView::new(&mut scm.graph_scroll, status.history.len(), ROW)
         .selected(&mut picked)
         .show(ui, Id::ScmGraph, list, |ui, row| {
             let (Some(c), Some(r)) = (status.history.get(row.index), status.rows.get(row.index))
@@ -165,6 +183,59 @@ fn graph(
             Ok(())
         })?;
     scm.graph_picked = picked;
+    let clicked = response
+        .row_clicked
+        .or((picked != before).then_some(picked).flatten());
+    Ok(clicked
+        .and_then(|i| status.history.get(i))
+        .map(|c| Ask::Show(c.id.clone())))
+}
+
+/// the picked commit: who, when, the hash, the whole message, its files.
+fn detail_card(
+    ui: &mut Ui<'_, Id>,
+    d: &super::graph::Detail,
+    rect: Rect,
+    now: i64,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(12.5);
+    let small = ui.theme.font(11.5);
+    let bold = ui.theme.bold(12.5);
+    ui.round(rect, 8.0, palette.raised)?;
+    let inner = rect.inset(10.0);
+    let mut y = inner.y;
+    let line = |y: f32| Rect::new(inner.x, y, inner.width, 18.0);
+    let when = super::graph::ago(now, d.time);
+    let short = &d.id[..d.id.len().min(10)];
+    ui.text_clipped(
+        &format!("{}  ·  {when}", d.author),
+        line(y),
+        &bold,
+        palette.text,
+        Align::Start,
+    )?;
+    ui.text_clipped(short, line(y), &small, palette.dim, Align::End)?;
+    y += 22.0;
+    for text in d.message.lines().take(6) {
+        if y + 18.0 > inner.y + inner.height {
+            return Ok(());
+        }
+        ui.text_clipped(text, line(y), &font, palette.text.fade(0.9), Align::Start)?;
+        y += 18.0;
+    }
+    y += 6.0;
+    for (letter, path) in &d.files {
+        if y + 18.0 > inner.y + inner.height {
+            break;
+        }
+        let colour = letter_colour(ui, *letter);
+        let row = line(y);
+        let (mark, rest) = row.split_left(14.0, 4.0);
+        ui.text(&letter.to_string(), mark, &small, colour, Align::Center)?;
+        ui.text_clipped(path, rest, &small, palette.dim, Align::Start)?;
+        y += 18.0;
+    }
     Ok(())
 }
 
@@ -231,7 +302,9 @@ pub fn show(
         if moved.changed {
             scm.graph_at = Some(at);
         }
-        graph(ui, scm, status, bottom, texts)?;
+        if let Some(show) = graph(ui, scm, status, bottom, texts)? {
+            ask = Some(show);
+        }
         top
     };
     let staged: Vec<&Change> = status.changes.iter().filter(|c| c.staged()).collect();

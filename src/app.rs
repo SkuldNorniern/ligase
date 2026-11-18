@@ -410,6 +410,8 @@ enum Done {
         Result<Option<document::Stamp>, String>,
     ),
     Shell(u32, Result<vanta::Terminal, String>),
+    /// a commit read in full for the graph's card.
+    CommitShown(Result<crate::git::graph::Detail, String>),
     /// who last changed a line, or why not.
     Blame(
         ViewId,
@@ -3071,6 +3073,10 @@ impl App {
             return;
         };
         match ask {
+            Ask::Show(id) => {
+                self.jobs
+                    .run(move || Done::CommitShown(crate::git::graph::detail(&top, &id)));
+            }
             Ask::Open(path) => {
                 let view = self.open_file(&path);
                 self.ui.focus(Id::Editor(view), 1);
@@ -3470,6 +3476,10 @@ impl App {
                         self.say(format!("{} {name}: {why}", self.texts.tr("Save failed")));
                         self.after_save(doc, false);
                     }
+                },
+                Done::CommitShown(result) => match result {
+                    Ok(detail) => self.scm.detail = Some(detail),
+                    Err(why) => self.say(why),
                 },
                 Done::Blame(view, line, revision, result) => {
                     self.blame = result.ok().map(|b| {

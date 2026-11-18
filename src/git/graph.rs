@@ -206,6 +206,69 @@ fn free(lanes: &mut Vec<Option<&str>>) -> usize {
     }
 }
 
+/// one commit in full: the whole message and the files it touched.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Detail {
+    pub id: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    pub message: String,
+    /// git's letter and the path, from the top.
+    pub files: Vec<(char, String)>,
+}
+
+/// most files listed for one commit.
+const MAX_FILES: usize = 500;
+
+/// commit `id` of the repository at `top`. runs on the worker.
+pub fn detail(top: &Path, id: &str) -> Result<Detail, String> {
+    if id.len() != 40 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("not a commit id".to_owned());
+    }
+    let out = super::run(
+        top,
+        &[
+            "show",
+            "--no-color",
+            "--name-status",
+            "-z",
+            "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%B%x1e",
+            id,
+        ],
+    )?;
+    parse_detail(&String::from_utf8_lossy(&out)).ok_or_else(|| "no such commit".to_owned())
+}
+
+fn parse_detail(out: &str) -> Option<Detail> {
+    let (head, rest) = out.split_once('\x1e')?;
+    let mut f = head.split('\x1f');
+    let mut d = Detail {
+        id: f.next()?.trim().to_owned(),
+        author: f.next()?.chars().take(80).collect(),
+        email: f.next()?.chars().take(120).collect(),
+        time: f.next()?.trim().parse().unwrap_or(0),
+        message: f.next()?.trim().chars().take(8000).collect(),
+        files: Vec::new(),
+    };
+    // then letter, path pairs; a rename gives two paths, the new one last
+    let mut fields = rest.split('\0').map(str::trim).filter(|s| !s.is_empty());
+    while let Some(status) = fields.next() {
+        let Some(letter) = status.chars().next().filter(char::is_ascii_uppercase) else {
+            continue;
+        };
+        let mut path = fields.next()?.to_owned();
+        if matches!(letter, 'R' | 'C') {
+            path = fields.next()?.to_owned();
+        }
+        d.files.push((letter, path));
+        if d.files.len() >= MAX_FILES {
+            break;
+        }
+    }
+    Some(d)
+}
+
 /// `seconds` ago as a short phrase: "now", "5 min", "3 h", "2 d", "4 w",
 /// "7 mo", "2 y".
 pub fn ago(now: i64, then: i64) -> String {
@@ -307,6 +370,24 @@ mod tests {
         let rows = layout(&commits);
         assert_eq!(rows.len(), commits.len());
         assert!(commits.iter().all(|c| c.id.len() == 40));
+    }
+
+    #[test]
+    fn reads_one_commit() {
+        let out = "abc\x1fEira\x1fe@x\x1f1700000000\x1ffeat: thing\n\nbody line\n\x1e\n\0M\0src/a.rs\0R100\0old.rs\0new.rs\0A\0b.md\0";
+        let d = parse_detail(out).unwrap();
+        assert_eq!(d.author, "Eira");
+        assert_eq!(d.message, "feat: thing\n\nbody line");
+        assert_eq!(
+            d.files,
+            [
+                ('M', "src/a.rs".to_owned()),
+                ('R', "new.rs".to_owned()),
+                ('A', "b.md".to_owned())
+            ]
+        );
+        assert!(parse_detail("no separator").is_none());
+        assert!(detail(Path::new("."), "zz").is_err());
     }
 
     #[test]
