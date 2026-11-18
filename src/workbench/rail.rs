@@ -15,7 +15,6 @@ pub fn thickness(place: RailPlace) -> f32 {
     match place {
         RailPlace::Left | RailPlace::Right => 46.0,
         RailPlace::Top | RailPlace::Bottom => 38.0,
-        RailPlace::Hidden => 0.0,
     }
 }
 

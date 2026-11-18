@@ -281,3 +281,7 @@
 "abbreviations" = "약어"
 "Indexing…" = "색인 중…"
 "rows" = "행"
+"Show Rail" = "레일 표시"
+"Always, never, or when the pointer reaches the rail's edge." = "항상, 숨김, 또는 포인터가 레일 가장자리에 닿을 때"
+"always" = "항상"
+"edge" = "가장자리"

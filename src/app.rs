@@ -28,7 +28,7 @@ use crate::lsp::{self, Lsp};
 use crate::palette::{self, Kind, Palette};
 use crate::problems::{self, Problems};
 use crate::search::{self, Finder};
-use crate::settings::{self, RailPlace, Settings, SidePlace, ThemeChoice};
+use crate::settings::{self, RailPlace, RailShow, Settings, SidePlace, ThemeChoice};
 use crate::syntax::Syntax;
 use crate::terminal;
 use crate::workbench::panels::{PaneId, Panel};
@@ -505,6 +505,8 @@ pub struct App {
     blame: Option<(ViewId, usize, Revision, String)>,
     /// the blame asked for last.
     blame_asked: Option<(ViewId, usize, Revision)>,
+    /// the rail is out at its edge (shown only at the edge).
+    rail_out: bool,
     /// the remote folder in the side bar, while one is open.
     remote: Option<crate::remote::browse::Browser>,
     /// local copies of remote files: where each goes back to on save.
@@ -648,6 +650,7 @@ impl App {
             blame_asked: None,
             remote: None,
             remote_files: HashMap::new(),
+            rail_out: false,
             previews: crate::preview::Previews::default(),
             want_signature: None,
             line_clip: None,
@@ -3898,7 +3901,9 @@ impl App {
         });
         let rail_items = self.rail_items();
         let side_head = self.side_head(&titles);
-        let rail_pick;
+        let mut rail_pick;
+        let was_out = self.rail_out;
+        let mut rail_out = false;
         let sheet_ask;
         let mut side_held = false;
         let mut side_moved = false;
@@ -4089,16 +4094,19 @@ impl App {
             };
             let rail_place = settings.rail;
             let thick = rail::thickness(rail_place);
-            let (rail_at, work) = match rail_place {
+            let (rail_at, kept) = match rail_place {
                 RailPlace::Left => main.split_left(thick, 0.0),
                 RailPlace::Right => main.split_right(thick, 0.0),
                 RailPlace::Top => main.split_top(thick, 0.0),
                 RailPlace::Bottom => main.split_bottom(thick, 0.0),
-                RailPlace::Hidden => (Rect::new(main.x, main.y, 0.0, 0.0), main),
             };
-            rail_pick = if rail_place == RailPlace::Hidden {
-                None
+            // only a rail always in sight takes room; one at the edge floats
+            let work = if settings.rail_show == RailShow::Always {
+                kept
             } else {
+                main
+            };
+            rail_pick = if settings.rail_show == RailShow::Always {
                 rail::show(
                     &mut ui,
                     rail_at,
@@ -4106,6 +4114,8 @@ impl App {
                     (&rail_items.0, &rail_items.1),
                     keymap,
                 )?
+            } else {
+                None
             };
             let right = settings.side_bar == SidePlace::Right;
             let overlay = settings.side_overlay;
@@ -4131,6 +4141,57 @@ impl App {
                 })
                 .show(&mut ui, Id::Dock, dock_at)?;
             changed = response.changed;
+            // at the edge: a few pixels there call the rail out, it stays
+            // while the pointer is on it, and slides over the work
+            if settings.rail_show == RailShow::Edge {
+                let reach = 4.0;
+                let zone = match rail_place {
+                    RailPlace::Left => Rect::new(main.x, main.y, reach, main.height),
+                    RailPlace::Right => Rect::new(main.right() - reach, main.y, reach, main.height),
+                    RailPlace::Top => Rect::new(main.x, main.y, main.width, reach),
+                    RailPlace::Bottom => {
+                        Rect::new(main.x, main.bottom() - reach, main.width, reach)
+                    }
+                };
+                rail_out = ui
+                    .pointer()
+                    .is_some_and(|p| zone.contains(p) || (was_out && rail_at.contains(p)));
+                let shown = ui.animate(
+                    Id::Rail,
+                    u16::MAX,
+                    aurea::ui::Channel::Custom(0),
+                    if rail_out { 1.0 } else { 0.0 },
+                    16.0,
+                );
+                if shown > 0.01 {
+                    // slid in from its edge by how far out it is
+                    let hide = (1.0 - shown) * thick;
+                    let at = match rail_place {
+                        RailPlace::Left => {
+                            Rect::new(rail_at.x - hide, rail_at.y, rail_at.width, rail_at.height)
+                        }
+                        RailPlace::Right => {
+                            Rect::new(rail_at.x + hide, rail_at.y, rail_at.width, rail_at.height)
+                        }
+                        RailPlace::Top => {
+                            Rect::new(rail_at.x, rail_at.y - hide, rail_at.width, rail_at.height)
+                        }
+                        RailPlace::Bottom => {
+                            Rect::new(rail_at.x, rail_at.y + hide, rail_at.width, rail_at.height)
+                        }
+                    };
+                    let palette = ui.theme.palette;
+                    ui.fill(at, palette.background)?;
+                    ui.border(at, 0.0, 1.0, palette.border.fade(shown))?;
+                    rail_pick = rail::show(
+                        &mut ui,
+                        at,
+                        rail_place,
+                        (&rail_items.0, &rail_items.1),
+                        keymap,
+                    )?;
+                }
+            }
             // floating, the bar goes over the editors after them, so it
             // takes the pointer where they meet
             if overlay && let Some(pane) = side_pane {
@@ -4368,6 +4429,7 @@ impl App {
             self.menu_target = Some(Target::Editor(view));
             self.menu.ask(at, context_menu::editor());
         }
+        self.rail_out = rail_out;
         if let Some(command) = welcome_pick.or(status_pick).or(rail_pick) {
             self.run(command);
         }

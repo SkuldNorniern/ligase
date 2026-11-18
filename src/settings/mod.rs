@@ -47,7 +47,15 @@ pub enum RailPlace {
     Right,
     Top,
     Bottom,
+}
+
+/// when the rail is in sight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailShow {
+    Always,
     Hidden,
+    /// slides out over the work when the pointer reaches its edge.
+    Edge,
 }
 
 /// which edge the side bar sits on.
@@ -99,6 +107,8 @@ pub struct Settings {
     pub word_wrap: bool,
     /// where the rail of panel buttons sits.
     pub rail: RailPlace,
+    /// when the rail shows; its edge is the one it sits on.
+    pub rail_show: RailShow,
     /// which edge the side bar sits on.
     pub side_bar: SidePlace,
     /// the side bar floats over the editor and folds away when the editor is clicked.
@@ -133,6 +143,7 @@ impl Default for Settings {
             save_on_focus_loss: false,
             word_wrap: false,
             rail: RailPlace::Left,
+            rail_show: RailShow::Always,
             side_bar: SidePlace::Left,
             side_overlay: false,
         }
@@ -305,7 +316,14 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some("right") => out.rail = RailPlace::Right,
             Some("top") => out.rail = RailPlace::Top,
             Some("bottom") => out.rail = RailPlace::Bottom,
-            Some(_) => out.rail = RailPlace::Hidden,
+            // the old way to hide it: hidden, on the left when shown again
+            Some(_) => out.rail_show = RailShow::Hidden,
+            None => return false,
+        },
+        "rail_show" => match word(value, &["always", "hidden", "edge"]) {
+            Some("always") => out.rail_show = RailShow::Always,
+            Some("hidden") => out.rail_show = RailShow::Hidden,
+            Some(_) => out.rail_show = RailShow::Edge,
             None => return false,
         },
         "side_bar" => match word(value, &["left", "right"]) {
@@ -536,7 +554,14 @@ pub const FIELDS: &[Field] = &[
         label: "Panel Rail",
         about: "Panel button rail position.",
         group: "Layout",
-        kind: FieldKind::Choice(&["left", "right", "top", "bottom", "hidden"]),
+        kind: FieldKind::Choice(&["left", "right", "top", "bottom"]),
+    },
+    Field {
+        key: "rail_show",
+        label: "Show Rail",
+        about: "Always, never, or when the pointer reaches the rail's edge.",
+        group: "Layout",
+        kind: FieldKind::Choice(&["always", "hidden", "edge"]),
     },
     Field {
         key: "side_bar",
@@ -588,7 +613,11 @@ pub fn current(s: &Settings, key: &str) -> Option<String> {
             RailPlace::Right => "right",
             RailPlace::Top => "top",
             RailPlace::Bottom => "bottom",
-            RailPlace::Hidden => "hidden",
+        }),
+        "rail_show" => quote(match s.rail_show {
+            RailShow::Always => "always",
+            RailShow::Hidden => "hidden",
+            RailShow::Edge => "edge",
         }),
         "side_bar" => quote(match s.side_bar {
             SidePlace::Left => "left",
@@ -760,6 +789,7 @@ mod tests {
             "save_on_focus_loss",
             "word_wrap",
             "rail",
+            "rail_show",
             "side_bar",
             "side_overlay",
         ];
