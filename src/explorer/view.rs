@@ -8,7 +8,7 @@ use super::{Click, Explorer};
 use crate::app::Id;
 use crate::icons;
 
-const ROW: f32 = 22.0;
+const ROW: f32 = 24.0;
 const INDENT: f32 = 14.0;
 
 /// what a frame of the tree tells the app.
@@ -40,14 +40,14 @@ pub fn show(
             let Some(entry) = tree.row(row.index) else {
                 return Ok(());
             };
-            // inset and rounded, the way zed and vs code mark a row
+            // inset and rounded, so a row reads as a chip, not a stripe
             let lit = row.rect.inset_xy(4.0, 1.0);
             if row.picked {
-                ui.round(lit, 4.0, palette.selection)?;
+                ui.round(lit, 6.0, palette.selection)?;
             } else if active.is_some_and(|a| same_path(a, entry.path)) {
-                ui.round(lit, 4.0, palette.raised)?;
+                ui.round(lit, 6.0, palette.raised)?;
             } else if row.hovered {
-                ui.round(lit, 4.0, palette.hover)?;
+                ui.round(lit, 6.0, palette.hover)?;
             }
             // one faint line per folder this row sits in, under its arrow
             for depth in 0..entry.depth {
