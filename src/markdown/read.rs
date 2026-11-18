@@ -299,6 +299,8 @@ fn lay_block(
             let row = (MONO_SIZE * 1.5).round();
             let top = y;
             let mut at = y + 12.0;
+            // the plate goes in here, under the label and the lines
+            let first = items.len();
             if !lang.is_empty() {
                 items.push(Item::Text {
                     x: x1 - 12.0 - ui.text_width(lang, mono),
@@ -311,7 +313,6 @@ fn lay_block(
                     plate: false,
                 });
             }
-            let first = items.len();
             for line in lines.iter().take(5000) {
                 items.push(Item::Text {
                     x: x0 + 14.0,
