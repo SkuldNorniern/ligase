@@ -64,6 +64,10 @@ pub enum Id {
     ScmGraph,
     /// the bar between the changes and the graph.
     ScmSplit,
+    /// the filter field in the graph header.
+    ScmFilter,
+    /// a file row in the picked commit's card; the index in its file list.
+    ScmCardFile(u16),
     ReplaceInFiles,
     /// a tab of the terminal strip; `u16::MAX` is the add button.
     TerminalTab(u16),

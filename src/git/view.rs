@@ -2,12 +2,13 @@
 //! staged files and the changed ones. a click opens a file; the button on a
 //! row stages or unstages it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use aurea::AureaResult;
 use aurea::render::Rect;
-use aurea::ui::{Align, Button, ListView, Splitter, TextField, Ui};
+use aurea::ui::{Align, Button, ListView, Response, Sense, Splitter, TextField, Ui};
+use aurea::{AureaResult, CursorIcon};
 
+use super::graph;
 use super::{Change, Status};
 use crate::app::Id;
 use crate::icons;
@@ -38,7 +39,10 @@ pub struct Scm {
     scroll: f32,
     picked: Option<usize>,
     graph_scroll: f32,
+    /// the picked commit, as its index in the history.
     graph_picked: Option<usize>,
+    /// the graph's filter text; empty shows all commits.
+    pub filter: String,
     /// where the changes end and the graph starts, from the list's top;
     /// none until dragged.
     graph_at: Option<f32>,
@@ -68,14 +72,46 @@ fn graph(
     let font = ui.theme.font(12.5);
     let small = ui.theme.font(11.0);
     let (head, list) = rect.split_top(ROW, 2.0);
-    let label = format!("{}  {}", texts.tr("Graph"), status.history.len());
+    // history indices of the commits that pass the filter
+    let filtering = !scm.filter.trim().is_empty();
+    let shown: Vec<usize> = status
+        .history
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| graph::matches(c, &scm.filter))
+        .map(|(i, _)| i)
+        .collect();
+    let label = if filtering {
+        format!(
+            "{}  {} / {}",
+            texts.tr("Graph"),
+            shown.len(),
+            status.history.len()
+        )
+    } else {
+        format!("{}  {}", texts.tr("Graph"), status.history.len())
+    };
+    let label_w = ui.text_width(&label, &ui.theme.font(12.0));
+    let (label_at, filter_at) = head.inset_xy(4.0, 0.0).split_left(label_w, 8.0);
     ui.text_clipped(
         &label,
-        head.inset_xy(4.0, 0.0),
+        label_at,
         &ui.theme.font(12.0),
         palette.dim,
         Align::Start,
     )?;
+    if filter_at.width >= 60.0 {
+        let field = Rect::new(
+            filter_at.x,
+            head.y + 1.0,
+            filter_at.width.min(160.0),
+            ROW - 2.0,
+        );
+        TextField::new(&mut scm.filter)
+            .placeholder(texts.tr("Filter commits"))
+            .max_chars(120)
+            .show(ui, Id::ScmFilter, field)?;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
@@ -86,7 +122,12 @@ fn graph(
         .max()
         .unwrap_or(1)
         .max(1);
-    let lanes_w = widest as f32 * LANE + 8.0;
+    // a filtered list has no lanes, only a dot column
+    let lanes_w = if filtering {
+        LANE + 8.0
+    } else {
+        widest as f32 * LANE + 8.0
+    };
     // the picked commit's card takes the bottom of the graph
     let (list, card) = match &scm.detail {
         Some(d) if status.history.iter().any(|c| c.id == d.id) => {
@@ -97,16 +138,21 @@ fn graph(
         }
         _ => (list, None),
     };
+    let mut card_ask = None;
     if let (Some(card), Some(d)) = (card, &scm.detail) {
-        detail_card(ui, d, card, now)?;
+        card_ask = detail_card(ui, d, card, now, &status.top)?;
     }
-    let mut picked = scm.graph_picked;
+    let mut picked = scm
+        .graph_picked
+        .and_then(|h| shown.iter().position(|&s| s == h));
     let before = picked;
-    let response = ListView::new(&mut scm.graph_scroll, status.history.len(), ROW)
+    let response = ListView::new(&mut scm.graph_scroll, shown.len(), ROW)
         .selected(&mut picked)
         .show(ui, Id::ScmGraph, list, |ui, row| {
-            let (Some(c), Some(r)) = (status.history.get(row.index), status.rows.get(row.index))
-            else {
+            let Some(&h) = shown.get(row.index) else {
+                return Ok(());
+            };
+            let (Some(c), Some(r)) = (status.history.get(h), status.rows.get(h)) else {
                 return Ok(());
             };
             let lit = row.rect.inset_xy(2.0, 1.0);
@@ -118,36 +164,12 @@ fn graph(
             let x0 = row.rect.x + 10.0;
             let mid = row.rect.y + ROW / 2.0;
             let x_of = |lane: usize| x0 + lane as f32 * LANE;
-            // lines to the next row: straight down, or a soft bend
-            for &(a, b) in &r.down {
-                let colour = lane_colour(ui, if a == r.lane { b } else { a });
-                let (xa, xb) = (x_of(a), x_of(b));
-                if a == b {
-                    ui.line(
-                        aurea::render::Point::new(xa, mid),
-                        aurea::render::Point::new(xb, mid + ROW),
-                        1.6,
-                        colour,
-                    )?;
-                } else {
-                    let pts: Vec<aurea::render::Point> = (0..=8)
-                        .map(|i| {
-                            let t = i as f32 / 8.0;
-                            let e = t * t * (3.0 - 2.0 * t);
-                            aurea::render::Point::new(xa + (xb - xa) * e, mid + ROW * t)
-                        })
-                        .collect();
-                    ui.polyline(&pts, 1.6, colour)?;
-                }
-            }
-            let dot = aurea::render::Point::new(x_of(r.lane), mid);
-            let colour = lane_colour(ui, r.lane);
-            if c.parents.len() > 1 {
-                // a merge: a ring, not a dot
-                ui.circle(dot, 4.5, colour)?;
-                ui.circle(dot, 2.5, palette.background)?;
+            if filtering {
+                // no lines between rows when some are hidden
+                let colour = lane_colour(ui, 0);
+                ui.circle(aurea::render::Point::new(x0, mid), 3.5, colour)?;
             } else {
-                ui.circle(dot, 4.0, colour)?;
+                draw_lanes(ui, r, x_of, mid, c.parents.len() > 1)?;
             }
             // pills for branches, then the subject; who and when on the right
             let mut x = row.rect.x + lanes_w + 4.0;
@@ -155,6 +177,7 @@ fn graph(
             let when = super::graph::ago(now, c.time);
             let meta = format!("{}  {when}", c.author);
             let meta_w = ui.text_width(&meta, &small).min(row.rect.width * 0.35);
+            let colour = lane_colour(ui, r.lane);
             for name in &c.refs {
                 let w = ui.text_width(name, &small) + 14.0;
                 if x + w > right - meta_w - 40.0 {
@@ -180,15 +203,80 @@ fn graph(
             ui.text_clipped(&c.subject, body, &font, subject_colour, Align::Start)?;
             let meta_at = Rect::new(right - meta_w, row.rect.y, meta_w, ROW);
             ui.text_clipped(&meta, meta_at, &small, palette.dim, Align::End)?;
+            if row.hovered {
+                let tip = format!(
+                    "{}\n{}  {} UTC\n{}",
+                    c.id.get(..12).unwrap_or(&c.id),
+                    c.author,
+                    graph::utc_stamp(c.time),
+                    c.subject
+                );
+                ui.tooltip(
+                    &Response {
+                        rect: row.rect,
+                        hovered: true,
+                        ..Response::default()
+                    },
+                    &tip,
+                );
+            }
             Ok(())
         })?;
-    scm.graph_picked = picked;
+    if picked != before {
+        scm.graph_picked = picked.and_then(|i| shown.get(i).copied());
+    }
     let clicked = response
         .row_clicked
         .or((picked != before).then_some(picked).flatten());
-    Ok(clicked
-        .and_then(|i| status.history.get(i))
-        .map(|c| Ask::Show(c.id.clone())))
+    let show = clicked
+        .and_then(|i| shown.get(i))
+        .and_then(|&h| status.history.get(h))
+        .map(|c| Ask::Show(c.id.clone()));
+    Ok(card_ask.or(show))
+}
+
+/// the lanes at one row: lines to the next row, then the commit's dot, a ring
+/// for a merge.
+fn draw_lanes(
+    ui: &mut Ui<'_, Id>,
+    r: &graph::Row,
+    x_of: impl Fn(usize) -> f32,
+    mid: f32,
+    merge: bool,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    // lines to the next row: straight down, or a soft bend
+    for &(a, b) in &r.down {
+        let colour = lane_colour(ui, if a == r.lane { b } else { a });
+        let (xa, xb) = (x_of(a), x_of(b));
+        if a == b {
+            ui.line(
+                aurea::render::Point::new(xa, mid),
+                aurea::render::Point::new(xb, mid + ROW),
+                1.6,
+                colour,
+            )?;
+        } else {
+            let pts: Vec<aurea::render::Point> = (0..=8)
+                .map(|i| {
+                    let t = i as f32 / 8.0;
+                    let e = t * t * (3.0 - 2.0 * t);
+                    aurea::render::Point::new(xa + (xb - xa) * e, mid + ROW * t)
+                })
+                .collect();
+            ui.polyline(&pts, 1.6, colour)?;
+        }
+    }
+    let dot = aurea::render::Point::new(x_of(r.lane), mid);
+    let colour = lane_colour(ui, r.lane);
+    if merge {
+        // a merge: a ring, not a dot
+        ui.circle(dot, 4.5, colour)?;
+        ui.circle(dot, 2.5, palette.background)?;
+    } else {
+        ui.circle(dot, 4.0, colour)?;
+    }
+    Ok(())
 }
 
 /// the picked commit: who, when, the hash, the whole message, its files.
@@ -197,7 +285,8 @@ fn detail_card(
     d: &super::graph::Detail,
     rect: Rect,
     now: i64,
-) -> AureaResult<()> {
+    top: &Path,
+) -> AureaResult<Option<Ask>> {
     let palette = ui.theme.palette;
     let font = ui.theme.font(12.5);
     let small = ui.theme.font(11.5);
@@ -219,24 +308,41 @@ fn detail_card(
     y += 22.0;
     for text in d.message.lines().take(6) {
         if y + 18.0 > inner.y + inner.height {
-            return Ok(());
+            return Ok(None);
         }
         ui.text_clipped(text, line(y), &font, palette.text.fade(0.9), Align::Start)?;
         y += 18.0;
     }
     y += 6.0;
-    for (letter, path) in &d.files {
+    let mut ask = None;
+    for (i, (letter, path)) in d.files.iter().enumerate() {
         if y + 18.0 > inner.y + inner.height {
             break;
         }
+        let row = line(y).inset_xy(-4.0, 0.0);
+        let part = u16::try_from(i).unwrap_or(u16::MAX);
+        let hit = ui.interact(Id::ScmCardFile(part), 0, row, Sense::Click, true);
+        if hit.hovered {
+            ui.round(row, 4.0, palette.hover)?;
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        if hit.clicked {
+            ask = Some(Ask::Open(repo_path(top, path)));
+        }
         let colour = letter_colour(ui, *letter);
-        let row = line(y);
-        let (mark, rest) = row.split_left(14.0, 4.0);
+        let (mark, rest) = line(y).split_left(14.0, 4.0);
         ui.text(&letter.to_string(), mark, &small, colour, Align::Center)?;
         ui.text_clipped(path, rest, &small, palette.dim, Align::Start)?;
         y += 18.0;
     }
-    Ok(())
+    Ok(ask)
+}
+
+/// `rel` (git's forward slashes) joined onto the repository root `top`.
+fn repo_path(top: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .filter(|s| !s.is_empty())
+        .fold(top.to_path_buf(), |p, s| p.join(s))
 }
 
 enum Line<'a> {

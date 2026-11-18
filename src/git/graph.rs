@@ -284,9 +284,80 @@ pub fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// whether `c` matches `query`: a case-insensitive substring of the subject,
+/// the author, a ref name or the short hash. an empty query matches all.
+pub fn matches(c: &Commit, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let short = c.id.get(..12).unwrap_or(&c.id);
+    [c.subject.as_str(), c.author.as_str(), short]
+        .into_iter()
+        .chain(c.refs.iter().map(String::as_str))
+        .any(|s| s.to_lowercase().contains(&q))
+}
+
+/// `time` in UTC as "YYYY-MM-DD HH:MM", from the unix seconds.
+pub fn utc_stamp(time: i64) -> String {
+    let days = time.div_euclid(86_400);
+    let secs = time.rem_euclid(86_400);
+    // civil date from days since the epoch, after howard hinnant's algorithm
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_matches_fields_case_insensitively() {
+        let mut x = c("a", &[]);
+        x.id = "0123456789abcdef".to_owned();
+        x.subject = "Fix the Parser".to_owned();
+        x.author = "Eira".to_owned();
+        x.refs = vec!["origin/main".to_owned()];
+        assert!(matches(&x, ""));
+        assert!(matches(&x, "   "));
+        assert!(matches(&x, "parser"));
+        assert!(matches(&x, "EIRA"));
+        assert!(matches(&x, "Origin/Main"));
+        assert!(matches(&x, "01234567"));
+        assert!(matches(&x, "fix the"));
+        assert!(!matches(&x, "def"), "the hash is cut to 12 chars");
+        assert!(!matches(&x, "nothing here"));
+    }
+
+    #[test]
+    fn filter_on_short_ids_does_not_panic() {
+        let mut x = c("a", &[]);
+        x.id = "abc".to_owned();
+        assert!(matches(&x, "ab"));
+        assert!(!matches(&x, "zz"));
+    }
+
+    #[test]
+    fn utc_stamp_known_times() {
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00");
+        assert_eq!(utc_stamp(-1), "1969-12-31 23:59");
+        assert_eq!(utc_stamp(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(utc_stamp(951_782_400), "2000-02-29 00:00");
+        assert!(!utc_stamp(i64::MIN).is_empty(), "no panic on extremes");
+        assert!(!utc_stamp(i64::MAX).is_empty());
+    }
 
     fn c(id: &str, parents: &[&str]) -> Commit {
         Commit {
