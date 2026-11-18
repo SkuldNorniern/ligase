@@ -13,6 +13,7 @@ use crate::document::ViewId;
 use crate::markdown;
 
 mod table;
+pub mod rows;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
