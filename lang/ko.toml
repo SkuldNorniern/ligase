@@ -261,3 +261,4 @@
 "New Remote Shell (ssh)" = "새 원격 셸 (ssh)"
 "that host name won't do" = "그 호스트 이름은 쓸 수 없음"
 "user@host, as ssh takes it" = "ssh에 쓰는 user@host"
+"Read" = "읽기"

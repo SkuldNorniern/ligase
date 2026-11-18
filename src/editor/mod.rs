@@ -746,6 +746,8 @@ pub enum Crumb {
     Folder(String),
     /// the symbols of the file.
     Symbols,
+    /// read the file as a page.
+    Read,
 }
 
 /// one line laid out for drawing: tabs opened up, with where each char
@@ -1010,6 +1012,22 @@ fn crumbs(
     Ok(picked)
 }
 
+/// a small rounded button at the right end of `strip`. true when clicked.
+fn chip(ui: &mut Ui<'_, Id>, id: ViewId, strip: Rect, label: &str) -> AureaResult<bool> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(11.5);
+    let w = ui.text_width(label, &font) + 20.0;
+    let at = Rect::new(strip.x + strip.width - w - 14.0, strip.y + 3.0, w, strip.height - 6.0);
+    let input = ui.interact(Id::Crumb(id), u16::MAX - 1, at, Sense::Click, true);
+    let fill = if input.hovered { palette.hover } else { palette.raised };
+    ui.round(at, at.height / 2.0, fill)?;
+    ui.text(label, at, &font, palette.dim, Align::Center)?;
+    if input.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    Ok(input.clicked)
+}
+
 /// where problems and find hits are in the whole file, in the strip the
 /// scroll bar runs in: hits on the left half, problems on the right, the
 /// caret's line across. by line, so folds and wraps only bend it a little.
@@ -1154,6 +1172,10 @@ pub fn show(
                 .filter(|s| s.at <= head)
                 .max_by_key(|s| s.at);
             shown.crumb = crumbs(ui, id, path, symbol, strip)?;
+            // markdown offers its page at the far end
+            if doc.language == Some("markdown") && chip(ui, id, strip, texts.tr("Read"))? {
+                shown.crumb = Some(Crumb::Read);
+            }
             rest
         }
         None => rect,

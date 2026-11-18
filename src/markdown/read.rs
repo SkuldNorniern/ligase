@@ -117,6 +117,8 @@ impl Shade {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ask {
     Open(String),
+    /// back to the text.
+    Edit,
 }
 
 struct Fonts {
@@ -577,7 +579,7 @@ pub fn show(
                         let mut c = colour.of(&palette);
                         if let Some(url) = link {
                             n = n.wrapping_add(1);
-                            let input = ui.interact(Id::Reader(view), n, r, Sense::Click, false);
+                            let input = ui.interact(Id::Reader(view), n, r, Sense::Click, true);
                             if input.hovered || pointer.is_some_and(|p| r.contains(p)) {
                                 ui.set_cursor(CursorIcon::Pointer);
                                 c = palette.text;
@@ -597,6 +599,21 @@ pub fn show(
             Ok(())
         },
     )?;
+    // the way back to the text, floating at the top right
+    let font = ui.theme.font(11.5);
+    let label = "Edit";
+    let w = ui.text_width(label, &font) + 22.0;
+    let at = Rect::new(rect.x + rect.width - w - 22.0, rect.y + 10.0, w, 24.0);
+    let input = ui.interact(Id::Reader(view), 0, at, Sense::Click, true);
+    let fill = if input.hovered { palette.hover } else { palette.raised };
+    ui.round(at, 12.0, fill)?;
+    ui.text(label, at, &font, palette.dim, Align::Center)?;
+    if input.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    if input.clicked {
+        ask = Some(Ask::Edit);
+    }
     Ok(ask)
 }
 

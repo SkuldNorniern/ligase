@@ -4180,13 +4180,23 @@ impl App {
             self.menu.ask(at, context_menu::explorer(on_entry));
         }
         self.point_at(pointer);
-        if let Some((view, crate::markdown::read::Ask::Open(url))) = read_ask {
-            self.open_link(view, &url);
+        match read_ask {
+            Some((view, crate::markdown::read::Ask::Open(url))) => self.open_link(view, &url),
+            Some((view, crate::markdown::read::Ask::Edit)) => {
+                self.focus = Some(view);
+                self.last_editor = Some(view);
+                self.run(Command::ToggleReading);
+            }
+            None => {}
         }
         if let Some((c, view)) = crumb {
             self.last_editor = Some(view);
             match c {
                 editor::Crumb::Symbols => self.run(Command::GotoSymbol),
+                editor::Crumb::Read => {
+                    self.focus = Some(view);
+                    self.run(Command::ToggleReading);
+                }
                 editor::Crumb::Folder(folder) => {
                     // quick open, narrowed to that folder
                     self.palette.open(Kind::Files);
