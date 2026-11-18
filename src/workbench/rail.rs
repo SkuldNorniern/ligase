@@ -46,15 +46,8 @@ pub fn show(
     keymap: &Keymap<Command>,
 ) -> AureaResult<Option<Command>> {
     let palette = ui.theme.palette;
-    ui.fill(rect, palette.surface)?;
-    // the line on the side facing the work
-    let line = match place {
-        RailPlace::Right => Rect::new(rect.x, rect.y, 1.0, rect.height),
-        RailPlace::Top => Rect::new(rect.x, rect.bottom() - 1.0, rect.width, 1.0),
-        RailPlace::Bottom => Rect::new(rect.x, rect.y, rect.width, 1.0),
-        _ => Rect::new(rect.right() - 1.0, rect.y, 1.0, rect.height),
-    };
-    ui.fill(line, palette.border)?;
+    // the rail is part of the floor, not a ruled strip: icons float on it
+    ui.fill(rect, palette.background)?;
     let across = matches!(place, RailPlace::Top | RailPlace::Bottom);
     let (start, end) = if across {
         (rect.x, rect.right())
@@ -148,19 +141,12 @@ fn cell(
         let tint = palette.hover.mix(palette.pressed, eased.press);
         ui.round(plate, 7.0, tint.fade(eased.hover.max(eased.press)))?;
     }
+    // lit: a soft accent pill and an accent icon, no bar on the edge
     if item.lit {
-        ui.round(plate, 7.0, palette.accent.fade(0.14))?;
-        // a mark on the rail's outer edge
-        let mark = match place {
-            RailPlace::Right => Rect::new(at.right() - 2.0, at.y + 10.0, 2.0, at.height - 20.0),
-            RailPlace::Top => Rect::new(at.x + 10.0, at.y, at.width - 20.0, 2.0),
-            RailPlace::Bottom => Rect::new(at.x + 10.0, at.bottom() - 2.0, at.width - 20.0, 2.0),
-            _ => Rect::new(at.x, at.y + 10.0, 2.0, at.height - 20.0),
-        };
-        ui.fill(mark, palette.accent)?;
+        ui.round(plate, 9.0, palette.accent.fade(0.18))?;
     }
     let colour = if item.lit {
-        palette.text
+        palette.accent.mix(palette.text, 0.25)
     } else {
         palette.dim.mix(palette.text, eased.hover)
     };
