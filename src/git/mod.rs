@@ -3,6 +3,7 @@
 //! is ever read on the ui thread.
 
 pub mod diff;
+pub mod graph;
 pub mod view;
 
 use std::collections::hash_map::DefaultHasher;
@@ -109,6 +110,9 @@ impl Change {
 pub struct Status {
     pub top: PathBuf,
     pub changes: Vec<Change>,
+    /// recent history for the graph, and its lanes; empty until asked.
+    pub history: Vec<graph::Commit>,
+    pub rows: Vec<graph::Row>,
 }
 
 /// changes past this many are not listed.
@@ -125,6 +129,8 @@ pub fn status(dir: &Path) -> Option<Status> {
     Some(Status {
         changes: parse_status(&top, &out),
         top,
+        history: Vec::new(),
+        rows: Vec::new(),
     })
 }
 

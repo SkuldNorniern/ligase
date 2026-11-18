@@ -35,6 +35,134 @@ pub struct Scm {
     pub message: String,
     scroll: f32,
     picked: Option<usize>,
+    graph_scroll: f32,
+    graph_picked: Option<usize>,
+}
+
+/// lane colours, by lane, round and round.
+fn lane_colour(ui: &Ui<'_, Id>, lane: usize) -> aurea::render::Color {
+    let p = ui.theme.palette;
+    let all = [p.accent, p.success, p.warning, p.danger, p.text.fade(0.7)];
+    all[lane % all.len()]
+}
+
+const LANE: f32 = 12.0;
+
+/// the history with its lanes: one row a commit, lines down to its parents,
+/// branch names as pills, who and when on the right.
+fn graph(
+    ui: &mut Ui<'_, Id>,
+    scm: &mut Scm,
+    status: &Status,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<()> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(12.5);
+    let small = ui.theme.font(11.0);
+    let (head, list) = rect.split_top(ROW, 2.0);
+    let label = format!("{}  {}", texts.tr("Graph"), status.history.len());
+    ui.text_clipped(
+        &label,
+        head.inset_xy(4.0, 0.0),
+        &ui.theme.font(12.0),
+        palette.dim,
+        Align::Start,
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let widest = status
+        .rows
+        .iter()
+        .map(|r| r.width)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let lanes_w = widest as f32 * LANE + 8.0;
+    let mut picked = scm.graph_picked;
+    ListView::new(&mut scm.graph_scroll, status.history.len(), ROW)
+        .selected(&mut picked)
+        .show(ui, Id::ScmGraph, list, |ui, row| {
+            let (Some(c), Some(r)) = (status.history.get(row.index), status.rows.get(row.index))
+            else {
+                return Ok(());
+            };
+            let lit = row.rect.inset_xy(2.0, 1.0);
+            if row.picked {
+                ui.round(lit, 4.0, palette.selection)?;
+            } else if row.hovered {
+                ui.round(lit, 4.0, palette.hover)?;
+            }
+            let x0 = row.rect.x + 10.0;
+            let mid = row.rect.y + ROW / 2.0;
+            let x_of = |lane: usize| x0 + lane as f32 * LANE;
+            // lines to the next row: straight down, or a soft bend
+            for &(a, b) in &r.down {
+                let colour = lane_colour(ui, if a == r.lane { b } else { a });
+                let (xa, xb) = (x_of(a), x_of(b));
+                if a == b {
+                    ui.line(
+                        aurea::render::Point::new(xa, mid),
+                        aurea::render::Point::new(xb, mid + ROW),
+                        1.6,
+                        colour,
+                    )?;
+                } else {
+                    let pts: Vec<aurea::render::Point> = (0..=8)
+                        .map(|i| {
+                            let t = i as f32 / 8.0;
+                            let e = t * t * (3.0 - 2.0 * t);
+                            aurea::render::Point::new(xa + (xb - xa) * e, mid + ROW * t)
+                        })
+                        .collect();
+                    ui.polyline(&pts, 1.6, colour)?;
+                }
+            }
+            let dot = aurea::render::Point::new(x_of(r.lane), mid);
+            let colour = lane_colour(ui, r.lane);
+            if c.parents.len() > 1 {
+                // a merge: a ring, not a dot
+                ui.circle(dot, 4.5, colour)?;
+                ui.circle(dot, 2.5, palette.background)?;
+            } else {
+                ui.circle(dot, 4.0, colour)?;
+            }
+            // pills for branches, then the subject; who and when on the right
+            let mut x = row.rect.x + lanes_w + 4.0;
+            let right = row.rect.x + row.rect.width - 6.0;
+            let when = super::graph::ago(now, c.time);
+            let meta = format!("{}  {when}", c.author);
+            let meta_w = ui.text_width(&meta, &small).min(row.rect.width * 0.35);
+            for name in &c.refs {
+                let w = ui.text_width(name, &small) + 14.0;
+                if x + w > right - meta_w - 40.0 {
+                    break;
+                }
+                let pill = Rect::new(x, row.rect.y + 3.0, w, ROW - 6.0);
+                let remote = name.contains('/');
+                let fill = if remote {
+                    palette.raised
+                } else {
+                    colour.fade(0.28)
+                };
+                ui.round(pill, (ROW - 6.0) / 2.0, fill)?;
+                ui.text(name, pill, &small, palette.text, Align::Center)?;
+                x += w + 4.0;
+            }
+            let subject_colour = if c.outgoing {
+                palette.text
+            } else {
+                palette.text.fade(0.85)
+            };
+            let body = Rect::new(x, row.rect.y, (right - meta_w - 8.0 - x).max(0.0), ROW);
+            ui.text_clipped(&c.subject, body, &font, subject_colour, Align::Start)?;
+            let meta_at = Rect::new(right - meta_w, row.rect.y, meta_w, ROW);
+            ui.text_clipped(&meta, meta_at, &small, palette.dim, Align::End)?;
+            Ok(())
+        })?;
+    scm.graph_picked = picked;
+    Ok(())
 }
 
 enum Line<'a> {
@@ -80,6 +208,16 @@ pub fn show(
         ask = Some(Ask::Commit);
     }
 
+    // the graph takes the lower part when there is history to show
+    let list = if status.history.is_empty() {
+        list
+    } else {
+        let wanted = (status.changes.len() as f32 + 3.0) * ROW;
+        let top_h = wanted.clamp(ROW * 3.0, list.height * 0.45);
+        let (top, bottom) = list.split_top(top_h, 6.0);
+        graph(ui, scm, status, bottom, texts)?;
+        top
+    };
     let staged: Vec<&Change> = status.changes.iter().filter(|c| c.staged()).collect();
     let changed: Vec<&Change> = status.changes.iter().filter(|c| c.unstaged()).collect();
     if staged.is_empty() && changed.is_empty() {

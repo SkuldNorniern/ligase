@@ -60,6 +60,8 @@ pub enum Id {
     ScmCommit,
     ScmList,
     ScmRow(u16),
+    /// the commit graph in source control.
+    ScmGraph,
     ReplaceInFiles,
     /// a tab of the terminal strip; `u16::MAX` is the add button.
     TerminalTab(u16),
@@ -2918,9 +2920,16 @@ impl App {
             return;
         }
         let root = self.explorer.root().to_path_buf();
-        self.changes_asked = self
-            .jobs
-            .run(move || Done::Changes(crate::git::status(&root)));
+        // the graph is read only while the panel is up
+        let graph = self.shows(Panel::Git);
+        self.changes_asked = self.jobs.run(move || {
+            let mut status = crate::git::status(&root);
+            if graph && let Some(s) = &mut status {
+                s.history = crate::git::graph::log(&s.top).unwrap_or_default();
+                s.rows = crate::git::graph::layout(&s.history);
+            }
+            Done::Changes(status)
+        });
     }
 
     /// replaces every hit of the search in its file. each file opens as a
