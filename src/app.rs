@@ -127,6 +127,8 @@ pub enum Command {
     NewTerminal,
     /// a markdown file read as a page, or back to its text.
     ToggleReading,
+    /// a shell on another machine, over ssh.
+    NewRemoteShell,
     ToggleProblems,
     ToggleGit,
     /// the focused file against HEAD.
@@ -273,6 +275,11 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("view.terminal", "Terminal", Command::ToggleTerminal),
     ("terminal.new", "New Terminal", Command::NewTerminal),
     (
+        "terminal.newRemote",
+        "New Remote Shell (ssh)",
+        Command::NewRemoteShell,
+    ),
+    (
         "markdown.read",
         "Toggle Reading View",
         Command::ToggleReading,
@@ -363,6 +370,8 @@ enum Target {
 /// what a prompt in the palette is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PromptFor {
+    /// a host for a shell over ssh.
+    RemoteShell,
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
@@ -990,6 +999,7 @@ impl App {
     /// its output wakes the canvas.
     fn start_shell(&mut self) {
         let id = self.shells.current_id();
+        let remote = self.shells.current().remote.clone();
         self.shells.current_mut().state = terminal::State::Starting;
         let root = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
@@ -999,7 +1009,7 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(id, terminal::spawn(&root, wake))
+            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), wake))
         };
         if !self.jobs.run(job) {
             self.shells
@@ -1371,6 +1381,13 @@ impl App {
                 }
             }
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
+            Command::NewRemoteShell => {
+                self.prompt_for = Some(PromptFor::RemoteShell);
+                let hint = self.texts.tr("user@host, as ssh takes it").to_owned();
+                self.palette.prompt(hint, String::new());
+                self.ui.focus(Id::PaletteField, 0);
+                return;
+            }
             Command::ToggleReading => {
                 let Some(view) = focus.or(self.last_editor) else {
                     return;
@@ -1776,12 +1793,33 @@ impl App {
         let Some(prompt) = self.prompt_for.take() else {
             return;
         };
+        if let PromptFor::RemoteShell = prompt {
+            let host = answer.trim();
+            if !terminal::host_ok(host) {
+                self.say(self.texts.tr("that host name won't do").to_owned());
+                return;
+            }
+            if self.shells.add_remote(host).is_none() {
+                self.say(
+                    self.texts
+                        .tr("that is all the shells there can be")
+                        .to_owned(),
+                );
+                return;
+            }
+            if !self.shows(Panel::Terminal) {
+                self.bench.toggle(Panel::Terminal);
+            }
+            self.ui.focus(Id::Terminal, 1);
+            return;
+        }
         let Some(name) = explorer::plain_name(answer) else {
             self.say(self.texts.tr("that name won't do").to_owned());
             return;
         };
         let name = name.to_owned();
         let job: Box<dyn FnOnce() -> Done + Send> = match prompt {
+            PromptFor::RemoteShell => return,
             PromptFor::NewFile(dir) => Box::new(move || {
                 let path = dir.join(&name);
                 Done::FileOp(explorer::create_file(&path).map(|()| FileDone {

@@ -70,6 +70,8 @@ pub struct Shell {
     dropped: u64,
     /// typed while the shell was starting; sent once it runs.
     early: String,
+    /// the host this shell runs on over ssh; none for this machine.
+    pub remote: Option<String>,
 }
 
 /// most shells in the panel.
@@ -138,6 +140,13 @@ impl Shells {
         Some(id)
     }
 
+    /// a new shell on `host` over ssh, in front. none past the cap.
+    pub fn add_remote(&mut self, host: &str) -> Option<u32> {
+        let id = self.add()?;
+        self.current_mut().remote = Some(host.to_owned());
+        Some(id)
+    }
+
     pub fn pick(&mut self, i: usize) {
         if i < self.list.len() {
             self.at = i;
@@ -175,7 +184,10 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
     let mut x = rect.x + 8.0;
     for (i, (_, shell)) in shells.list.iter().enumerate() {
         let n = u16::try_from(i).unwrap_or(u16::MAX);
-        let label = format!("{}", i + 1);
+        let label = match &shell.remote {
+            Some(host) => format!("⇄ {}", host.chars().take(24).collect::<String>()),
+            None => format!("{}", i + 1),
+        };
         let w = ui.text_width(&label, &font) + 34.0;
         let tab = Rect::new(x, rect.y + 3.0, w, rect.height - 6.0);
         let front = i == shells.at;
@@ -231,13 +243,37 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
     Ok(ask)
 }
 
-/// starts a shell in `root`. runs on the worker; `wake` runs on vanta's
-/// reader thread after each chunk of output.
-pub fn spawn(root: &Path, wake: impl Fn() + Send + 'static) -> Result<Terminal, String> {
-    let config = SpawnConfig {
+/// a host name ssh may be given: `user@host`, `host:port` is not ssh's
+/// way, but names, ips and `[v6]` are. never starts with `-`, so it can't
+/// pass as an option.
+pub fn host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.starts_with('-')
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@' | b':' | b'[' | b']')
+        })
+}
+
+/// starts a shell in `root`, or `ssh` to `remote` from there. runs on the
+/// worker; `wake` runs on vanta's reader thread after each chunk of output.
+pub fn spawn(
+    root: &Path,
+    remote: Option<&str>,
+    wake: impl Fn() + Send + 'static,
+) -> Result<Terminal, String> {
+    let mut config = SpawnConfig {
         cwd: Some(root.to_path_buf()),
         ..SpawnConfig::default()
     };
+    if let Some(host) = remote {
+        if !host_ok(host) {
+            return Err(format!("not a host name: {host}"));
+        }
+        // `--` ends ssh's options; the host can only be a host
+        config.program = Some("ssh".into());
+        config.args = vec!["-t".into(), "--".into(), host.into()];
+    }
     Terminal::spawn_notify(&config, wake).map_err(|e| e.to_string())
 }
 
@@ -575,6 +611,25 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosts_are_names_never_options() {
+        for ok in ["box", "eira@box.local", "10.0.0.2", "[::1]", "a_b-c"] {
+            assert!(host_ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-oProxyCommand=x",
+            "a b",
+            "a;b",
+            "a$(x)",
+            "a
+b",
+            "ü",
+        ] {
+            assert!(!host_ok(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn shells_add_pick_and_close() {
