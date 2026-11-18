@@ -62,6 +62,8 @@ pub enum Id {
     ScmRow(u16),
     /// the commit graph in source control.
     ScmGraph,
+    /// a repository's pill in source control.
+    ScmRepo(u16),
     /// the bar between the changes and the graph.
     ScmSplit,
     /// the remote folder's tree.
@@ -463,7 +465,8 @@ enum Done {
     GitHunks(DocumentId, Revision, Vec<crate::git::Hunk>),
     Branch(Option<String>),
     Recent(Vec<PathBuf>),
-    Changes(Option<crate::git::Status>),
+    /// the picked repository's state, and every repository's change count.
+    Changes(Option<crate::git::Status>, Vec<(PathBuf, usize)>),
     Diff(DocumentId, Revision, Vec<crate::git::DiffLine>),
     /// stage, unstage or commit came back; a commit says so.
     GitDid(Result<bool, String>),
@@ -582,6 +585,10 @@ pub struct App {
     /// the repository's changed files, for the source control panel; none
     /// outside a repository.
     changes: Option<crate::git::Status>,
+    /// every repository in the workspace and how many files changed in it.
+    repos: Vec<(PathBuf, usize)>,
+    /// the repository picked to work in; none for the first one.
+    repo_pick: Option<PathBuf>,
     /// git was asked for `changes` and answered, at least once.
     changes_known: bool,
     /// git was asked and hasn't answered yet.
@@ -690,6 +697,8 @@ impl App {
             status: String::new(),
             branch: None,
             changes: None,
+            repos: Vec::new(),
+            repo_pick: None,
             changes_known: false,
             changes_asked: false,
             scm: crate::git::view::Scm::default(),
@@ -2968,19 +2977,34 @@ impl App {
     /// asks git what changed in the repository, for the source control
     /// panel and the count on its rail button.
     fn refresh_status(&mut self) {
-        if !self.shows(Panel::Git) && self.branch.is_none() {
+        if !self.shows(Panel::Git) && self.branch.is_none() && self.repos.is_empty() {
             return;
         }
         let root = self.explorer.root().to_path_buf();
         // the graph is read only while the panel is up
         let graph = self.shows(Panel::Git);
+        let pick = self.repo_pick.clone();
         self.changes_asked = self.jobs.run(move || {
-            let mut status = crate::git::status(&root);
+            let tops = crate::git::repos(&root);
+            let mut counts = Vec::with_capacity(tops.len());
+            let mut status = None;
+            for top in &tops {
+                let s = crate::git::status(top);
+                counts.push((top.clone(), s.as_ref().map_or(0, |s| s.changes.len())));
+                let wanted = pick.as_ref().map_or(status.is_none(), |p| p == top);
+                if wanted {
+                    status = s;
+                }
+            }
+            // the picked one went away: the first one
+            if status.is_none() {
+                status = tops.first().and_then(|t| crate::git::status(t));
+            }
             if graph && let Some(s) = &mut status {
                 s.history = crate::git::graph::log(&s.top).unwrap_or_default();
                 s.rows = crate::git::graph::layout(&s.history);
             }
-            Done::Changes(status)
+            Done::Changes(status, counts)
         });
     }
 
@@ -3113,10 +3137,18 @@ impl App {
     /// what the source control panel asked for.
     fn scm_ask(&mut self, ask: crate::git::view::Ask) {
         use crate::git::view::Ask;
+        // another repository: the panel reads it, the card and pick reset
+        if let Ask::Repo(path) = ask {
+            self.repo_pick = Some(path);
+            self.scm.detail = None;
+            self.refresh_status();
+            return;
+        }
         let Some(top) = self.changes.as_ref().map(|s| s.top.clone()) else {
             return;
         };
         match ask {
+            Ask::Repo(_) => {}
             Ask::Show(id) => {
                 self.jobs
                     .run(move || Done::CommitShown(crate::git::graph::detail(&top, &id)));
@@ -3619,8 +3651,9 @@ impl App {
                 Done::Diff(doc, revision, rows) => {
                     self.diffs.insert(doc, (Some(revision), false, rows));
                 }
-                Done::Changes(status) => {
+                Done::Changes(status, repos) => {
                     self.changes = status;
+                    self.repos = repos;
                     self.changes_known = true;
                     self.changes_asked = false;
                 }
@@ -3919,6 +3952,7 @@ impl App {
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
+            let repos = &self.repos;
             let extensions = &mut self.extensions;
             let view_states = &mut self.view_states;
             let feeds = &self.feeds;
@@ -4072,7 +4106,7 @@ impl App {
                 }
                 Some(Panel::Git) => {
                     scm_asked = if changes_known {
-                        crate::git::view::show(ui, scm, changes.as_ref(), rect, texts)?
+                        crate::git::view::show(ui, scm, changes.as_ref(), repos, rect, texts)?
                     } else {
                         None
                     };
@@ -4731,7 +4765,16 @@ impl App {
         let (Some(v), Some(doc)) = (self.docs.view(view), self.docs.doc_of(view)) else {
             return;
         };
-        let Some(top) = self.changes.as_ref().map(|s| s.top.clone()) else {
+        // the repository holding the file: the deepest one around it
+        let Some(top) = self
+            .repos
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| doc.path.starts_with(p))
+            .max_by_key(|p| p.components().count())
+            .cloned()
+            .or_else(|| self.changes.as_ref().map(|s| s.top.clone()))
+        else {
             return;
         };
         let Ok(rel) = doc.path.strip_prefix(&top) else {
@@ -5068,7 +5111,12 @@ impl App {
             lit: panel.is_some_and(|p| self.shows(p)),
             badge,
         };
-        let changes = self.changes.as_ref().map_or(0, |s| s.changes.len());
+        // every repository's changes count on the rail
+        let changes = if self.repos.is_empty() {
+            self.changes.as_ref().map_or(0, |s| s.changes.len())
+        } else {
+            self.repos.iter().map(|(_, n)| n).sum()
+        };
         let problems: usize = self.docs.all().map(|d| d.diags.len()).sum();
         let mut top = vec![
             item(

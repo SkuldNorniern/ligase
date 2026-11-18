@@ -30,6 +30,8 @@ pub enum Ask {
     Commit,
     /// read this commit in full.
     Show(String),
+    /// work in this repository.
+    Repo(PathBuf),
 }
 
 /// the panel's own state.
@@ -360,17 +362,99 @@ fn letter_colour(ui: &Ui<'_, Id>, letter: char) -> aurea::render::Color {
     }
 }
 
+/// the repositories as pills, each with how many files changed; the one
+/// worked in lit. gives the one clicked.
+fn repo_pills(
+    ui: &mut Ui<'_, Id>,
+    repos: &[(PathBuf, usize)],
+    current: Option<&Path>,
+    rect: Rect,
+) -> AureaResult<Option<PathBuf>> {
+    let palette = ui.theme.palette;
+    let small = ui.theme.font(11.5);
+    let mut x = rect.x;
+    let mut y = rect.y;
+    let mut picked = None;
+    for (i, (path, count)) in repos.iter().enumerate() {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let label = if *count > 0 {
+            format!("{name}  {count}")
+        } else {
+            name
+        };
+        let w = ui.text_width(&label, &small) + 18.0;
+        if x + w > rect.right() && x > rect.x {
+            x = rect.x;
+            y += 26.0;
+        }
+        let pill = Rect::new(x, y, w.min(rect.width), 22.0);
+        let part = u16::try_from(i).unwrap_or(u16::MAX);
+        let input = ui.interact(Id::ScmRepo(part), 0, pill, Sense::Click, true);
+        let lit = current.is_some_and(|c| c == path.as_path());
+        let fill = if lit {
+            palette.accent.fade(0.22)
+        } else if input.hovered {
+            palette.hover
+        } else {
+            palette.raised
+        };
+        ui.round(pill, 11.0, fill)?;
+        let ink = if lit { palette.text } else { palette.dim };
+        ui.text(&label, pill, &small, ink, Align::Center)?;
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        if input.clicked {
+            picked = Some(path.clone());
+        }
+        x += w + 6.0;
+    }
+    Ok(picked)
+}
+
+/// how tall the pills take for `repos` at `width`.
+fn pills_height(ui: &mut Ui<'_, Id>, repos: &[(PathBuf, usize)], width: f32) -> f32 {
+    let small = ui.theme.font(11.5);
+    let mut x = 0.0;
+    let mut rows = 1.0;
+    for (path, count) in repos {
+        let name = path
+            .file_name()
+            .map_or(0.0, |n| ui.text_width(&n.to_string_lossy(), &small));
+        let w = name + if *count > 0 { 30.0 } else { 0.0 } + 18.0;
+        if x + w > width && x > 0.0 {
+            x = 0.0;
+            rows += 1.0;
+        }
+        x += w + 6.0;
+    }
+    rows * 26.0
+}
+
 pub fn show(
     ui: &mut Ui<'_, Id>,
     scm: &mut Scm,
     status: Option<&Status>,
+    repos: &[(PathBuf, usize)],
     rect: Rect,
     texts: &Texts,
 ) -> AureaResult<Option<Ask>> {
     let palette = ui.theme.palette;
     let font = ui.theme.font(13.0);
     let small = ui.theme.font(12.0);
-    let inner = rect.inset(PAD);
+    let mut inner = rect.inset(PAD);
+    // several repositories: pills to switch between them on top
+    if repos.len() > 1 {
+        let h = pills_height(ui, repos, inner.width);
+        let (pills, rest) = inner.split_top(h, 6.0);
+        if let Some(path) = repo_pills(ui, repos, status.map(|s| s.top.as_path()), pills)? {
+            return Ok(Some(Ask::Repo(path)));
+        }
+        inner = rest;
+    }
     let Some(status) = status else {
         let hint = texts.tr("Not a Git repository");
         ui.text(hint, inner, &small, palette.dim, Align::Center)?;

@@ -116,6 +116,67 @@ pub struct Status {
     pub rows: Vec<graph::Row>,
 }
 
+/// most repositories found under a workspace.
+pub const MAX_REPOS: usize = 32;
+/// how deep below the workspace repositories are looked for.
+const REPO_DEPTH: usize = 3;
+/// most folders looked in while finding them.
+const MAX_LOOKED: usize = 4000;
+
+/// the repositories of a workspace at `root`: the one it is in, if any,
+/// then ones in folders below it, a few levels down, in name order. runs
+/// on the worker.
+pub fn repos(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(top) = git(root, &["rev-parse", "--show-toplevel"])
+        .and_then(|t| String::from_utf8(t).ok())
+        .map(|t| PathBuf::from(t.trim()))
+    {
+        out.push(top);
+    }
+    let own = out.len();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut looked = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        looked += 1;
+        if looked > MAX_LOOKED || out.len() >= MAX_REPOS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with('.') && !crate::search::SKIP.iter().any(|s| name == *s)
+            })
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        for d in dirs.into_iter().rev() {
+            if d.join(".git").exists() && !out.iter().any(|o| same(o, &d)) {
+                out.push(d.clone());
+            }
+            if depth + 1 < REPO_DEPTH {
+                stack.push((d, depth + 1));
+            }
+        }
+    }
+    out.truncate(MAX_REPOS);
+    // the workspace's own first, the rest by path
+    out[own..].sort();
+    out
+}
+
+/// two paths name one folder, whatever their case and separators.
+fn same(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    norm(a) == norm(b)
+}
+
 /// changes past this many are not listed.
 const MAX_CHANGES: usize = 5000;
 
@@ -456,6 +517,33 @@ pub fn hunks(base: &str, now: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_repositories_below_a_workspace() {
+        let dir = std::env::temp_dir().join(format!("ligase-repos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for p in [
+            "b/.git",
+            "a/.git",
+            "deep/x/y/.git",
+            "deeper/1/2/3/.git",
+            "target/t/.git",
+            ".hid/.git",
+        ] {
+            std::fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        let found: Vec<String> = repos(&dir)
+            .iter()
+            .filter_map(|p| p.strip_prefix(&dir).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            found,
+            ["a", "b", "deep/x/y"],
+            "three deep, skipped and hidden folders out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn kinds(base: &str, now: &str) -> Vec<(Range<usize>, Kind)> {
         hunks(base, now)
