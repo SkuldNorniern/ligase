@@ -550,6 +550,8 @@ pub struct App {
     blame_asked: Option<(ViewId, usize, Revision)>,
     /// the rail is out at its edge (shown only at the edge).
     rail_out: bool,
+    /// frame times, kept only when `LIGASE_FRAME_STATS` is set.
+    frame_stats: Option<FrameStats>,
     /// the remote folder in the side bar, while one is open.
     remote: Option<crate::remote::browse::Browser>,
     /// local copies of remote files: where each goes back to on save.
@@ -701,6 +703,7 @@ impl App {
             remote: None,
             remote_files: HashMap::new(),
             rail_out: false,
+            frame_stats: std::env::var_os("LIGASE_FRAME_STATS").map(|_| FrameStats::default()),
             previews: crate::preview::Previews::default(),
             want_signature: None,
             line_clip: None,
@@ -3996,7 +3999,17 @@ impl App {
     /// # Errors
     ///
     /// what drawing reports.
+    /// draws a frame; with `LIGASE_FRAME_STATS` set, times it too.
     pub fn draw(&mut self, ctx: &mut dyn DrawingContext) -> AureaResult<()> {
+        let start = Instant::now();
+        let result = self.draw_frame(ctx);
+        if let Some(stats) = &mut self.frame_stats {
+            stats.add(start.elapsed());
+        }
+        result
+    }
+
+    fn draw_frame(&mut self, ctx: &mut dyn DrawingContext) -> AureaResult<()> {
         self.poll();
         ctx.clear(self.theme.palette.background)?;
         let area = Rect::new(0.0, 0.0, ctx.width() as f32, ctx.height() as f32);
@@ -5717,6 +5730,40 @@ fn word_around(text: &resolvase::TextSnapshot, at: usize) -> Range<usize> {
     span.start + start..span.start + end
 }
 
+/// frame times for measuring: every `FrameStats::EVERY` frames the
+/// average, the 95th percentile and the worst go to stderr.
+#[derive(Default)]
+struct FrameStats {
+    times: Vec<f32>,
+}
+
+impl FrameStats {
+    const EVERY: usize = 120;
+
+    fn add(&mut self, took: std::time::Duration) {
+        self.times.push(took.as_secs_f32() * 1000.0);
+        if self.times.len() >= Self::EVERY {
+            let (avg, p95, max) = summary(&mut self.times);
+            eprintln!(
+                "frames: {} avg {avg:.2} ms, p95 {p95:.2} ms, max {max:.2} ms",
+                Self::EVERY
+            );
+            self.times.clear();
+        }
+    }
+}
+
+/// average, 95th percentile and largest of `times` (sorted in place).
+fn summary(times: &mut [f32]) -> (f32, f32, f32) {
+    if times.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    times.sort_by(f32::total_cmp);
+    let avg = times.iter().sum::<f32>() / times.len() as f32;
+    let p95 = times[((times.len() - 1) as f32 * 0.95) as usize];
+    (avg, p95, times[times.len() - 1])
+}
+
 fn keymap() -> Keymap<Command> {
     let mut map = Keymap::new();
     map.bind(Chord::command(KeyCode::S), Command::Save)
@@ -5819,6 +5866,13 @@ fn keymap() -> Keymap<Command> {
 mod tests {
     use super::*;
     use aurea::dialog::MessageChoice;
+
+    #[test]
+    fn frame_summary() {
+        let mut t = vec![3.0, 1.0, 2.0, 10.0];
+        assert_eq!(summary(&mut t), (4.0, 3.0, 10.0));
+        assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
+    }
 
     #[test]
     fn the_word_under_the_pointer() {
