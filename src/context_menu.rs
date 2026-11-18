@@ -18,6 +18,8 @@ pub enum Act {
     Rename,
     Delete,
     Reveal,
+    /// opens the file and shows its preview.
+    Preview,
     CopyPath,
     CloseOthers,
     CloseAll,
@@ -96,11 +98,15 @@ impl ContextMenu {
 }
 
 /// rows for a right click on an explorer entry, or on its empty space.
-pub fn explorer(on_entry: bool) -> Vec<Entry> {
+pub fn explorer(on_entry: bool, previews: bool) -> Vec<Entry> {
     let mut rows = vec![
         Entry::Item("New File", Act::NewFile),
         Entry::Item("New Folder", Act::NewFolder),
     ];
+    if previews {
+        rows.insert(0, Entry::Line);
+        rows.insert(0, Entry::Item("Open Preview", Act::Preview));
+    }
     if on_entry {
         rows.extend([
             Entry::Line,
@@ -119,7 +125,7 @@ pub fn editor() -> Vec<Entry> {
     use crate::editor::LineOp;
     vec![
         Entry::Item("Quick Fix", Act::Run(Command::CodeActions)),
-        Entry::Item("Reading View", Act::Run(Command::ToggleReading)),
+        Entry::Item("Preview", Act::Run(Command::TogglePreview)),
         Entry::Item("Go to Definition", Act::Run(Command::GotoDefinition)),
         Entry::Item("Find References", Act::Run(Command::References)),
         Entry::Item("Rename Symbol", Act::Run(Command::Rename)),

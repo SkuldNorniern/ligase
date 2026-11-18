@@ -1017,9 +1017,18 @@ fn chip(ui: &mut Ui<'_, Id>, id: ViewId, strip: Rect, label: &str) -> AureaResul
     let palette = ui.theme.palette;
     let font = ui.theme.font(11.5);
     let w = ui.text_width(label, &font) + 20.0;
-    let at = Rect::new(strip.x + strip.width - w - 14.0, strip.y + 3.0, w, strip.height - 6.0);
+    let at = Rect::new(
+        strip.x + strip.width - w - 14.0,
+        strip.y + 3.0,
+        w,
+        strip.height - 6.0,
+    );
     let input = ui.interact(Id::Crumb(id), u16::MAX - 1, at, Sense::Click, true);
-    let fill = if input.hovered { palette.hover } else { palette.raised };
+    let fill = if input.hovered {
+        palette.hover
+    } else {
+        palette.raised
+    };
     ui.round(at, at.height / 2.0, fill)?;
     ui.text(label, at, &font, palette.dim, Align::Center)?;
     if input.hovered {

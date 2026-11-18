@@ -178,6 +178,11 @@ impl Documents {
 
     /// takes the file types extensions add now. open files whose language
     /// changes start their colours over.
+    /// the language a file at `path` opens in.
+    pub fn language_of(&self, path: &Path) -> Option<&'static str> {
+        syntax::language_for(path, &self.associations)
+    }
+
     pub fn set_associations(&mut self, associations: syntax::Associations) {
         self.associations = associations;
         for doc in self.docs.values_mut() {

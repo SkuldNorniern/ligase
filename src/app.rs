@@ -126,7 +126,7 @@ pub enum Command {
     /// another shell in the terminal panel.
     NewTerminal,
     /// a markdown file read as a page, or back to its text.
-    ToggleReading,
+    TogglePreview,
     /// a shell on another machine, over ssh.
     NewRemoteShell,
     ToggleProblems,
@@ -279,11 +279,7 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
         "New Remote Shell (ssh)",
         Command::NewRemoteShell,
     ),
-    (
-        "markdown.read",
-        "Toggle Reading View",
-        Command::ToggleReading,
-    ),
+    ("markdown.read", "Toggle Preview", Command::TogglePreview),
     ("view.problems", "Problems", Command::ToggleProblems),
     ("view.sourceControl", "Source Control", Command::ToggleGit),
     ("view.extensions", "Extensions", Command::ToggleExtensions),
@@ -410,12 +406,8 @@ enum Done {
         Result<Option<document::Stamp>, String>,
     ),
     Shell(u32, Result<vanta::Terminal, String>),
-    /// a markdown view's text, parsed.
-    Markdown(
-        ViewId,
-        Revision,
-        Vec<(usize, crate::markdown::parse::Block)>,
-    ),
+    /// a previewed view's text, parsed for its kind.
+    Preview(ViewId, Revision, crate::preview::Parsed),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
@@ -474,7 +466,7 @@ pub struct App {
     /// the card shown for the word the pointer rests on.
     peek: Option<Peek>,
     /// markdown views read as pages.
-    readers: crate::markdown::read::Readers,
+    previews: crate::preview::Previews,
     /// signature help to ask for once the text is synced.
     want_signature: Option<ViewId>,
     /// a whole line copied with nothing selected; pasting it goes in above.
@@ -608,7 +600,7 @@ impl App {
             signature: None,
             pointing: None,
             peek: None,
-            readers: crate::markdown::read::Readers::default(),
+            previews: crate::preview::Previews::default(),
             want_signature: None,
             line_clip: None,
             zoom: editor::SIZE,
@@ -1388,13 +1380,13 @@ impl App {
                 self.ui.focus(Id::PaletteField, 0);
                 return;
             }
-            Command::ToggleReading => {
+            Command::TogglePreview => {
                 let Some(view) = focus.or(self.last_editor) else {
                     return;
                 };
-                if let Some(reader) = self.readers.remove(&view) {
-                    // back to the text where the page was
-                    if let Some(line) = reader.top_line()
+                if let Some(preview) = self.previews.remove(&view) {
+                    // back to the text where the preview was
+                    if let Some(line) = preview.top_line()
                         && let Some(v) = self.docs.view_mut(view)
                     {
                         v.goto = Some((Point::new(line, 0), Encoding::Utf32));
@@ -1404,17 +1396,16 @@ impl App {
                 let Some(doc) = self.docs.doc_of(view) else {
                     return;
                 };
-                if doc.language != Some("markdown") {
-                    self.say(self.texts.tr("only markdown reads as a page").to_owned());
+                let Some(kind) = crate::preview::kind_for(doc.language) else {
+                    self.say(self.texts.tr("this file has no preview").to_owned());
                     return;
-                }
+                };
                 let line = self
                     .docs
                     .view(view)
                     .and_then(|v| doc.buffer.text().line_of(v.sel.head).ok());
-                let mut reader = crate::markdown::read::Reader::default();
-                reader.reveal_line = line;
-                self.readers.insert(view, reader);
+                self.previews
+                    .insert(view, crate::preview::Preview::new(kind, line));
                 return;
             }
             Command::NewTerminal => {
@@ -1747,6 +1738,17 @@ impl App {
                     self.jobs.run(move || {
                         Done::Note(aurea::reveal_path(&path).err().map(|e| e.to_string()))
                     });
+                }
+            }
+            Act::Preview => {
+                if let Some(path) = path {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                    if !self.previews.contains_key(&view) {
+                        self.focus = Some(view);
+                        self.run(Command::TogglePreview);
+                    }
                 }
             }
             Act::CopyPath => {
@@ -3455,11 +3457,11 @@ impl App {
                         self.after_save(doc, false);
                     }
                 },
-                Done::Markdown(view, revision, blocks) => {
-                    if let Some(reader) = self.readers.get_mut(&view)
-                        && reader.asked == Some(revision)
+                Done::Preview(view, revision, parsed) => {
+                    if let Some(preview) = self.previews.get_mut(&view)
+                        && preview.asked == Some(revision)
                     {
-                        reader.set(revision, blocks);
+                        preview.set(revision, parsed);
                     }
                 }
                 Done::Shell(id, result) => {
@@ -3704,7 +3706,7 @@ impl App {
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let mut crumb: Option<(editor::Crumb, ViewId)> = None;
-        let mut read_ask: Option<(ViewId, crate::markdown::read::Ask)> = None;
+        let mut read_ask: Option<(ViewId, crate::preview::Ask)> = None;
         let mut pointer: Option<(ViewId, usize, aurea::render::Point)> = None;
         let menu_act;
         let mut focus = None;
@@ -3769,7 +3771,7 @@ impl App {
             let shells = &mut self.shells;
             let hover = &hover_now;
             let peek_now = &self.peek;
-            let readers = &mut self.readers;
+            let previews = &mut self.previews;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
@@ -3797,8 +3799,8 @@ impl App {
                     let Some(doc_id) = docs.view(view).map(|v| v.doc) else {
                         return Ok(());
                     };
-                    if let Some(reader) = readers.get_mut(&view) {
-                        if let Some(ask) = crate::markdown::read::show(ui, view, reader, rect)? {
+                    if let Some(preview) = previews.get_mut(&view) {
+                        if let Some(ask) = preview.show(ui, view, rect)? {
                             read_ask = Some((view, ask));
                         }
                         return Ok(());
@@ -4173,19 +4175,23 @@ impl App {
             let root = self.explorer.root().to_path_buf();
             let entry = entry.filter(|(path, _)| *path != root);
             let on_entry = entry.is_some();
+            let previews = entry.as_ref().is_some_and(|(path, dir)| {
+                !dir && crate::preview::kind_for(self.docs.language_of(path)).is_some()
+            });
             self.menu_target = Some(match entry {
                 Some((path, dir)) => Target::Entry(path, dir),
                 None => Target::Root,
             });
-            self.menu.ask(at, context_menu::explorer(on_entry));
+            self.menu
+                .ask(at, context_menu::explorer(on_entry, previews));
         }
         self.point_at(pointer);
         match read_ask {
-            Some((view, crate::markdown::read::Ask::Open(url))) => self.open_link(view, &url),
-            Some((view, crate::markdown::read::Ask::Edit)) => {
+            Some((view, crate::preview::Ask::Open(url))) => self.open_link(view, &url),
+            Some((view, crate::preview::Ask::Edit)) => {
                 self.focus = Some(view);
                 self.last_editor = Some(view);
-                self.run(Command::ToggleReading);
+                self.run(Command::TogglePreview);
             }
             None => {}
         }
@@ -4195,7 +4201,7 @@ impl App {
                 editor::Crumb::Symbols => self.run(Command::GotoSymbol),
                 editor::Crumb::Read => {
                     self.focus = Some(view);
-                    self.run(Command::ToggleReading);
+                    self.run(Command::TogglePreview);
                 }
                 editor::Crumb::Folder(folder) => {
                     // quick open, narrowed to that folder
@@ -4409,9 +4415,9 @@ impl App {
     /// closed views go.
     fn ask_pages(&mut self) {
         let docs = &self.docs;
-        self.readers.retain(|v, _| docs.view(*v).is_some());
+        self.previews.retain(|v, _| docs.view(*v).is_some());
         let mut jobs = Vec::new();
-        for (&view, reader) in &mut self.readers {
+        for (&view, reader) in &mut self.previews {
             let Some(doc) = self.docs.doc_of(view) else {
                 continue;
             };
@@ -4420,12 +4426,12 @@ impl App {
                 continue;
             }
             reader.asked = Some(revision);
-            jobs.push((view, revision, doc.buffer.snapshot()));
+            jobs.push((view, revision, reader.kind, doc.buffer.snapshot()));
         }
-        for (view, revision, snap) in jobs {
+        for (view, revision, kind, snap) in jobs {
             self.jobs.run(move || {
                 let text = snap.slice(0..snap.len()).unwrap_or_default();
-                Done::Markdown(view, revision, crate::markdown::parse::parse(&text))
+                Done::Preview(view, revision, crate::preview::parse(kind, &text))
             });
         }
     }
@@ -5193,7 +5199,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::Grave).shift(), Command::NewTerminal)
-        .bind(Chord::command(KeyCode::V).shift(), Command::ToggleReading)
+        .bind(Chord::command(KeyCode::V).shift(), Command::TogglePreview)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)

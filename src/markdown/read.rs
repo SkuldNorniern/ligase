@@ -1,8 +1,6 @@
 //! markdown as a page to read: blocks measured once per width, drawn in a
 //! centred column, links that open.
 
-use std::collections::HashMap;
-
 use aurea::render::{Color, Font, FontStyle, FontWeight, Rect};
 use aurea::ui::{Align, Palette, ScrollArea, Sense, Ui};
 use aurea::{AureaResult, CursorIcon};
@@ -10,6 +8,7 @@ use aurea::{AureaResult, CursorIcon};
 use super::parse::{Block, Span, Style};
 use crate::app::Id;
 use crate::document::ViewId;
+use crate::preview::Ask;
 
 /// widest the text column gets; past this lines are hard to follow.
 const COLUMN: f32 = 760.0;
@@ -23,13 +22,9 @@ const INDENT: f32 = 22.0;
 /// table columns never get narrower than this.
 const MIN_COL: f32 = 60.0;
 
-/// one view's page: what it was made from and how it was laid out.
+/// one view's page and how it was laid out.
 #[derive(Default)]
 pub struct Reader {
-    /// the text revision the blocks came from.
-    pub made_from: Option<resolvase::Revision>,
-    /// a parse is out for this revision.
-    pub asked: Option<resolvase::Revision>,
     pub blocks: Vec<(usize, Block)>,
     laid: Option<Laid>,
     pub scroll: f32,
@@ -38,9 +33,8 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// new blocks for `revision`; the layout is made again.
-    pub fn set(&mut self, revision: resolvase::Revision, blocks: Vec<(usize, Block)>) {
-        self.made_from = Some(revision);
+    /// new blocks; the layout is made again.
+    pub fn set(&mut self, blocks: Vec<(usize, Block)>) {
         self.blocks = blocks;
         self.laid = None;
     }
@@ -111,14 +105,6 @@ impl Shade {
             Shade::Border => p.border,
         }
     }
-}
-
-/// what a click on the page asks for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Ask {
-    Open(String),
-    /// back to the text.
-    Edit,
 }
 
 struct Fonts {
@@ -606,7 +592,11 @@ pub fn show(
     let w = ui.text_width(label, &font) + 22.0;
     let at = Rect::new(rect.x + rect.width - w - 22.0, rect.y + 10.0, w, 24.0);
     let input = ui.interact(Id::Reader(view), 0, at, Sense::Click, true);
-    let fill = if input.hovered { palette.hover } else { palette.raised };
+    let fill = if input.hovered {
+        palette.hover
+    } else {
+        palette.raised
+    };
     ui.round(at, 12.0, fill)?;
     ui.text(label, at, &font, palette.dim, Align::Center)?;
     if input.hovered {
@@ -617,6 +607,3 @@ pub fn show(
     }
     Ok(ask)
 }
-
-/// readers by view; one exists while its view reads.
-pub type Readers = HashMap<ViewId, Reader>;
