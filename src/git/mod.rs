@@ -2,6 +2,7 @@
 //! and the branch. git runs as a program on the file worker; no repository
 //! is ever read on the ui thread.
 
+pub mod blame;
 pub mod diff;
 pub mod graph;
 pub mod view;

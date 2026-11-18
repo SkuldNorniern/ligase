@@ -913,6 +913,8 @@ pub struct Look<'a> {
     pub hover: Option<&'a str>,
     /// the card for what the pointer rests on, and where it rests.
     pub peek: Option<(&'a str, Point)>,
+    /// who last changed the caret's line, shown dim at its end.
+    pub blame: Option<&'a str>,
     /// find bar matches, sorted, and the picked one.
     pub found: &'a [Range<usize>],
     pub current: Option<Range<usize>>,
@@ -1734,6 +1736,22 @@ pub fn show(
                     )?;
                     squiggles(ui, &font, &laid, &doc.diags, span.clone(), body, line_h)?;
                     let drawn_w = ui.text_width(&laid.drawn, &font);
+                    // the caret line's last row ends with who changed it
+                    if let Some(note) = look.blame
+                        && line == caret_line
+                        && last_piece
+                        && focused
+                    {
+                        let at = Rect::new(
+                            body.x + drawn_w + char_w * 4.0,
+                            y,
+                            (area.x + area.width - body.x - drawn_w).max(0.0),
+                            line_h,
+                        );
+                        let small = Font::new(&font.family, (look.size - 1.0).max(9.0))
+                            .with_style(aurea::render::FontStyle::Italic);
+                        ui.text_clipped(note, at, &small, palette.faint, Align::Start)?;
+                    }
                     widest = widest.max(drawn_w);
                     // spaces as dots and tabs as arrows, everywhere or in
                     // the selection only

@@ -62,6 +62,8 @@ pub enum Id {
     ScmRow(u16),
     /// the commit graph in source control.
     ScmGraph,
+    /// the bar between the changes and the graph.
+    ScmSplit,
     ReplaceInFiles,
     /// a tab of the terminal strip; `u16::MAX` is the add button.
     TerminalTab(u16),
@@ -408,6 +410,13 @@ enum Done {
         Result<Option<document::Stamp>, String>,
     ),
     Shell(u32, Result<vanta::Terminal, String>),
+    /// who last changed a line, or why not.
+    Blame(
+        ViewId,
+        usize,
+        Revision,
+        Result<crate::git::blame::Blame, String>,
+    ),
     /// a previewed view's text, parsed for its kind.
     Preview(ViewId, Revision, crate::preview::Parsed),
     Server(&'static str, Result<lsp::server::Server, String>),
@@ -467,6 +476,10 @@ pub struct App {
     pointing: Option<(ViewId, Range<usize>, aurea::render::Point, Instant)>,
     /// the card shown for the word the pointer rests on.
     peek: Option<Peek>,
+    /// who last changed the caret's line: for which view, line and text.
+    blame: Option<(ViewId, usize, Revision, String)>,
+    /// the blame asked for last.
+    blame_asked: Option<(ViewId, usize, Revision)>,
     /// markdown views read as pages.
     previews: crate::preview::Previews,
     /// signature help to ask for once the text is synced.
@@ -602,6 +615,8 @@ impl App {
             signature: None,
             pointing: None,
             peek: None,
+            blame: None,
+            blame_asked: None,
             previews: crate::preview::Previews::default(),
             want_signature: None,
             line_clip: None,
@@ -3341,6 +3356,7 @@ impl App {
         }
         self.ask_feeds();
         self.ask_pages();
+        self.ask_blame();
         if let Some(view) = self.want_complete.take() {
             self.complete_for = Some(view);
             // no server: extension snippets alone, and only on a word, not
@@ -3455,6 +3471,20 @@ impl App {
                         self.after_save(doc, false);
                     }
                 },
+                Done::Blame(view, line, revision, result) => {
+                    self.blame = result.ok().map(|b| {
+                        let note = if b.uncommitted {
+                            self.texts.tr("Not committed yet").to_owned()
+                        } else {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+                            let when = crate::git::graph::ago(now, b.time);
+                            format!("{}, {when} · {}", b.author, b.summary)
+                        };
+                        (view, line, revision, note)
+                    });
+                }
                 Done::Preview(view, revision, parsed) => {
                     if let Some(preview) = self.previews.get_mut(&view)
                         && preview.asked == Some(revision)
@@ -3769,6 +3799,7 @@ impl App {
             let shells = &mut self.shells;
             let hover = &hover_now;
             let peek_now = &self.peek;
+            let blame_now = &self.blame;
             let previews = &mut self.previews;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
@@ -3826,6 +3857,10 @@ impl App {
                             size: zoom,
                             idle,
                             hover,
+                            blame: blame_now
+                                .as_ref()
+                                .filter(|(v, ..)| *v == view)
+                                .map(|(.., note)| note.as_str()),
                             peek: peek_now
                                 .as_ref()
                                 .filter(|k| k.view == view && !k.text.is_empty())
@@ -4407,6 +4442,60 @@ impl App {
         {
             self.peek = None;
         }
+    }
+
+    /// who changed the caret's line, asked once the caret rests there.
+    fn ask_blame(&mut self) {
+        const REST: std::time::Duration = std::time::Duration::from_millis(500);
+        let Some(view) = self.focus else {
+            return;
+        };
+        let (Some(v), Some(doc)) = (self.docs.view(view), self.docs.doc_of(view)) else {
+            return;
+        };
+        let Some(top) = self.changes.as_ref().map(|s| s.top.clone()) else {
+            return;
+        };
+        let Ok(rel) = doc.path.strip_prefix(&top) else {
+            return;
+        };
+        let text = doc.buffer.text();
+        let Ok(line) = text.line_of(v.sel.head) else {
+            return;
+        };
+        let key = (view, line, doc.buffer.revision());
+        if self
+            .blame
+            .as_ref()
+            .is_some_and(|(bv, bl, br, _)| (*bv, *bl, *br) != key)
+        {
+            self.blame = None;
+        }
+        if self.blame_asked == Some(key) {
+            return;
+        }
+        if self.typed_at.elapsed() < REST {
+            if let Some(canvas) = self.canvas {
+                request_canvas_redraw_at(canvas, self.typed_at + REST);
+            }
+            return;
+        }
+        if doc.untitled || text.len() > crate::git::blame::MAX_TEXT {
+            return;
+        }
+        self.blame_asked = Some(key);
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let snap = doc.buffer.snapshot();
+        let (revision, top) = (key.2, top);
+        self.jobs.run(move || {
+            let body = snap.slice(0..snap.len()).unwrap_or_default();
+            Done::Blame(
+                view,
+                line,
+                revision,
+                crate::git::blame::line(&top, &rel, line, &body),
+            )
+        });
     }
 
     /// pages whose text moved on are parsed again on the worker; pages of
