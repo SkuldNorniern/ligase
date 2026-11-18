@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use aurea::AureaResult;
 use aurea::render::Rect;
-use aurea::ui::{Align, Button, ListView, TextField, Ui};
+use aurea::ui::{Align, Button, ListView, Splitter, TextField, Ui};
 
 use super::{Change, Status};
 use crate::app::Id;
@@ -37,6 +37,9 @@ pub struct Scm {
     picked: Option<usize>,
     graph_scroll: f32,
     graph_picked: Option<usize>,
+    /// where the changes end and the graph starts, from the list's top;
+    /// none until dragged.
+    graph_at: Option<f32>,
 }
 
 /// lane colours, by lane, round and round.
@@ -213,8 +216,21 @@ pub fn show(
         list
     } else {
         let wanted = (status.changes.len() as f32 + 3.0) * ROW;
-        let top_h = wanted.clamp(ROW * 3.0, list.height * 0.45);
-        let (top, bottom) = list.split_top(top_h, 6.0);
+        let mut at = scm
+            .graph_at
+            .unwrap_or_else(|| wanted.clamp(ROW * 3.0, list.height * 0.45))
+            .min(list.height - ROW * 3.0)
+            .max(ROW * 2.0);
+        let (top, bottom, moved) = Splitter::new(&mut at)
+            .stacked()
+            .min(ROW * 2.0, ROW * 3.0)
+            .threshold(2.0)
+            .whole_pixels(true)
+            .label(texts.tr("Graph"))
+            .show(ui, Id::ScmSplit, list)?;
+        if moved.changed {
+            scm.graph_at = Some(at);
+        }
         graph(ui, scm, status, bottom, texts)?;
         top
     };
