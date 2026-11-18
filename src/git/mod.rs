@@ -9,10 +9,12 @@ pub mod view;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use resolvase::Revision;
 
@@ -47,14 +49,18 @@ pub struct State {
     pub pending: bool,
 }
 
-/// runs git in `dir`; its output, or what it said went wrong. pathspecs are
-/// taken literally, so a file named `*` is only that file.
-fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+/// fetch, pull and push past this long are killed.
+const SYNC_LIMIT: Duration = Duration::from_secs(120);
+
+/// the git command for `args` in `dir`, no window, no prompts: a credential
+/// question fails instead of waiting on a terminal nobody sees.
+fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("--literal-pathspecs")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null());
     #[cfg(windows)]
     {
@@ -62,11 +68,24 @@ fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+    cmd
+}
+
+/// runs git in `dir`; its output, or what it said went wrong. pathspecs are
+/// taken literally, so a file named `*` is only that file.
+fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = command(dir, args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
         return Ok(out.stdout);
     }
-    // some refusals ("nothing added to commit") come on stdout instead
+    Err(refusal(&out.stdout, &out.stderr))
+}
+
+/// what git said went wrong: its first line, from stderr or else stdout
+/// (some refusals, "nothing added to commit", come on stdout).
+fn refusal(stdout: &[u8], stderr: &[u8]) -> String {
     let first = |bytes: &[u8]| {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -74,9 +93,64 @@ fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             .find(|l| !l.is_empty())
             .map(str::to_owned)
     };
-    Err(first(&out.stderr)
-        .or_else(|| first(&out.stdout))
-        .unwrap_or_else(|| "git failed".to_owned()))
+    first(stderr)
+        .or_else(|| first(stdout))
+        .unwrap_or_else(|| "git failed".to_owned())
+}
+
+/// reads a pipe to its end on its own thread, so a full pipe never stalls git.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// like `run`, for the network commands: killed past `SYNC_LIMIT`. the
+/// answer is git's first line, or nothing, when it worked.
+fn run_limited(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut child: Child = command(dir, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < SYNC_LIMIT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("git took too long".to_owned());
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("git: {e}"));
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        return Err(refusal(&stdout, &stderr));
+    }
+    // progress and summaries come on either stream, depending on the command
+    let line = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_owned)
+    };
+    Ok(line(&stderr).or_else(|| line(&stdout)).unwrap_or_default())
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -114,6 +188,8 @@ pub struct Status {
     /// recent history for the graph, and its lanes; empty until asked.
     pub history: Vec<graph::Commit>,
     pub rows: Vec<graph::Row>,
+    /// the branch and its counts against the upstream; none until asked.
+    pub tracking: Option<Tracking>,
 }
 
 /// most repositories found under a workspace.
@@ -193,6 +269,7 @@ pub fn status(dir: &Path) -> Option<Status> {
         top,
         history: Vec::new(),
         rows: Vec::new(),
+        tracking: None,
     })
 }
 
@@ -255,6 +332,136 @@ pub fn discard(top: &Path, rels: &[String]) -> Result<(), String> {
 /// commits what is staged with `message`.
 pub fn commit(top: &Path, message: &str) -> Result<(), String> {
     run(top, &["commit", "--quiet", "-m", message]).map(drop)
+}
+
+/// the branch checked out and how far it is from its upstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tracking {
+    /// the branch's name; the short commit when detached.
+    pub branch: String,
+    /// the remote branch it follows, as `origin/main`; none when it has none.
+    pub upstream: Option<String>,
+    /// commits here that the upstream doesn't have.
+    pub ahead: usize,
+    /// commits upstream that aren't here.
+    pub behind: usize,
+}
+
+/// the branch under `top` and its counts against the upstream. none when
+/// git isn't there or there is no commit yet.
+pub fn tracking(top: &Path) -> Option<Tracking> {
+    let branch = match current_branch(top) {
+        Some(name) => name,
+        None => git(top, &["rev-parse", "--short", "HEAD"]).and_then(one_line)?,
+    };
+    let up = git(
+        top,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .and_then(one_line);
+    let counts = up
+        .as_ref()
+        .and_then(|_| {
+            git(
+                top,
+                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            )
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_counts(&text));
+    let (upstream, ahead, behind) = match counts {
+        Some((ahead, behind)) => (up, ahead, behind),
+        // no upstream, or one git can't count against: nothing to pull or push
+        None => (None, 0, 0),
+    };
+    Some(Tracking {
+        branch,
+        upstream,
+        ahead,
+        behind,
+    })
+}
+
+/// `rev-list --left-right --count` output: the left count, then the right,
+/// tab apart. left is ahead here, right is behind.
+fn parse_counts(text: &str) -> Option<(usize, usize)> {
+    let mut parts = text.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((ahead, behind))
+}
+
+/// the checked out branch's name; none when detached.
+fn current_branch(top: &Path) -> Option<String> {
+    git(top, &["symbolic-ref", "--short", "-q", "HEAD"]).and_then(one_line)
+}
+
+/// the first non-empty line of git's output, trimmed.
+fn one_line(bytes: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(bytes).ok()?;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.to_owned())
+}
+
+fn has_origin(top: &Path) -> bool {
+    git(top, &["remote"])
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|text| text.lines().any(|l| l.trim() == "origin"))
+}
+
+/// fetches every remote, dropping the branches they deleted.
+pub fn fetch(top: &Path) -> Result<String, String> {
+    run_limited(top, &["fetch", "--prune"])
+}
+
+/// fast-forwards the current branch to its upstream. never a merge commit
+/// or a rebase: a branch that has diverged is refused.
+pub fn pull(top: &Path) -> Result<String, String> {
+    run_limited(top, &["pull", "--ff-only"])
+}
+
+/// pushes the current branch. with no upstream yet, sets `origin` as it
+/// when there is an origin remote.
+pub fn push(top: &Path) -> Result<String, String> {
+    let has_upstream = tracking(top).is_some_and(|t| t.upstream.is_some());
+    if has_upstream {
+        return run_limited(top, &["push"]);
+    }
+    match current_branch(top) {
+        Some(branch) if has_origin(top) => {
+            run_limited(top, &["push", "-u", "origin", branch.as_str()])
+        }
+        _ => Err("No upstream branch".to_owned()),
+    }
+}
+
+/// the local branches, in git's order. a list past `MAX_BRANCHES` is cut.
+pub fn branches(top: &Path) -> Result<Vec<String>, String> {
+    let out = run(top, &["branch", "--format=%(refname:short)"])?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(MAX_BRANCHES)
+        .map(str::to_owned)
+        .collect())
+}
+
+/// most branches listed in the picker.
+const MAX_BRANCHES: usize = 500;
+
+/// checks out the local branch `name`. a name that could read as an option
+/// is refused before git sees it.
+pub fn switch(top: &Path, name: &str) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(format!("not a branch: {name}"));
+    }
+    run(top, &["switch", "--no-guess", name]).map(drop)
 }
 
 /// the file's text at HEAD. none when git isn't there, the file isn't in a
@@ -651,5 +858,34 @@ mod tests {
             }
             assert!(marked.iter().all(|&i| i < now.len()));
         }
+    }
+
+    #[test]
+    fn rev_list_counts() {
+        assert_eq!(parse_counts("3\t1\n"), Some((3, 1)), "ahead, then behind");
+        assert_eq!(parse_counts("0 0\n"), Some((0, 0)));
+        assert_eq!(parse_counts(""), None);
+        assert_eq!(parse_counts("3"), None);
+        assert_eq!(parse_counts("1 2 3"), None);
+        assert_eq!(parse_counts("x\ty"), None);
+    }
+
+    #[test]
+    fn tracking_of_this_crate() {
+        // skipped when the crate isn't in a git repository
+        let Some(t) = tracking(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
+            return;
+        };
+        assert!(!t.branch.is_empty());
+        if t.upstream.is_none() {
+            assert_eq!((t.ahead, t.behind), (0, 0), "no upstream, no counts");
+        }
+    }
+
+    #[test]
+    fn option_looking_branch_names_are_refused() {
+        assert!(switch(Path::new("."), "-x").is_err());
+        assert!(switch(Path::new("."), "--detach").is_err());
+        assert!(switch(Path::new("."), "").is_err());
     }
 }

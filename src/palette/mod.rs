@@ -81,6 +81,7 @@ impl Palette {
         self.pick = 0;
         self.top = 0;
         self.made_for = None;
+        self.hint.clear();
     }
 
     /// asks for a line of text, starting as `start`, with `hint` shown

@@ -103,6 +103,8 @@ pub fn show(
     let hint = match palette.kind {
         Some(Kind::Commands) => texts.tr("Search commands"),
         Some(Kind::Symbols) => texts.tr("Search symbols"),
+        // a list borrowing the actions kind says what it is
+        Some(Kind::Actions) if !palette.hint.is_empty() => palette.hint.as_str(),
         Some(Kind::Actions) => texts.tr("Quick fixes"),
         Some(Kind::Prompt) => palette.hint.as_str(),
         _ => texts.tr("Search files by name (> commands, : line)"),

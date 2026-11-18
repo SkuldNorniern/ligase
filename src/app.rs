@@ -64,6 +64,11 @@ pub enum Id {
     ScmGraph,
     /// a repository's pill in source control.
     ScmRepo(u16),
+    /// the branch pill and the sync buttons in source control.
+    ScmBranch,
+    ScmPull,
+    ScmPush,
+    ScmFetch,
     /// the bar between the changes and the graph.
     ScmSplit,
     /// the remote folder's tree.
@@ -470,6 +475,41 @@ enum Done {
     Diff(DocumentId, Revision, Vec<crate::git::DiffLine>),
     /// stage, unstage or commit came back; a commit says so.
     GitDid(Result<bool, String>),
+    /// the local branches for the picker, or why there are none.
+    Branches(Result<Vec<String>, String>),
+    /// a fetch, pull, push or switch came back: git's line, or why not.
+    Synced(SyncJob, Result<String, String>),
+}
+
+/// the source control jobs that report in the status bar.
+#[derive(Clone, Copy)]
+enum SyncJob {
+    Fetch,
+    Pull,
+    Push,
+    Switch,
+}
+
+impl SyncJob {
+    /// the status bar's words when it worked.
+    fn done(self) -> &'static str {
+        match self {
+            SyncJob::Fetch => "Fetched",
+            SyncJob::Pull => "Pulled",
+            SyncJob::Push => "Pushed",
+            SyncJob::Switch => "Switched",
+        }
+    }
+
+    /// the status bar's words when it didn't, before the reason.
+    fn failed(self) -> &'static str {
+        match self {
+            SyncJob::Fetch => "Fetch failed",
+            SyncJob::Pull => "Pull failed",
+            SyncJob::Push => "Push failed",
+            SyncJob::Switch => "Switch failed",
+        }
+    }
 }
 
 /// code actions offered for a document as of a revision.
@@ -594,6 +634,9 @@ pub struct App {
     /// git was asked and hasn't answered yet.
     changes_asked: bool,
     scm: crate::git::view::Scm,
+    /// the local branches listed in the palette for a switch; none when the
+    /// palette lists code actions.
+    branch_pick: Option<Vec<String>>,
     /// each diff tab's rows, the revision they are for, and whether a new
     /// diff is out.
     diffs: HashMap<DocumentId, (Option<Revision>, bool, Vec<crate::git::DiffLine>)>,
@@ -702,6 +745,7 @@ impl App {
             changes_known: false,
             changes_asked: false,
             scm: crate::git::view::Scm::default(),
+            branch_pick: None,
             diffs: HashMap::new(),
             diff_shown: HashMap::new(),
             watcher: document::watch::Watcher::default(),
@@ -2433,6 +2477,13 @@ impl App {
                 }
             }
             Kind::Actions => {
+                // a branch list, not code actions: switch to the one picked
+                if let Some(names) = self.branch_pick.take() {
+                    if let Some(name) = names.get(item).cloned() {
+                        self.switch_branch(name);
+                    }
+                    return;
+                }
                 let Some(offered) = self.actions.take() else {
                     return;
                 };
@@ -3000,9 +3051,12 @@ impl App {
             if status.is_none() {
                 status = tops.first().and_then(|t| crate::git::status(t));
             }
-            if graph && let Some(s) = &mut status {
-                s.history = crate::git::graph::log(&s.top).unwrap_or_default();
-                s.rows = crate::git::graph::layout(&s.history);
+            if let Some(s) = &mut status {
+                s.tracking = crate::git::tracking(&s.top);
+                if graph {
+                    s.history = crate::git::graph::log(&s.top).unwrap_or_default();
+                    s.rows = crate::git::graph::layout(&s.history);
+                }
             }
             Done::Changes(status, counts)
         });
@@ -3149,6 +3203,13 @@ impl App {
         };
         match ask {
             Ask::Repo(_) => {}
+            Ask::Branches => {
+                self.jobs
+                    .run(move || Done::Branches(crate::git::branches(&top)));
+            }
+            Ask::Fetch => self.sync_job(SyncJob::Fetch, top, crate::git::fetch),
+            Ask::Pull => self.sync_job(SyncJob::Pull, top, crate::git::pull),
+            Ask::Push => self.sync_job(SyncJob::Push, top, crate::git::push),
             Ask::Show(id) => {
                 self.jobs
                     .run(move || Done::CommitShown(crate::git::graph::detail(&top, &id)));
@@ -3185,6 +3246,33 @@ impl App {
                     .run(move || Done::GitDid(crate::git::commit(&top, &message).map(|()| true)));
             }
         }
+    }
+
+    /// runs a fetch, pull, push or switch on the worker. one at a time: a
+    /// second one is dropped while `scm.busy` is up.
+    fn sync_job(
+        &mut self,
+        job: SyncJob,
+        top: PathBuf,
+        work: impl FnOnce(&Path) -> Result<String, String> + Send + 'static,
+    ) {
+        if self.scm.busy {
+            return;
+        }
+        self.scm.busy = true;
+        if !self.jobs.run(move || Done::Synced(job, work(&top))) {
+            self.scm.busy = false;
+        }
+    }
+
+    /// switches the repository to the local branch `name`.
+    fn switch_branch(&mut self, name: String) {
+        let Some(top) = self.changes.as_ref().map(|s| s.top.clone()) else {
+            return;
+        };
+        self.sync_job(SyncJob::Switch, top, move |top| {
+            crate::git::switch(top, &name).map(|()| String::new())
+        });
     }
 
     /// sends a diff off for each file whose text moved on.
@@ -3377,6 +3465,7 @@ impl App {
                             note: a.kind.clone(),
                         })
                         .collect();
+                    self.branch_pick = None;
                     self.palette.set_actions(items);
                     self.palette.open(Kind::Actions);
                     self.ui.focus(Id::PaletteField, 0);
@@ -3669,6 +3758,48 @@ impl App {
                         Err(why) => self.say(why),
                     }
                     self.refresh_status();
+                }
+                Done::Branches(Ok(names)) => {
+                    let current = self.branch.clone();
+                    let current_note = self.texts.tr("current branch").to_owned();
+                    let items = names
+                        .iter()
+                        .map(|n| palette::Item {
+                            text: n.clone(),
+                            note: if current.as_deref() == Some(n.as_str()) {
+                                current_note.clone()
+                            } else {
+                                String::new()
+                            },
+                        })
+                        .collect();
+                    self.actions = None;
+                    self.palette.set_actions(items);
+                    self.palette.open(Kind::Actions);
+                    self.palette.hint = self.texts.tr("Switch branch").to_owned();
+                    self.ui.focus(Id::PaletteField, 0);
+                    self.branch_pick = Some(names);
+                }
+                Done::Branches(Err(why)) => self.say(why),
+                Done::Synced(job, result) => {
+                    self.scm.busy = false;
+                    match result {
+                        Ok(_) => {
+                            let done = self.texts.tr(job.done()).to_owned();
+                            self.say(done);
+                        }
+                        Err(why) => {
+                            let why = self.texts.tr(&why).to_owned();
+                            let failed = self.texts.tr(job.failed()).to_owned();
+                            self.say(format!("{failed}: {why}"));
+                        }
+                    }
+                    // a fetch moves no branch; the others may move every mark
+                    if matches!(job, SyncJob::Fetch) {
+                        self.refresh_status();
+                    } else {
+                        self.refresh_git();
+                    }
                 }
                 Done::Note(note) => {
                     if let Some(note) = note {

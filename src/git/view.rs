@@ -9,7 +9,7 @@ use aurea::ui::{Align, Button, ListView, Response, Sense, Splitter, TextField, U
 use aurea::{AureaResult, CursorIcon};
 
 use super::graph;
-use super::{Change, Status};
+use super::{Change, Status, Tracking};
 use crate::app::Id;
 use crate::icons;
 use crate::lang::Texts;
@@ -32,12 +32,19 @@ pub enum Ask {
     Show(String),
     /// work in this repository.
     Repo(PathBuf),
+    /// the local branches, to switch to.
+    Branches,
+    Fetch,
+    Pull,
+    Push,
 }
 
 /// the panel's own state.
 #[derive(Default)]
 pub struct Scm {
     pub message: String,
+    /// a fetch, pull, push or switch is out; the app sets this.
+    pub busy: bool,
     scroll: f32,
     picked: Option<usize>,
     graph_scroll: f32,
@@ -362,6 +369,98 @@ fn letter_colour(ui: &Ui<'_, Id>, letter: char) -> aurea::render::Color {
     }
 }
 
+/// the branch as a pill, then pull, push and fetch as small text buttons. a
+/// button with nothing to do is dimmed, still clickable. a sync running
+/// shows "Syncing…" in their place.
+fn sync_row(
+    ui: &mut Ui<'_, Id>,
+    scm: &Scm,
+    t: &Tracking,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let small = ui.theme.font(11.5);
+    let mut ask = None;
+    let name_w = ui.text_width(&t.branch, &small) + 18.0;
+    let pill = Rect::new(
+        rect.x,
+        rect.y + 2.0,
+        name_w.min(rect.width * 0.5),
+        rect.height - 4.0,
+    );
+    let on_pill = ui.interact(Id::ScmBranch, 0, pill, Sense::Click, true);
+    let fill = if on_pill.hovered {
+        palette.hover
+    } else {
+        palette.raised
+    };
+    ui.round(pill, pill.height / 2.0, fill)?;
+    ui.text_clipped(&t.branch, pill, &small, palette.text, Align::Center)?;
+    if on_pill.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+        let tip = Response {
+            rect: pill,
+            hovered: true,
+            ..Response::default()
+        };
+        ui.tooltip(&tip, texts.tr("Switch branch"));
+    }
+    if on_pill.clicked {
+        ask = Some(Ask::Branches);
+    }
+    let mut x = pill.right() + 8.0;
+    if scm.busy {
+        let at = Rect::new(x, rect.y, (rect.right() - x).max(0.0), rect.height);
+        ui.text_clipped(texts.tr("Syncing…"), at, &small, palette.dim, Align::Start)?;
+        return Ok(ask);
+    }
+    let lit = palette.text.fade(0.8);
+    let quiet = palette.dim.fade(0.5);
+    let specs = [
+        (
+            Id::ScmPull,
+            format!("↓ {}", t.behind),
+            t.upstream.is_some() && t.behind > 0,
+            "Pull (fast-forward only)",
+            Ask::Pull,
+        ),
+        (
+            Id::ScmPush,
+            format!("↑ {}", t.ahead),
+            t.upstream.is_none() || t.ahead > 0,
+            "Push",
+            Ask::Push,
+        ),
+        (Id::ScmFetch, "⟳".to_owned(), true, "Fetch", Ask::Fetch),
+    ];
+    for (id, label, on, tip, want) in specs {
+        let w = ui.text_width(&label, &small) + 14.0;
+        if x + w > rect.right() {
+            break;
+        }
+        let at = Rect::new(x, rect.y + 2.0, w, rect.height - 4.0);
+        let hit = ui.interact(id, 0, at, Sense::Click, true);
+        if hit.hovered {
+            ui.round(at, 4.0, palette.hover)?;
+            ui.set_cursor(CursorIcon::Pointer);
+            let tip_at = Response {
+                rect: at,
+                hovered: true,
+                ..Response::default()
+            };
+            ui.tooltip(&tip_at, texts.tr(tip));
+        }
+        let ink = if on { lit } else { quiet };
+        ui.text_clipped(&label, at, &small, ink, Align::Center)?;
+        if hit.clicked {
+            ask = Some(want);
+        }
+        x += w + 4.0;
+    }
+    Ok(ask)
+}
+
 /// the repositories as pills, each with how many files changed; the one
 /// worked in lit. gives the one clicked.
 fn repo_pills(
@@ -462,7 +561,7 @@ pub fn show(
     };
     let mut ask = None;
     let (field, rest) = inner.split_top(FIELD, 6.0);
-    let (button, list) = rest.split_top(FIELD, 8.0);
+    let (button, rest) = rest.split_top(FIELD, 8.0);
     let typed = TextField::new(&mut scm.message)
         .placeholder(texts.tr("commit message"))
         .max_chars(2000)
@@ -471,6 +570,17 @@ pub fn show(
     if typed.submitted || pressed.clicked {
         ask = Some(Ask::Commit);
     }
+    // the sync row under the commit button, once git has said what it follows
+    let list = match &status.tracking {
+        Some(t) => {
+            let (row, rest) = rest.split_top(ROW + 4.0, 4.0);
+            if let Some(sync) = sync_row(ui, scm, t, row, texts)? {
+                ask = Some(sync);
+            }
+            rest
+        }
+        None => rest,
+    };
 
     // the graph takes the lower part when there is history to show
     let list = if status.history.is_empty() {
