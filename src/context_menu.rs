@@ -119,6 +119,7 @@ pub fn editor() -> Vec<Entry> {
     use crate::editor::LineOp;
     vec![
         Entry::Item("Quick Fix", Act::Run(Command::CodeActions)),
+        Entry::Item("Reading View", Act::Run(Command::ToggleReading)),
         Entry::Item("Go to Definition", Act::Run(Command::GotoDefinition)),
         Entry::Item("Find References", Act::Run(Command::References)),
         Entry::Item("Rename Symbol", Act::Run(Command::Rename)),

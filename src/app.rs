@@ -65,6 +65,8 @@ pub enum Id {
     TerminalTab(u16),
     /// the breadcrumb over an editor.
     Crumb(ViewId),
+    /// a markdown view read as a page.
+    Reader(ViewId),
     ReplaceAllButton,
     DiffOpen(DocumentId),
     DiffList(DocumentId),
@@ -123,6 +125,8 @@ pub enum Command {
     ToggleTerminal,
     /// another shell in the terminal panel.
     NewTerminal,
+    /// a markdown file read as a page, or back to its text.
+    ToggleReading,
     ToggleProblems,
     ToggleGit,
     /// the focused file against HEAD.
@@ -268,6 +272,11 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
     ("view.search", "Search", Command::ToggleSearch),
     ("view.terminal", "Terminal", Command::ToggleTerminal),
     ("terminal.new", "New Terminal", Command::NewTerminal),
+    (
+        "markdown.read",
+        "Toggle Reading View",
+        Command::ToggleReading,
+    ),
     ("view.problems", "Problems", Command::ToggleProblems),
     ("view.sourceControl", "Source Control", Command::ToggleGit),
     ("view.extensions", "Extensions", Command::ToggleExtensions),
@@ -392,6 +401,12 @@ enum Done {
         Result<Option<document::Stamp>, String>,
     ),
     Shell(u32, Result<vanta::Terminal, String>),
+    /// a markdown view's text, parsed.
+    Markdown(
+        ViewId,
+        Revision,
+        Vec<(usize, crate::markdown::parse::Block)>,
+    ),
     Server(&'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
@@ -449,6 +464,8 @@ pub struct App {
     pointing: Option<(ViewId, Range<usize>, aurea::render::Point, Instant)>,
     /// the card shown for the word the pointer rests on.
     peek: Option<Peek>,
+    /// markdown views read as pages.
+    readers: crate::markdown::read::Readers,
     /// signature help to ask for once the text is synced.
     want_signature: Option<ViewId>,
     /// a whole line copied with nothing selected; pasting it goes in above.
@@ -582,6 +599,7 @@ impl App {
             signature: None,
             pointing: None,
             peek: None,
+            readers: crate::markdown::read::Readers::default(),
             want_signature: None,
             line_clip: None,
             zoom: editor::SIZE,
@@ -1353,6 +1371,35 @@ impl App {
                 }
             }
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
+            Command::ToggleReading => {
+                let Some(view) = focus.or(self.last_editor) else {
+                    return;
+                };
+                if let Some(reader) = self.readers.remove(&view) {
+                    // back to the text where the page was
+                    if let Some(line) = reader.top_line()
+                        && let Some(v) = self.docs.view_mut(view)
+                    {
+                        v.goto = Some((Point::new(line, 0), Encoding::Utf32));
+                    }
+                    return;
+                }
+                let Some(doc) = self.docs.doc_of(view) else {
+                    return;
+                };
+                if doc.language != Some("markdown") {
+                    self.say(self.texts.tr("only markdown reads as a page").to_owned());
+                    return;
+                }
+                let line = self
+                    .docs
+                    .view(view)
+                    .and_then(|v| doc.buffer.text().line_of(v.sel.head).ok());
+                let mut reader = crate::markdown::read::Reader::default();
+                reader.reveal_line = line;
+                self.readers.insert(view, reader);
+                return;
+            }
             Command::NewTerminal => {
                 if self.shells.add().is_none() {
                     self.say(
@@ -3254,6 +3301,7 @@ impl App {
             self.want_complete.get_or_insert(view);
         }
         self.ask_feeds();
+        self.ask_pages();
         if let Some(view) = self.want_complete.take() {
             self.complete_for = Some(view);
             // no server: extension snippets alone, and only on a word, not
@@ -3369,6 +3417,13 @@ impl App {
                         self.after_save(doc, false);
                     }
                 },
+                Done::Markdown(view, revision, blocks) => {
+                    if let Some(reader) = self.readers.get_mut(&view)
+                        && reader.asked == Some(revision)
+                    {
+                        reader.set(revision, blocks);
+                    }
+                }
                 Done::Shell(id, result) => {
                     if let Some(shell) = self.shells.get_mut(id) {
                         shell.started(result);
@@ -3611,6 +3666,7 @@ impl App {
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let mut crumb: Option<(editor::Crumb, ViewId)> = None;
+        let mut read_ask: Option<(ViewId, crate::markdown::read::Ask)> = None;
         let mut pointer: Option<(ViewId, usize, aurea::render::Point)> = None;
         let menu_act;
         let mut focus = None;
@@ -3675,6 +3731,7 @@ impl App {
             let shells = &mut self.shells;
             let hover = &hover_now;
             let peek_now = &self.peek;
+            let readers = &mut self.readers;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
             let (scm, changes) = (&mut self.scm, &self.changes);
@@ -3702,6 +3759,12 @@ impl App {
                     let Some(doc_id) = docs.view(view).map(|v| v.doc) else {
                         return Ok(());
                     };
+                    if let Some(reader) = readers.get_mut(&view) {
+                        if let Some(ask) = crate::markdown::read::show(ui, view, reader, rect)? {
+                            read_ask = Some((view, ask));
+                        }
+                        return Ok(());
+                    }
                     let mut state = docs.view(view).cloned().expect("view exists");
                     if let Some(doc) = docs.doc(doc_id) {
                         let hover = hover
@@ -4079,6 +4142,9 @@ impl App {
             self.menu.ask(at, context_menu::explorer(on_entry));
         }
         self.point_at(pointer);
+        if let Some((view, crate::markdown::read::Ask::Open(url))) = read_ask {
+            self.open_link(view, &url);
+        }
         if let Some((c, view)) = crumb {
             self.last_editor = Some(view);
             match c {
@@ -4289,6 +4355,59 @@ impl App {
         {
             self.peek = None;
         }
+    }
+
+    /// pages whose text moved on are parsed again on the worker; pages of
+    /// closed views go.
+    fn ask_pages(&mut self) {
+        let docs = &self.docs;
+        self.readers.retain(|v, _| docs.view(*v).is_some());
+        let mut jobs = Vec::new();
+        for (&view, reader) in &mut self.readers {
+            let Some(doc) = self.docs.doc_of(view) else {
+                continue;
+            };
+            let revision = doc.buffer.revision();
+            if reader.made_from == Some(revision) || reader.asked == Some(revision) {
+                continue;
+            }
+            reader.asked = Some(revision);
+            jobs.push((view, revision, doc.buffer.snapshot()));
+        }
+        for (view, revision, snap) in jobs {
+            self.jobs.run(move || {
+                let text = snap.slice(0..snap.len()).unwrap_or_default();
+                Done::Markdown(view, revision, crate::markdown::parse::parse(&text))
+            });
+        }
+    }
+
+    /// a link on a page: the web in the browser, a file next to this one
+    /// in an editor.
+    fn open_link(&mut self, view: ViewId, url: &str) {
+        let url = url.trim();
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+            if aurea::files::open_url(url).is_err() {
+                self.say(format!("{} {url}", self.texts.tr("can't open")));
+            }
+            return;
+        }
+        // `#part` alone stays on the page; a path drops its `#part`
+        let path = url.split('#').next().unwrap_or_default();
+        if path.is_empty() || path.contains("://") {
+            return;
+        }
+        let Some(dir) = self
+            .docs
+            .doc_of(view)
+            .and_then(|d| d.path.parent().map(Path::to_path_buf))
+        else {
+            return;
+        };
+        let target = dir.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let opened = self.open_file(&target);
+        self.ui.focus(Id::Editor(opened), 1);
+        self.last_editor = Some(opened);
     }
 
     /// the server's answer for the pointer: under the problems, if any.
@@ -5026,6 +5145,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::Grave).shift(), Command::NewTerminal)
+        .bind(Chord::command(KeyCode::V).shift(), Command::ToggleReading)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)

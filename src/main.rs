@@ -14,6 +14,7 @@ mod icons;
 mod jobs;
 mod lang;
 mod lsp;
+mod markdown;
 mod palette;
 mod problems;
 mod search;
