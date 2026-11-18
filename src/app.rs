@@ -4950,8 +4950,8 @@ fn status_bar(
     place: &[(String, Option<Command>)],
 ) -> AureaResult<Option<Command>> {
     let palette = ui.theme.palette;
-    ui.fill(rect, palette.surface)?;
-    ui.fill(Rect::new(rect.x, rect.y, rect.width, 1.0), palette.border)?;
+    // no ruled edge: the bar is the floor the panes stand on
+    ui.fill(rect, palette.background)?;
     let font = ui.theme.font(12.0);
     let mut picked = None;
     // a part a click does something with lights up under the pointer

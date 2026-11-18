@@ -205,19 +205,24 @@ fn badge(ui: &mut Ui<'_, Id>, icon: Rect, n: usize, fill: Color, ink: Color) -> 
 /// is about (the folder, the branch) in plain text.
 pub fn head(ui: &mut Ui<'_, Id>, rect: Rect, title: &str, about: &str) -> AureaResult<()> {
     let palette = ui.theme.palette;
-    ui.fill(
-        Rect::new(rect.x, rect.bottom() - 1.0, rect.width, 1.0),
-        palette.border,
-    )?;
+    // a quiet title and a chip for what it is about; no ruled line
     let inner = rect.inset_xy(14.0, 0.0);
-    let small = ui.theme.font(11.0);
-    let caps = title.to_uppercase();
-    let caps_w = ui.text_width(&caps, &small).min(inner.width);
-    let (title_at, rest) = inner.split_left(caps_w, 10.0);
-    ui.text_clipped(&caps, title_at, &small, palette.dim, Align::Start)?;
+    let bold = ui.theme.bold(13.0);
+    let title_w = ui.text_width(title, &bold).min(inner.width);
+    let (title_at, rest) = inner.split_left(title_w, 10.0);
+    ui.text_clipped(title, title_at, &bold, palette.text, Align::Start)?;
     if !about.is_empty() {
-        let font = ui.theme.font(12.5);
-        ui.text_clipped(about, rest, &font, palette.text, Align::Start)?;
+        let font = ui.theme.font(11.5);
+        let w = (ui.text_width(about, &font) + 16.0).min(rest.width);
+        let chip = Rect::new(rest.x, rect.y + (rect.height - 20.0) / 2.0, w, 20.0);
+        ui.round(chip, 10.0, palette.raised)?;
+        ui.text_clipped(
+            about,
+            chip.inset_xy(8.0, 0.0),
+            &font,
+            palette.dim,
+            Align::Start,
+        )?;
     }
     Ok(())
 }
