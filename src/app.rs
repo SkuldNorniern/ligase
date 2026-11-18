@@ -2414,6 +2414,7 @@ impl App {
             }
             Kind::Commands => {
                 if let Some(&(_, _, command)) = COMMANDS.get(item) {
+                    self.palette.used(item);
                     self.run(command);
                 }
             }

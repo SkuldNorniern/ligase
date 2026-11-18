@@ -9,6 +9,10 @@ use std::path::Path;
 pub const MAX_FILES: usize = 50_000;
 /// rows kept after a filter.
 const MAX_SHOWN: usize = 300;
+/// commands remembered as used lately.
+const MAX_RECENT: usize = 8;
+/// how much a recent command's score is lifted when filtering.
+const RECENT_LIFT: i32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -60,6 +64,8 @@ pub struct Palette {
     generation: usize,
     /// what a prompt asks for.
     pub hint: String,
+    /// commands run from here lately, newest first, by their place in the list.
+    recent: Vec<usize>,
 }
 
 impl Palette {
@@ -159,7 +165,17 @@ impl Palette {
             // ":12" is a line in the editor, not a filter
             Vec::new()
         } else if query.is_empty() {
-            (0..items.len().min(MAX_SHOWN))
+            // commands used lately first, then the rest in their order
+            let recent: Vec<usize> = if kind == Kind::Commands {
+                self.recent.iter().copied().filter(|&i| i < items.len()).collect()
+            } else {
+                Vec::new()
+            };
+            recent
+                .iter()
+                .copied()
+                .chain((0..items.len()).filter(|i| !recent.contains(i)))
+                .take(MAX_SHOWN)
                 .map(|item| Shown {
                     item,
                     marks: Vec::new(),
@@ -170,7 +186,12 @@ impl Palette {
                 .iter()
                 .enumerate()
                 .filter_map(|(item, it)| {
-                    score(query, &it.text).map(|(s, marks)| (s, Shown { item, marks }))
+                    let lift = if kind == Kind::Commands && self.recent.contains(&item) {
+                        RECENT_LIFT
+                    } else {
+                        0
+                    };
+                    score(query, &it.text).map(|(s, marks)| (s + lift, Shown { item, marks }))
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.item.cmp(&b.1.item)));
@@ -181,6 +202,14 @@ impl Palette {
         self.pick = 0;
         self.top = 0;
         self.made_for = Some(key);
+    }
+
+    /// command `item` was run: it comes first next time.
+    pub fn used(&mut self, item: usize) {
+        self.recent.retain(|&i| i != item);
+        self.recent.insert(0, item);
+        self.recent.truncate(MAX_RECENT);
+        self.made_for = None;
     }
 
     /// moves the pick, keeping it in sight of `rows` rows.
@@ -354,6 +383,34 @@ mod tests {
         p.open(Kind::Files);
         p.query = ">sav".into();
         assert_eq!(p.wanted(), (Kind::Commands, "sav"));
+    }
+
+    #[test]
+    fn recent_commands_come_first() {
+        let commands = ["Save", "Save As", "Split Editor", "Settings"]
+            .iter()
+            .map(|t| Item {
+                text: (*t).to_owned(),
+                note: String::new(),
+            })
+            .collect();
+        let mut p = Palette {
+            commands,
+            ..Palette::default()
+        };
+        p.used(3);
+        p.used(2);
+        p.open(Kind::Commands);
+        p.refresh();
+        let order: Vec<usize> = p.shown.iter().map(|s| s.item).collect();
+        assert_eq!(order, [2, 3, 0, 1]);
+        p.query = "s".into();
+        p.refresh();
+        assert_eq!(p.picked(), Some(2), "a recent match wins a tie");
+        for i in 0..20 {
+            p.used(i % 4);
+        }
+        assert!(p.recent.len() <= MAX_RECENT);
     }
 
     #[test]
