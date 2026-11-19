@@ -15,3 +15,6 @@ serde_json = "1"
 sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-dsl = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
+
+[build-dependencies]
+winres = "0.1"
