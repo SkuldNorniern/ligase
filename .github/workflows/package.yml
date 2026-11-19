@@ -1,0 +1,157 @@
+name: Package
+
+# builds and packs ligase on each os, then publishes a github release:
+# `release` for a v* tag, `nightly` as the moving nightly prerelease.
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: release or nightly
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out resolvase and vanta
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/SkuldNorniern/resolvase ../resolvase
+          git clone --depth 1 https://github.com/SkuldNorniern/vanta ../vanta
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/kago*
+            target
+          key: ${{ runner.os }}-package-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-package-cargo-
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+            libxkbcommon-dev pkg-config libegl-mesa0 libgtk-3-dev
+
+      - name: Install kago
+        if: runner.os == 'Windows'
+        shell: bash
+        run: command -v kago || cargo install --locked --git https://github.com/SkuldNorniern/kago
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Label
+        id: label
+        shell: bash
+        run: |
+          if [[ "${{ inputs.channel }}" == "release" ]]; then
+            echo "label=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=nightly-$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack
+        shell: bash
+        run: bash packaging/package.sh "${{ steps.label.outputs.label }}" "${{ matrix.target }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ligase-${{ matrix.target }}
+          path: |
+            ligase-*.tar.gz
+            ligase-*.zip
+            ligase-*.dmg
+            ligase-*-setup.exe
+            ligase-*.sha256
+            latest.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish (${{ inputs.channel }})
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Notes
+        run: |
+          current=""
+          [[ "${{ inputs.channel }}" == "release" ]] && current="${{ github.ref_name }}"
+          bash packaging/changelog.sh "$current" > notes.md
+          cat artifacts/*.sha256 | sort > checksums.sha256
+          {
+            echo
+            echo "### Downloads"
+            echo
+            echo "| Platform | File | SHA256 |"
+            echo "|----------|------|--------|"
+            while read -r hash file; do
+              file=$(basename "$file")
+              case "$file" in
+                *setup.exe) platform="Windows x86_64, setup" ;;
+                *windows*)  platform="Windows x86_64" ;;
+                *darwin*)   platform="macOS ARM64" ;;
+                *linux*)    platform="Linux x86_64" ;;
+                *)          platform="Other" ;;
+              esac
+              echo "| $platform | \`$file\` | \`${hash:0:16}...\` |"
+            done < checksums.sha256
+          } >> notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*.tar.gz artifacts/*.zip artifacts/*.dmg artifacts/*-setup.exe checksums.sha256)
+          if [[ "${{ inputs.channel }}" == "release" ]]; then
+            # latest.json lets installed copies find this release
+            files+=(artifacts/latest.json)
+            pre=""
+            [[ "${{ github.ref_name }}" == *-* ]] && pre="--prerelease"
+            gh release create "${{ github.ref_name }}" $pre \
+              --title "Ligase ${{ github.ref_name }}" --notes-file notes.md "${files[@]}"
+          else
+            gh release delete nightly --yes --cleanup-tag || true
+            gh release create nightly --prerelease --target "${{ github.sha }}" \
+              --title "Nightly ($(date -u +%Y-%m-%d))" --notes-file notes.md "${files[@]}"
+          fi

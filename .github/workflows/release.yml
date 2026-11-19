@@ -1,0 +1,16 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Release
+    uses: ./.github/workflows/package.yml
+    with:
+      channel: release
+    permissions:
+      contents: write
+    secrets: inherit
