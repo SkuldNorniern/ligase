@@ -1792,18 +1792,8 @@ pub fn show(
                     || !settings.smooth_caret
                     || seen_line.is_none_or(|l: usize| l.abs_diff(caret_line) > 6);
                 let (cx, cy) = if jump {
-                    ui.set_animated(
-                        Id::Editor(id),
-                        PART_CARET,
-                        Channel::Custom(CARET_X),
-                        target_x,
-                    );
-                    ui.set_animated(
-                        Id::Editor(id),
-                        PART_CARET,
-                        Channel::Custom(CARET_Y),
-                        target_y,
-                    );
+                    put(ui, Id::Editor(id), PART_CARET, CARET_X, target_x);
+                    put(ui, Id::Editor(id), PART_CARET, CARET_Y, target_y);
                     (target_x, target_y)
                 } else {
                     let rate = CARET_RATE;
@@ -1949,19 +1939,16 @@ pub fn show(
             }
             // no scrolling far past the longest line in sight
             hscroll = hscroll.min((widest - area.width * 0.5).max(0.0));
+            let peek_alpha = fade(ui, Id::Editor(id), PART_PEEK, look.peek.is_some());
             if let Some((text, p)) = look.peek {
                 // under the pointer's line, so the word stays in sight
                 let line = Rect::new(p.x, p.y - line_h / 2.0, 1.0, line_h);
-                let alpha = ui.animate(Id::Editor(id), PART_PEEK, Channel::Custom(0), 1.0, 14.0);
-                hover::show(ui, text, line, seen, alpha, (look.dark, look.size))?;
-            } else {
-                ui.set_animated(Id::Editor(id), PART_PEEK, Channel::Custom(0), 0.0);
+                hover::show(ui, text, line, seen, peek_alpha, (look.dark, look.size))?;
             }
+            let hovering = look.hover.is_some() && shown.caret.is_some();
+            let hover_alpha = fade(ui, Id::Editor(id), PART_HOVER, hovering);
             if let (Some(text), Some(caret)) = (look.hover, shown.caret) {
-                let alpha = ui.animate(Id::Editor(id), PART_HOVER, Channel::Custom(0), 1.0, 14.0);
-                hover::show(ui, text, caret, seen, alpha, (look.dark, look.size))?;
-            } else {
-                ui.set_animated(Id::Editor(id), PART_HOVER, Channel::Custom(0), 0.0);
+                hover::show(ui, text, caret, seen, hover_alpha, (look.dark, look.size))?;
             }
             Ok(pull)
         },
@@ -1985,6 +1972,31 @@ pub fn show(
     multi::merge(view);
     view.preedit = preedit;
     Ok(shown)
+}
+
+/// puts an eased value straight at `value`. only when it isn't there: each
+/// set asks aurea for another frame, so setting it every frame never idles.
+fn put(ui: &mut Ui<'_, Id>, id: Id, part: u16, channel: u16, value: f32) {
+    let channel = Channel::Custom(channel);
+    if ui.animated(id, part, channel) != Some(value) {
+        ui.set_animated(id, part, channel, value);
+    }
+}
+
+/// how far a card fading in is, 0 to 1. one seen for the first time starts
+/// at 0; a hidden one asks for nothing, so an idle editor draws no frames.
+fn fade(ui: &mut Ui<'_, Id>, id: Id, part: u16, shown: bool) -> f32 {
+    let channel = Channel::Custom(0);
+    if !shown {
+        if ui.animated(id, part, channel).is_some_and(|v| v != 0.0) {
+            ui.set_animated(id, part, channel, 0.0);
+        }
+        return 0.0;
+    }
+    if ui.animated(id, part, channel).is_none() {
+        ui.set_animated(id, part, channel, 0.0);
+    }
+    ui.animate(id, part, channel, 1.0, 14.0)
 }
 
 fn severity_colour(palette: &Palette, severity: Severity) -> Color {
