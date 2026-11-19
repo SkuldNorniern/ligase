@@ -71,9 +71,28 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+const NO_REPOSITORY: &str = "not a git repository";
+
+/// most folders walked up looking for `.git`.
+const MAX_UP: usize = 64;
+
+/// whether `dir` is in a repository: a `.git` folder or file (a worktree or
+/// a submodule) in it or above. one stat per folder, where starting git to ask
+/// takes most of a second on some windows machines. `GIT_DIR` set: git knows.
+fn in_repository(dir: &Path) -> bool {
+    std::env::var_os("GIT_DIR").is_some()
+        || dir
+            .ancestors()
+            .take(MAX_UP)
+            .any(|d| d.join(".git").exists())
+}
+
 /// runs git in `dir`; its output, or what it said went wrong. pathspecs are
 /// taken literally, so a file named `*` is only that file.
 fn run(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    if !in_repository(dir) {
+        return Err(NO_REPOSITORY.to_owned());
+    }
     let out = command(dir, args)
         .output()
         .map_err(|e| format!("git: {e}"))?;
@@ -112,6 +131,9 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
 /// like `run`, for the network commands: killed past `SYNC_LIMIT`. the
 /// answer is git's first line, or nothing, when it worked.
 fn run_limited(dir: &Path, args: &[&str]) -> Result<String, String> {
+    if !in_repository(dir) {
+        return Err(NO_REPOSITORY.to_owned());
+    }
     let mut child: Child = command(dir, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -736,6 +758,23 @@ pub fn hunks(base: &str, now: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_git_is_started_outside_a_repository() {
+        let dir = std::env::temp_dir().join(format!("ligase-norepo-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        if !in_repository(&dir) {
+            // refused before git runs, so this is quick
+            assert_eq!(
+                run(&dir.join("a/b"), &["status"]),
+                Err(NO_REPOSITORY.to_owned())
+            );
+            assert_eq!(branch(&dir.join("a")), None);
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert!(in_repository(&dir.join("a/b")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn finds_repositories_below_a_workspace() {
