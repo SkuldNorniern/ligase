@@ -31,11 +31,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::{Rc, Weak};
 
+use aurea::clipboard::ClipboardImage;
 use aurea::dialog::{FileDialog, MessageButtons, MessageChoice, MessageDialog, MessageKind};
 use aurea::elements::{Orientation, Stack};
 use aurea::menu::{MenuItem, SubMenu};
-use aurea::render::{Canvas, CanvasId, RendererBackend, request_canvas_redraw};
-use aurea::{AureaResult, Container, Window};
+use aurea::render::{Canvas, CanvasId, Image, ImageSet, RendererBackend, request_canvas_redraw};
+use aurea::{AureaResult, Container, Window, WindowEvent};
 
 use crate::app::{App, Command, Dialog, DialogStart};
 use crate::editor::{CaretOp, FoldOp, LineOp};
@@ -44,6 +45,27 @@ use crate::workbench::panels::Panel;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
+
+/// the app icon at each size windows draws it.
+const ICONS: [&[u8]; 6] = [
+    include_bytes!("../assets/icons/app/ligase-16.png"),
+    include_bytes!("../assets/icons/app/ligase-24.png"),
+    include_bytes!("../assets/icons/app/ligase-32.png"),
+    include_bytes!("../assets/icons/app/ligase-48.png"),
+    include_bytes!("../assets/icons/app/ligase-64.png"),
+    include_bytes!("../assets/icons/app/ligase-256.png"),
+];
+
+/// the icon pngs read into one set; none when not one reads.
+fn icon_set() -> Option<ImageSet> {
+    const MAX_BYTES: usize = 1 << 20;
+    let images: Vec<Image> = ICONS
+        .iter()
+        .filter_map(|png| ClipboardImage::from_png(png, MAX_BYTES).ok())
+        .map(|icon| Image::new(icon.width, icon.height, icon.rgba))
+        .collect();
+    (!images.is_empty()).then(|| ImageSet::new(images))
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -94,6 +116,12 @@ fn run() -> AureaResult<()> {
     let title = app.borrow().title();
     let mut window = Window::new(&title, WIDTH.cast_signed(), HEIGHT.cast_signed())?;
     window.set_min_size(640, 400)?;
+    let icons = icon_set();
+    if let Some(set) = &icons
+        && let Err(e) = window.set_icon_set(set)
+    {
+        eprintln!("ligase: icon: {e}");
+    }
     let canvas = Canvas::new(WIDTH, HEIGHT, RendererBackend::Cpu)?;
     let id = canvas.id();
     app.borrow_mut().set_canvas(id);
@@ -141,7 +169,16 @@ fn run() -> AureaResult<()> {
     *shown.borrow_mut() = Rc::downgrade(&window);
     let input = Rc::clone(&app);
     let weak = Rc::downgrade(&window);
+    let scale = std::cell::Cell::new(window.scale_factor());
     window.on_event(move |event| {
+        // another screen's scale wants the icon at other sizes
+        if let WindowEvent::Resized { scale: now, .. } = event
+            && (*now - scale.get()).abs() > f32::EPSILON
+            && let (Some(set), Some(window)) = (&icons, weak.upgrade())
+        {
+            scale.set(*now);
+            let _ = window.set_icon_set(set);
+        }
         let Ok(mut a) = input.try_borrow_mut() else {
             // an event sent from inside a frame; the frame redraws anyway
             return;
@@ -405,5 +442,13 @@ mod tests {
         let missing = dir.join("b.rs:3");
         assert_eq!(with_line(missing.clone()), (missing, None), "no such file");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_icon_reads_at_its_size() {
+        let set = icon_set().expect("icons");
+        let sizes: Vec<u32> = set.images().iter().map(|i| i.width).collect();
+        assert_eq!(sizes, [16, 24, 32, 48, 64, 256]);
+        assert!(set.images().iter().all(|i| i.width == i.height));
     }
 }
