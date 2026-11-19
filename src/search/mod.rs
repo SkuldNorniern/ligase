@@ -1,12 +1,14 @@
-//! find in files. a search walks the workspace on its own thread and sends
-//! hits back file by file; a new search stops the old one.
+//! find in files. one thread walks the workspace, skipping what
+//! `.gitignore` leaves out, and hands files to a few readers; their hits come
+//! back file by file, put in walk order. a new search stops the old one.
 
+pub mod ignore;
 pub mod view;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 
 use aurea::render::{CanvasId, request_canvas_redraw};
 
@@ -32,8 +34,12 @@ pub struct Hit {
 }
 
 enum Found {
-    Hits(Vec<Hit>),
-    Done { files: usize, capped: bool },
+    /// the hits of the file walked `n`th.
+    Hits(usize, Vec<Hit>),
+    Done {
+        files: usize,
+        capped: bool,
+    },
 }
 
 /// one running search.
@@ -54,6 +60,9 @@ pub struct Finder {
     /// what replace all puts in place of each hit.
     pub replace: String,
     pub hits: Vec<Hit>,
+    /// for each hit, the walk order of its file, so readers finishing out
+    /// of turn still list in order.
+    order: Vec<usize>,
     running: Option<Search>,
     /// files looked at and whether the hit cap was reached, once done.
     pub done: Option<(usize, bool)>,
@@ -77,6 +86,7 @@ impl Finder {
             paths.len()
         };
         self.query = title;
+        self.order = vec![0; hits.len()];
         self.hits = hits;
         self.done = Some((files, false));
         self.scroll = 0.0;
@@ -87,6 +97,7 @@ impl Finder {
     pub fn start(&mut self, root: &Path, canvas: Option<CanvasId>) {
         self.running = None;
         self.hits.clear();
+        self.order.clear();
         self.done = None;
         self.selected = None;
         self.scroll = 0.0;
@@ -106,8 +117,8 @@ impl Finder {
                         request_canvas_redraw(id);
                     }
                 };
-                let (files, capped) = walk(&root, &query, &quit, &mut |hits| {
-                    let _ = tx.send(Found::Hits(hits));
+                let (files, capped) = walk(&root, &query, &quit, &mut |n, hits| {
+                    let _ = tx.send(Found::Hits(n, hits));
                     wake();
                 });
                 let _ = tx.send(Found::Done { files, capped });
@@ -124,7 +135,12 @@ impl Finder {
         let mut finished = None;
         while let Ok(found) = search.found.try_recv() {
             match found {
-                Found::Hits(hits) => self.hits.extend(hits),
+                Found::Hits(n, hits) => {
+                    let at = self.order.partition_point(|&o| o <= n);
+                    self.order
+                        .splice(at..at, std::iter::repeat_n(n, hits.len()));
+                    self.hits.splice(at..at, hits);
+                }
                 Found::Done { files, capped } => finished = Some((files, capped)),
             }
         }
@@ -168,89 +184,240 @@ pub fn matcher(query: &str) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
     }
 }
 
-/// walks `root` for `query`. sends hits in batches; returns files read and
-/// whether the cap stopped it.
-fn walk(
-    root: &Path,
-    query: &str,
-    stop: &AtomicBool,
-    send: &mut dyn FnMut(Vec<Hit>),
-) -> (usize, bool) {
-    let find = matcher(query);
-    let mut stack = vec![root.to_path_buf()];
-    let mut files = 0;
-    let mut total = 0;
-    while let Some(dir) = stack.pop() {
+/// the files under `root` in walk order (names sorted, a folder's files
+/// before its folders), leaving out [`SKIP`] and what `.gitignore` files
+/// ignore, from the repository's top down. `visit` gives false to stop.
+/// reads the disk: worker only.
+pub fn files(root: &Path, stop: &AtomicBool, visit: &mut dyn FnMut(PathBuf) -> bool) {
+    let mut stack = vec![(root.to_path_buf(), outer_rules(root))];
+    while let Some((dir, rules)) = stack.pop() {
         if stop.load(Ordering::Relaxed) {
-            break;
+            return;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        let rules = match entries.iter().find(|e| e.file_name() == ".gitignore") {
+            Some(e) => {
+                ignore::Rules::read(&dir, &e.path()).map_or(rules.clone(), |r| rules.with(r))
+            }
+            None => rules,
+        };
         let mut dirs = Vec::new();
         for entry in entries {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            let name = entry.file_name();
+            let path = entry.path();
             if kind.is_dir() {
-                if !SKIP.iter().any(|s| name == *s) {
-                    dirs.push(entry.path());
+                if !SKIP.iter().any(|s| entry.file_name() == *s) && !rules.ignored(&path, true) {
+                    dirs.push(path);
                 }
-                continue;
-            }
-            if !kind.is_file() || entry.metadata().is_ok_and(|m| m.len() > MAX_FILE) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            // a nul byte early on means binary
-            if bytes.iter().take(8192).any(|&b| b == 0) {
-                continue;
-            }
-            let Ok(text) = std::str::from_utf8(&bytes) else {
-                continue;
-            };
-            files += 1;
-            let mut hits = Vec::new();
-            for (line, body) in text.lines().enumerate() {
-                if let Some((column, len)) = find(body) {
-                    let mut preview = body.trim().to_owned();
-                    if preview.len() > MAX_PREVIEW {
-                        let mut cut = MAX_PREVIEW;
-                        while !preview.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        preview.truncate(cut);
-                    }
-                    hits.push(Hit {
-                        path: entry.path(),
-                        line,
-                        column,
-                        len,
-                        preview,
-                    });
-                    total += 1;
-                    if total >= MAX_HITS {
-                        send(hits);
-                        return (files, true);
-                    }
-                }
-            }
-            if !hits.is_empty() {
-                send(hits);
+            } else if kind.is_file() && !rules.ignored(&path, false) && !visit(path) {
+                return;
             }
         }
         // sorted names, popped from the back: push in reverse
-        stack.extend(dirs.into_iter().rev());
+        stack.extend(dirs.into_iter().rev().map(|d| (d, rules.clone())));
     }
-    (files, false)
+}
+
+/// most folders walked up looking for the repository's top.
+const MAX_UP: usize = 64;
+
+/// rules from above `root` that still count inside it: the repository's
+/// `.git/info/exclude` and the `.gitignore` files between its top and
+/// `root`. none outside a repository.
+fn outer_rules(root: &Path) -> ignore::Stack {
+    let Some(top) = root
+        .ancestors()
+        .take(MAX_UP)
+        .find(|d| d.join(".git").exists())
+    else {
+        return ignore::Stack::default();
+    };
+    let mut stack = ignore::Stack::default();
+    if let Some(r) = ignore::Rules::read(top, &top.join(".git/info/exclude")) {
+        stack = stack.with(r);
+    }
+    // the root's own .gitignore is read by the walk
+    let mut above: Vec<&Path> = root.ancestors().skip(1).take_while(|d| *d != top).collect();
+    if top != root {
+        above.push(top);
+    }
+    for dir in above.into_iter().rev() {
+        if let Some(r) = ignore::Rules::read(dir, &dir.join(".gitignore")) {
+            stack = stack.with(r);
+        }
+    }
+    stack
+}
+
+/// readers searching files at once. past about four, opening files is the
+/// limit, not the cores (86k files: 7.8 s with one, 3.2 s with four).
+fn readers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4))
+}
+
+/// files handed to a reader at a time, so the queue lock is taken rarely.
+const BATCH: usize = 64;
+
+/// walks `root` for `query` with a few readers. sends each file's hits with
+/// its place in the walk; returns files read and whether the cap stopped it.
+fn walk(
+    root: &Path,
+    query: &str,
+    stop: &AtomicBool,
+    send: &mut (dyn FnMut(usize, Vec<Hit>) + Send),
+) -> (usize, bool) {
+    let read = AtomicUsize::new(0);
+    let total = AtomicUsize::new(0);
+    let capped = AtomicBool::new(false);
+    let send = Mutex::new(send);
+    // a short queue: the walk stays a little ahead of the readers
+    let (tx, rx) = sync_channel::<Vec<(usize, PathBuf)>>(8);
+    let rx = Mutex::new(rx);
+    std::thread::scope(|scope| {
+        for _ in 0..readers() {
+            scope.spawn(|| {
+                loop {
+                    let next = rx.lock().ok().and_then(|r| r.recv().ok());
+                    let Some(batch) = next else { return };
+                    for (n, path) in batch {
+                        if stop.load(Ordering::Relaxed) || capped.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let Some(text) = read_text(&path) else {
+                            continue;
+                        };
+                        read.fetch_add(1, Ordering::Relaxed);
+                        let mut hits: Vec<Hit> = matches(&text, query)
+                            .into_iter()
+                            .map(|(line, column, len, body)| Hit {
+                                path: path.clone(),
+                                line,
+                                column,
+                                len,
+                                preview: preview(body),
+                            })
+                            .collect();
+                        if hits.is_empty() {
+                            continue;
+                        }
+                        let before = total.fetch_add(hits.len(), Ordering::Relaxed);
+                        if before + hits.len() >= MAX_HITS {
+                            hits.truncate(MAX_HITS.saturating_sub(before));
+                            capped.store(true, Ordering::Relaxed);
+                        }
+                        if !hits.is_empty()
+                            && let Ok(mut send) = send.lock()
+                        {
+                            send(n, hits);
+                        }
+                    }
+                }
+            });
+        }
+        let mut n = 0;
+        let mut batch = Vec::with_capacity(BATCH);
+        files(root, stop, &mut |path| {
+            if capped.load(Ordering::Relaxed) {
+                return false;
+            }
+            batch.push((n, path));
+            n += 1;
+            batch.len() < BATCH || tx.send(std::mem::take(&mut batch)).is_ok()
+        });
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        drop(tx);
+    });
+    (read.into_inner(), capped.into_inner())
+}
+
+/// a file's text: none when it is too big, binary or not UTF-8.
+fn read_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    // one open: on windows each open costs more than the read
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > MAX_FILE {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).ok()?);
+    file.take(MAX_FILE).read_to_end(&mut bytes).ok()?;
+    // a nul byte early on means binary
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// the line, trimmed and cut short on a char edge.
+fn preview(body: &str) -> String {
+    let mut preview = body.trim().to_owned();
+    if preview.len() > MAX_PREVIEW {
+        let mut cut = MAX_PREVIEW;
+        while !preview.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        preview.truncate(cut);
+    }
+    preview
+}
+
+/// the first match on each line of `text`: (line from 0, byte column, byte
+/// length, the line without its ending), smart case like [`matcher`]. an
+/// ascii query is found in the whole text at once, in a copy lowered once
+/// for any case, not a line at a time.
+fn matches<'t>(text: &'t str, query: &str) -> Vec<(usize, usize, usize, &'t str)> {
+    let mut out = Vec::new();
+    let fold = !query.chars().any(char::is_uppercase);
+    if query.is_empty() || (fold && !query.is_ascii()) {
+        let find = matcher(query);
+        for (line, body) in text.lines().enumerate() {
+            if let Some((column, len)) = find(body) {
+                out.push((line, column, len, body));
+            }
+        }
+        return out;
+    }
+    let lowered;
+    let (hay, needle): (&str, String) = if fold {
+        lowered = text.to_ascii_lowercase();
+        (&lowered, query.to_ascii_lowercase())
+    } else {
+        (text, query.to_owned())
+    };
+    let bytes = text.as_bytes();
+    let (mut from, mut line, mut counted) = (0, 0, 0);
+    while let Some(at) = hay
+        .get(from..)
+        .and_then(|h| h.find(&needle))
+        .map(|i| i + from)
+    {
+        let start = hay[..at].rfind('\n').map_or(0, |n| n + 1);
+        line += bytes[counted..start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        counted = start;
+        let end = hay[at..].find('\n').map_or(hay.len(), |n| n + at);
+        // like `str::lines`: a `\r` goes with a `\n` after it, not alone at the end
+        let body_end = if end > start && end < bytes.len() && bytes[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        if at + needle.len() <= body_end {
+            out.push((line, at - start, needle.len(), &text[start..body_end]));
+        }
+        from = end + 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -288,9 +455,13 @@ mod tests {
         std::fs::write(dir.join("c.bin"), b"needle\0\0").unwrap();
         std::fs::write(dir.join("d.txt"), "가 needle\r\n").unwrap();
         let mut hits = Vec::new();
-        let (files, capped) = walk(&dir, "needle", &AtomicBool::new(false), &mut |h| {
-            hits.extend(h)
+        let mut batches = Vec::new();
+        let (files, capped) = walk(&dir, "needle", &AtomicBool::new(false), &mut |n, h| {
+            batches.push((n, h));
         });
+        // readers finish in any order; the walk order puts them back
+        batches.sort_by_key(|b| b.0);
+        hits.extend(batches.into_iter().flat_map(|b| b.1));
         assert!(!capped);
         assert_eq!(files, 2);
         let names: Vec<String> = hits
@@ -304,9 +475,95 @@ mod tests {
     }
 
     #[test]
+    fn whole_text_matching_agrees_with_line_matching() {
+        // a small generator, no crate: lines from a few pieces
+        let pieces = [
+            "ab", "AB", "aB", "x", " ", "\r", "가", "needle", "NeEdLe", "\t",
+        ];
+        let mut seed: u32 = 7;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as usize
+        };
+        for _ in 0..300 {
+            let mut text = String::new();
+            for _ in 0..next() % 40 {
+                if next() % 5 == 0 {
+                    text.push(if next() % 3 == 0 { '\r' } else { '\n' });
+                    if text.ends_with('\r') {
+                        text.push('\n');
+                    }
+                } else {
+                    text.push_str(pieces[next() % pieces.len()]);
+                }
+            }
+            for query in ["ab", "AB", "needle", "x x", "b\tx", "가"] {
+                let find = matcher(query);
+                let want: Vec<_> = text
+                    .lines()
+                    .enumerate()
+                    .filter_map(|(i, body)| find(body).map(|(c, l)| (i, c, l, body)))
+                    .collect();
+                assert_eq!(matches(&text, query), want, "{text:?} {query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_walk_keeps_to_gitignore() {
+        let dir = std::env::temp_dir().join(format!("ligase-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(dir.join("src/gen")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "out/\n*.log\n").unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "secret.txt\n").unwrap();
+        std::fs::write(dir.join("src/.gitignore"), "gen/\n!keep.log\n").unwrap();
+        for f in [
+            "a.rs",
+            "x.log",
+            "secret.txt",
+            "out/b.rs",
+            "src/c.rs",
+            "src/keep.log",
+            "src/gen/d.rs",
+        ] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let mut seen = Vec::new();
+        files(&dir, &AtomicBool::new(false), &mut |p| {
+            seen.push(
+                p.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            true
+        });
+        assert_eq!(
+            seen,
+            [
+                ".gitignore",
+                "a.rs",
+                "src/.gitignore",
+                "src/c.rs",
+                "src/keep.log"
+            ]
+        );
+        // a folder inside the repository still sees the rules above it
+        let mut inner = Vec::new();
+        files(&dir.join("src"), &AtomicBool::new(false), &mut |p| {
+            inner.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            true
+        });
+        assert_eq!(inner, [".gitignore", "c.rs", "keep.log"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn stop_ends_walk() {
         let mut hits = Vec::new();
-        let (files, _) = walk(Path::new("."), "x", &AtomicBool::new(true), &mut |h| {
+        let (files, _) = walk(Path::new("."), "x", &AtomicBool::new(true), &mut |_, h| {
             hits.extend(h)
         });
         assert_eq!(files, 0);

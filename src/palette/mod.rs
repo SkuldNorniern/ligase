@@ -295,37 +295,20 @@ fn walk(query: &str, text: &str, base: usize) -> Option<(i32, Vec<usize>)> {
     Some((score * 4 - len, marks))
 }
 
-/// relative paths of the files under `root`, `/` between parts, skipping
-/// the folders search skips. runs on the worker.
+/// relative paths of the files under `root`, `/` between parts, leaving
+/// out what search leaves out (`.gitignore` too). runs on the worker.
 pub fn list_files(root: &Path) -> Vec<Item> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                if !crate::search::SKIP.iter().any(|s| entry.file_name() == *s) {
-                    stack.push(path);
-                }
-            } else if kind.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                out.push(Item {
-                    text: rel.to_string_lossy().replace('\\', "/"),
-                    note: String::new(),
-                });
-                if out.len() >= MAX_FILES {
-                    return out;
-                }
-            }
+    let never = std::sync::atomic::AtomicBool::new(false);
+    crate::search::files(root, &never, &mut |path| {
+        if let Ok(rel) = path.strip_prefix(root) {
+            out.push(Item {
+                text: rel.to_string_lossy().replace('\\', "/"),
+                note: String::new(),
+            });
         }
-    }
+        out.len() < MAX_FILES
+    });
     out.sort_by(|a, b| a.text.cmp(&b.text));
     out
 }
