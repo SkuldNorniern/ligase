@@ -414,7 +414,11 @@ enum Done {
     /// paths the system asked to open, and which of them are folders.
     Opened(Vec<(PathBuf, bool)>),
     Listed(PathBuf, Result<Vec<(String, bool)>, String>),
-    Loaded(DocumentId, Result<String, String>, Option<document::Stamp>),
+    Loaded(
+        DocumentId,
+        Result<document::Loaded, String>,
+        Option<document::Stamp>,
+    ),
     /// stamps of open files now, for the ones that changed.
     Disk(Vec<(DocumentId, Option<document::Stamp>)>),
     Reloaded(
@@ -3472,7 +3476,7 @@ impl App {
         let path = path.to_path_buf();
         if !self.jobs.run(move || {
             let disk = document::stamp(&path);
-            Done::Loaded(doc, document::read_text(&path), disk)
+            Done::Loaded(doc, document::read_loaded(&path), disk)
         }) {
             self.docs
                 .loaded(doc, Err("the file worker is not running".to_owned()));
@@ -3610,7 +3614,7 @@ impl App {
                     self.explorer.listed(&path, Vec::new());
                 }
                 Done::Loaded(doc, result, disk) => {
-                    self.docs.loaded(doc, result);
+                    self.docs.loaded_text(doc, result);
                     // a csv too big to load opens as its table, read from the file
                     let too_big = self
                         .docs
