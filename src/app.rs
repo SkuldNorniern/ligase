@@ -5801,9 +5801,15 @@ struct FrameStats {
 
 impl FrameStats {
     const EVERY: usize = 120;
+    /// a frame this long is a stall someone sees: said right away.
+    const SLOW_MS: f32 = 50.0;
 
     fn add(&mut self, took: std::time::Duration) {
-        self.times.push(took.as_secs_f32() * 1000.0);
+        let ms = took.as_secs_f32() * 1000.0;
+        if ms > Self::SLOW_MS {
+            eprintln!("slow frame: {ms:.1} ms");
+        }
+        self.times.push(ms);
         if self.times.len() >= Self::EVERY {
             let (avg, p95, max) = summary(&mut self.times);
             eprintln!(
