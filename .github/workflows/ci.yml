@@ -22,12 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out resolvase and vanta
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/SkuldNorniern/resolvase ../resolvase
-          git clone --depth 1 https://github.com/SkuldNorniern/vanta ../vanta
-
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:

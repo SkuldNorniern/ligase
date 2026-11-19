@@ -50,7 +50,7 @@ builds are on the [releases](https://github.com/SkuldNorniern/ligase/releases) p
 cargo build --release
 ```
 
-`resolvase` and `vanta` sit next to this folder. `kago build` makes the windows setup in `dist/`.
+`kago build` makes the windows setup in `dist/`; kago is `cargo install --git https://github.com/SkuldNorniern/kago`.
 
 windows 11 first; linux and macos are next. needs `git` on the path for source control and `ssh` for remote work.
 

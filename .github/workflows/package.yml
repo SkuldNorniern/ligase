@@ -13,6 +13,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # the kago that builds the windows setup
+  KAGO_REV: a9f94d299d1a59066d35d2da0ab137537b061726
 
 jobs:
   build:
@@ -32,12 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out resolvase and vanta
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/SkuldNorniern/resolvase ../resolvase
-          git clone --depth 1 https://github.com/SkuldNorniern/vanta ../vanta
-
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
@@ -49,8 +45,8 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/kago*
             target
-          key: ${{ runner.os }}-package-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-package-cargo-
+          key: ${{ runner.os }}-package-cargo-${{ env.KAGO_REV }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-package-cargo-${{ env.KAGO_REV }}-
 
       - name: Install Linux system deps
         if: runner.os == 'Linux'
@@ -62,7 +58,7 @@ jobs:
       - name: Install kago
         if: runner.os == 'Windows'
         shell: bash
-        run: command -v kago || cargo install --locked --git https://github.com/SkuldNorniern/kago
+        run: command -v kago || cargo install --locked --git https://github.com/SkuldNorniern/kago --rev "$KAGO_REV"
 
       - name: Build
         run: cargo build --release
