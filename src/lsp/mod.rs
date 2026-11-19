@@ -42,7 +42,8 @@ pub struct ServerSpec {
     pub language_id: String,
     /// the package that declared it; none for the ones ligase knows.
     pub package: Option<String>,
-    /// file names that mark the folder to start in; see [`root_for`].
+    /// file names that mark the folder to start in, most wanted first; see
+    /// [`root_for`].
     pub roots: Vec<String>,
 }
 
@@ -50,11 +51,13 @@ pub struct ServerSpec {
 const MAX_UP: usize = 64;
 
 /// the folder a server for `file` starts in: the nearest one above it that
-/// holds one of `marks`, else `workspace`. reads the disk: worker only.
+/// holds the first of `marks`, else the next mark, else `workspace`. so
+/// `Cargo.lock` before `Cargo.toml` finds a cargo workspace, not a member.
+/// reads the disk: worker only.
 pub fn root_for(file: &Path, marks: &[String], workspace: &Path) -> PathBuf {
-    if !marks.is_empty() {
+    for mark in marks {
         for dir in file.ancestors().skip(1).take(MAX_UP) {
-            if marks.iter().any(|m| dir.join(m).is_file()) {
+            if dir.join(mark).is_file() {
                 return dir.to_path_buf();
             }
         }
@@ -62,25 +65,61 @@ pub fn root_for(file: &Path, marks: &[String], workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// servers ligase knows: sylven language, program, args, lsp language id.
-const BUILT_IN: &[(&str, &str, &[&str], &str)] = &[
-    ("rust", "rust-analyzer", &[], "rust"),
-    ("python", "pyright-langserver", &["--stdio"], "python"),
-    ("c", "clangd", &[], "c"),
-    ("toml", "taplo", &["lsp", "stdio"], "toml"),
+/// a server ligase knows without an extension.
+struct BuiltIn {
+    /// sylven language.
+    language: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+    /// lsp language id.
+    id: &'static str,
+    /// root marks; a folder with many projects starts the server in the one
+    /// the file is in, not the folder itself.
+    roots: &'static [&'static str],
+}
+
+const BUILT_IN: &[BuiltIn] = &[
+    BuiltIn {
+        language: "rust",
+        program: "rust-analyzer",
+        args: &[],
+        id: "rust",
+        roots: &["Cargo.lock", "Cargo.toml"],
+    },
+    BuiltIn {
+        language: "python",
+        program: "pyright-langserver",
+        args: &["--stdio"],
+        id: "python",
+        roots: &["pyrightconfig.json", "pyproject.toml", "setup.py"],
+    },
+    BuiltIn {
+        language: "c",
+        program: "clangd",
+        args: &[],
+        id: "c",
+        roots: &["compile_commands.json", ".clangd", "CMakeLists.txt"],
+    },
+    BuiltIn {
+        language: "toml",
+        program: "taplo",
+        args: &["lsp", "stdio"],
+        id: "toml",
+        roots: &[],
+    },
 ];
 
 fn built_in(language: &str) -> Option<ServerSpec> {
     BUILT_IN
         .iter()
-        .find(|(l, ..)| *l == language)
-        .map(|(l, command, args, id)| ServerSpec {
-            language: (*l).to_owned(),
-            command: (*command).to_owned(),
-            args: args.iter().map(|a| (*a).to_owned()).collect(),
-            language_id: (*id).to_owned(),
+        .find(|b| b.language == language)
+        .map(|b| ServerSpec {
+            language: b.language.to_owned(),
+            command: b.program.to_owned(),
+            args: b.args.iter().map(|a| (*a).to_owned()).collect(),
+            language_id: b.id.to_owned(),
             package: None,
-            roots: Vec::new(),
+            roots: b.roots.iter().map(|r| (*r).to_owned()).collect(),
         })
 }
 
@@ -1001,6 +1040,23 @@ mod tests {
         assert_eq!(root_for(&file, &[], &dir), dir, "no marks, the workspace");
         let none = vec!["Cargo.toml".to_owned()];
         assert_eq!(root_for(&file, &none, &dir), dir, "no mark found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cargo_workspace_wins_over_its_member() {
+        let dir = std::env::temp_dir().join(format!("ligase-cargo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ws/member/src")).unwrap();
+        std::fs::write(dir.join("ws/Cargo.toml"), "").unwrap();
+        std::fs::write(dir.join("ws/Cargo.lock"), "").unwrap();
+        std::fs::write(dir.join("ws/member/Cargo.toml"), "").unwrap();
+        let file = dir.join("ws/member/src/lib.rs");
+        let rust = built_in("rust").unwrap();
+        assert_eq!(root_for(&file, &rust.roots, &dir), dir.join("ws"));
+        // no lock yet: the nearest manifest
+        std::fs::remove_file(dir.join("ws/Cargo.lock")).unwrap();
+        assert_eq!(root_for(&file, &rust.roots, &dir), dir.join("ws/member"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
