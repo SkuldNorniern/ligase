@@ -94,6 +94,8 @@ fn with_line(arg: PathBuf) -> (PathBuf, Option<usize>) {
 }
 
 fn run() -> AureaResult<()> {
+    // the arguments are read here; later opens come as OpenRequested
+    let _ = aurea::app::take_opened();
     let first = std::env::args_os().nth(1);
     // a new window has no folder; its explorer is hidden, home stands in
     let blank = first.as_deref() == Some(std::ffi::OsStr::new(app::NEW_WINDOW));
@@ -183,6 +185,9 @@ fn run() -> AureaResult<()> {
             // an event sent from inside a frame; the frame redraws anyway
             return;
         };
+        if matches!(event, WindowEvent::OpenRequested) {
+            a.open_requested(aurea::app::take_opened());
+        }
         let redraw = a.event(event);
         let close = std::mem::take(&mut a.close_now);
         drop(a);

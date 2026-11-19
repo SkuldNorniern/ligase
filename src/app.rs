@@ -411,6 +411,8 @@ struct FileDone {
 
 /// what the worker hands back.
 enum Done {
+    /// paths the system asked to open, and which of them are folders.
+    Opened(Vec<(PathBuf, bool)>),
     Listed(PathBuf, Result<Vec<(String, bool)>, String>),
     Loaded(DocumentId, Result<String, String>, Option<document::Stamp>),
     /// stamps of open files now, for the ones that changed.
@@ -804,6 +806,25 @@ impl App {
     /// the folder to start again on, once the window is closed.
     pub fn take_reopen(&mut self) -> Option<PathBuf> {
         self.reopen.take()
+    }
+
+    /// opens what the system handed over, like a finder double click: files
+    /// here, each folder in a window of its own. a worker tells them apart.
+    pub fn open_requested(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.jobs.run(move || {
+            Done::Opened(
+                paths
+                    .into_iter()
+                    .map(|p| {
+                        let dir = p.is_dir();
+                        (p, dir)
+                    })
+                    .collect(),
+            )
+        });
     }
 
     /// opens `path` in an editor, at `line` (from 0) when given, after the
@@ -3764,6 +3785,22 @@ impl App {
                 }
                 Done::Branch(branch) => self.branch = branch,
                 Done::Recent(recent) => self.recent = recent,
+                Done::Opened(paths) => {
+                    for (path, dir) in paths {
+                        if !dir {
+                            self.open_at_start(path, None);
+                            continue;
+                        }
+                        let spawned = std::env::current_exe()
+                            .and_then(|exe| std::process::Command::new(exe).arg(&path).spawn());
+                        if let Err(e) = spawned {
+                            self.say(format!(
+                                "{}: {e}",
+                                self.texts.tr("Couldn't open a new window")
+                            ));
+                        }
+                    }
+                }
                 Done::Diff(doc, revision, rows) => {
                     self.diffs.insert(doc, (Some(revision), false, rows));
                 }
