@@ -533,6 +533,9 @@ pub struct App {
     docs: Documents,
     explorer: Explorer,
     jobs: Jobs<Done>,
+    /// work that starts a program: git, shells, servers, ssh. its own
+    /// worker, so a slow git never holds up a file being read.
+    procs: Jobs<Done>,
     syntax: Syntax,
     shells: terminal::Shells,
     finder: Finder,
@@ -691,6 +694,7 @@ impl App {
             docs: Documents::default(),
             explorer: Explorer::new(root),
             jobs: Jobs::default(),
+            procs: Jobs::default(),
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
             finder: Finder::default(),
@@ -858,17 +862,14 @@ impl App {
 
     pub fn set_canvas(&mut self, id: CanvasId) {
         self.jobs.set_canvas(id);
+        self.procs.set_canvas(id);
         self.syntax.set_canvas(id);
         self.watcher.set_canvas(id);
         self.canvas = Some(id);
         // the branch, now that its answer has a canvas to wake
         let root = self.explorer.root().to_path_buf();
-        self.jobs
+        self.procs
             .run(move || Done::Branch(crate::git::branch(&root)));
-    }
-
-    pub fn busy(&self) -> bool {
-        self.jobs.busy()
     }
 
     pub fn title(&self) -> String {
@@ -1108,7 +1109,7 @@ impl App {
                 lsp::server::Server::spawn(&spec.command, &args, &root, wake),
             )
         };
-        if !self.jobs.run(job) {
+        if !self.procs.run(job) {
             self.lsp
                 .started(language, Err("the file worker is not running".to_owned()));
         }
@@ -1130,7 +1131,7 @@ impl App {
             };
             Done::Shell(id, terminal::spawn(&root, remote.as_deref(), wake))
         };
-        if !self.jobs.run(job) {
+        if !self.procs.run(job) {
             self.shells
                 .current_mut()
                 .started(Err("the file worker is not running".to_owned()));
@@ -2351,7 +2352,7 @@ impl App {
                 && !rels.is_empty()
                 && let Some(top) = self.changes.as_ref().map(|s| s.top.clone())
             {
-                self.jobs
+                self.procs
                     .run(move || Done::GitDid(crate::git::discard(&top, &rels).map(|()| false)));
             }
             return;
@@ -3030,7 +3031,7 @@ impl App {
         else {
             return;
         };
-        self.jobs.run(move || {
+        self.procs.run(move || {
             let base = crate::git::base(&path);
             Done::GitBase(doc, path, base)
         });
@@ -3044,7 +3045,7 @@ impl App {
         }
         self.refresh_status();
         let root = self.explorer.root().to_path_buf();
-        self.jobs
+        self.procs
             .run(move || Done::Branch(crate::git::branch(&root)));
     }
 
@@ -3058,7 +3059,7 @@ impl App {
         // the graph is read only while the panel is up
         let graph = self.shows(Panel::Git);
         let pick = self.repo_pick.clone();
-        self.changes_asked = self.jobs.run(move || {
+        self.changes_asked = self.procs.run(move || {
             // past this many, only the picked one reads its branch
             const TRACKED: usize = 12;
             let tops = crate::git::repos(&root);
@@ -3252,14 +3253,14 @@ impl App {
         match ask {
             Ask::Repo(_) => {}
             Ask::Branches => {
-                self.jobs
+                self.procs
                     .run(move || Done::Branches(crate::git::branches(&top)));
             }
             Ask::Fetch => self.sync_job(SyncJob::Fetch, top, crate::git::fetch),
             Ask::Pull => self.sync_job(SyncJob::Pull, top, crate::git::pull),
             Ask::Push => self.sync_job(SyncJob::Push, top, crate::git::push),
             Ask::Show(id) => {
-                self.jobs
+                self.procs
                     .run(move || Done::CommitShown(crate::git::graph::detail(&top, &id)));
             }
             Ask::Open(path) => {
@@ -3273,7 +3274,7 @@ impl App {
                 self.show_diff(view);
             }
             Ask::Stage(rels) => {
-                self.jobs
+                self.procs
                     .run(move || Done::GitDid(crate::git::stage(&top, &rels).map(|()| false)));
             }
             Ask::Discard(rels) => {
@@ -3281,7 +3282,7 @@ impl App {
                 self.dialog = Some(Dialog::ConfirmDiscard);
             }
             Ask::Unstage(rels) => {
-                self.jobs
+                self.procs
                     .run(move || Done::GitDid(crate::git::unstage(&top, &rels).map(|()| false)));
             }
             Ask::Commit => {
@@ -3290,7 +3291,7 @@ impl App {
                     self.say(self.texts.tr("Commit message is empty").to_owned());
                     return;
                 }
-                self.jobs
+                self.procs
                     .run(move || Done::GitDid(crate::git::commit(&top, &message).map(|()| true)));
             }
         }
@@ -3308,7 +3309,7 @@ impl App {
             return;
         }
         self.scm.busy = true;
-        if !self.jobs.run(move || Done::Synced(job, work(&top))) {
+        if !self.procs.run(move || Done::Synced(job, work(&top))) {
             self.scm.busy = false;
         }
     }
@@ -3601,7 +3602,7 @@ impl App {
         for (doc, language, text) in self.docs.wanting_colours() {
             self.syntax.ask(doc, language, text);
         }
-        while let Some(done) = self.jobs.take() {
+        while let Some(done) = self.jobs.take().or_else(|| self.procs.take()) {
             match done {
                 Done::Listed(path, Ok(entries)) => self.explorer.listed(&path, entries),
                 Done::Listed(path, Err(why)) => {
@@ -4874,7 +4875,7 @@ impl App {
         }
         self.remote = Some(crate::remote::browse::Browser::new(host.clone()));
         self.bench.show(Panel::Remote);
-        self.jobs.run(move || {
+        self.procs.run(move || {
             let result = (|| {
                 let mut session = crate::remote::Session::connect(&host)?;
                 let root = match path {
@@ -4901,7 +4902,7 @@ impl App {
         let host = browser.host.clone();
         match ask {
             Ask::List(dir) => {
-                self.jobs.run(move || {
+                self.procs.run(move || {
                     let result = link
                         .lock()
                         .map_err(|_| "the link broke".to_owned())
@@ -4910,7 +4911,7 @@ impl App {
                 });
             }
             Ask::Open(path) => {
-                self.jobs.run(move || {
+                self.procs.run(move || {
                     let result = (|| {
                         let local = crate::remote::browse::cache_path(&host, &path)
                             .ok_or_else(|| "no place for a local copy".to_owned())?;
@@ -4949,7 +4950,7 @@ impl App {
             return;
         };
         let link = std::sync::Arc::clone(link);
-        self.jobs.run(move || {
+        self.procs.run(move || {
             let result = std::fs::read(&local)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| {
@@ -5013,7 +5014,7 @@ impl App {
         let rel = rel.to_string_lossy().replace('\\', "/");
         let snap = doc.buffer.snapshot();
         let (revision, top) = (key.2, top);
-        self.jobs.run(move || {
+        self.procs.run(move || {
             let body = snap.slice(0..snap.len()).unwrap_or_default();
             Done::Blame(
                 view,

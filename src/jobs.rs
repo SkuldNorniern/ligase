@@ -13,8 +13,6 @@ pub struct Jobs<T: Send + 'static> {
     to_worker: Option<Sender<Job<T>>>,
     done: Receiver<T>,
     canvas: Arc<Mutex<Option<CanvasId>>>,
-    /// jobs sent and not picked up yet.
-    waiting: usize,
 }
 
 impl<T: Send + 'static> Default for Jobs<T> {
@@ -40,7 +38,6 @@ impl<T: Send + 'static> Default for Jobs<T> {
             to_worker: started.ok().map(|_| to_worker),
             done,
             canvas,
-            waiting: 0,
         }
     }
 }
@@ -55,25 +52,15 @@ impl<T: Send + 'static> Jobs<T> {
 
     /// runs `job` after the ones before it. false when there is no worker.
     pub fn run(&mut self, job: impl FnOnce() -> T + Send + 'static) -> bool {
-        let sent = self
-            .to_worker
+        self.to_worker
             .as_ref()
-            .is_some_and(|tx| tx.send(Box::new(job)).is_ok());
-        if sent {
-            self.waiting += 1;
-        }
-        sent
+            .is_some_and(|tx| tx.send(Box::new(job)).is_ok())
     }
 
-    /// a finished job's result, if one is in.
+    /// a finished job's result, if one is in. the worker wakes the canvas
+    /// for each one, so nobody has to keep drawing to wait for it.
     pub fn take(&mut self) -> Option<T> {
-        let done = self.done.try_recv().ok()?;
-        self.waiting = self.waiting.saturating_sub(1);
-        Some(done)
-    }
-
-    pub fn busy(&self) -> bool {
-        self.waiting > 0
+        self.done.try_recv().ok()
     }
 }
 
@@ -93,6 +80,6 @@ mod tests {
             }
         }
         assert_eq!(got, [1, 2]);
-        assert!(!jobs.busy());
+        assert!(jobs.take().is_none());
     }
 }

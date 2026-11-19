@@ -147,7 +147,7 @@ fn run() -> AureaResult<()> {
             if let Some(dialog) = dialog {
                 show_dialog(&drawn, &shown_in_draw, id, dialog);
             }
-            (result, close, a.ui.wants_frame() || a.busy())
+            (result, close, a.ui.wants_frame())
         };
         // the app is not borrowed past here; closing may send events back
         if close && let Some(window) = &window {
