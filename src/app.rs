@@ -904,8 +904,8 @@ impl App {
             }
             // aurea gives the wheel to the first list under the pointer in
             // draw order, which is the editor under the sheet; take it here
-            if let WindowEvent::MouseWheel { delta_y, .. } = event {
-                self.sheet.wheel(*delta_y);
+            if let WindowEvent::Scroll(scroll) = event {
+                self.sheet.wheel(notches(scroll));
                 return true;
             }
             if let WindowEvent::KeyInput { pressed: true, .. } = event
@@ -934,23 +934,22 @@ impl App {
             }
         }
         if self.palette.is_open()
-            && let WindowEvent::MouseWheel { delta_y, .. } = event
+            && let WindowEvent::Scroll(scroll) = event
         {
             // three rows a notch; the editor under the card keeps still
             #[allow(clippy::cast_possible_truncation)]
-            let by = -(delta_y * 3.0).round() as isize;
+            let by = -(notches(scroll) * 3.0).round() as isize;
             self.palette.scroll(by, palette::view::ROWS);
             return true;
         }
-        if let WindowEvent::MouseWheel {
-            delta_y, modifiers, ..
-        } = event
-            && modifiers.command()
+        if let WindowEvent::Scroll(scroll) = event
+            && scroll.modifiers.command()
             && !self.shell_focus
-            && *delta_y != 0.0
+            && scroll.delta_y != 0.0
+            && !scroll.is_momentum()
         {
             // ctrl (cmd on a mac) and the wheel zoom the editor
-            self.zoom_by(if *delta_y > 0.0 { 1.0 } else { -1.0 });
+            self.zoom_by(if scroll.delta_y > 0.0 { 1.0 } else { -1.0 });
             return true;
         }
         if self.shell_focus {
@@ -5885,6 +5884,12 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
+}
+
+/// how far a scroll went in wheel notches; a trackpad's pixels count as
+/// notches of one line's height.
+fn notches(scroll: &aurea::ScrollEvent) -> f64 {
+    scroll.clicks.map_or(scroll.delta_y / 40.0, |(_, y)| y)
 }
 
 #[cfg(test)]

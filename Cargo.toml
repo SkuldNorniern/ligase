@@ -7,7 +7,7 @@ description = "native, modular development environment"
 repository = "https://github.com/SkuldNorniern/ligase"
 
 [dependencies]
-aurea = { git = "https://github.com/SkuldNorniern/aurea", rev = "778862c079108849279266ffceee66e366dd1eff" }
+aurea = { git = "https://github.com/SkuldNorniern/aurea", rev = "09dd1e8d5ec1c5354e2055964ebe0ec7fda4e234" }
 resolvase = { path = "../resolvase" }
 vanta = { path = "../vanta" }
 toml = "1"
