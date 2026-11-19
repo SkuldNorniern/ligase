@@ -36,11 +36,21 @@ markdown reads as a page in the same tab, ctrl+shift+v or the read chip. csv fil
 
 ![csv table](assets/screenshots/table.png)
 
+## install
+
+builds are on the [releases](https://github.com/SkuldNorniern/ligase/releases) page, `nightly` follows main.
+
+- windows: `ligase-*-setup.exe`, or the zip for a folder you keep yourself. the setup can add ligase to PATH and an "Open with Ligase" entry on folders
+- macos: `ligase-*.dmg`, drag Ligase into Applications. it is not notarized yet, so open it once with right click, Open
+- linux: `ligase-*.tar.gz` holds `bin/` and `share/`, unpack it into `~/.local` or `/usr/local`
+
 ## build
 
 ```
 cargo build --release
 ```
+
+`resolvase` and `vanta` sit next to this folder. `kago build` makes the windows setup in `dist/`.
 
 windows 11 first; linux and macos are next. needs `git` on the path for source control and `ssh` for remote work.
 
