@@ -146,6 +146,11 @@ pub enum Command {
     TogglePreview,
     /// a shell on another machine, over ssh.
     NewRemoteShell,
+    /// a terminal tab running the coding agent from settings.
+    NewAgent,
+    /// points the agent at the file and lines in the editor: starts one
+    /// when none runs, types a mention into it and gives it the keyboard.
+    AskAgent,
     /// a folder on another machine in the side bar, over ssh.
     OpenRemoteFolder,
     ToggleProblems,
@@ -303,6 +308,8 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
         "New Remote Terminal (SSH)",
         Command::NewRemoteShell,
     ),
+    ("agent.new", "New Agent Terminal", Command::NewAgent),
+    ("agent.ask", "Ask Agent About This", Command::AskAgent),
     ("markdown.read", "Toggle Preview", Command::TogglePreview),
     ("view.problems", "Problems", Command::ToggleProblems),
     ("view.sourceControl", "Source Control", Command::ToggleGit),
@@ -1060,6 +1067,7 @@ impl App {
             Some(
                 command @ (Command::ToggleTerminal
                 | Command::NewTerminal
+                | Command::NewAgent
                 | Command::ToggleSidebar
                 | Command::ToggleExplorer
                 | Command::ToggleSearch
@@ -1124,6 +1132,7 @@ impl App {
     fn start_shell(&mut self) {
         let id = self.shells.current_id();
         let remote = self.shells.current().remote.clone();
+        let agent = self.shells.current().agent;
         self.shells.current_mut().state = terminal::State::Starting;
         let root = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
@@ -1133,13 +1142,57 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), wake))
+            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), agent, wake))
         };
         if !self.procs.run(job) {
             self.shells
                 .current_mut()
                 .started(Err("the file worker is not running".to_owned()));
         }
+    }
+
+    /// the terminal panel in sight with the keyboard in it.
+    fn show_terminal(&mut self) {
+        if !self.shows(Panel::Terminal) {
+            self.bench.toggle(Panel::Terminal);
+        }
+        self.ui.focus(Id::Terminal, 1);
+    }
+
+    /// types a mention of `view`'s file, and its selected lines or the
+    /// caret's line, into the agent's tab; starts the agent when none runs.
+    fn ask_agent(&mut self, view: Option<ViewId>) {
+        let agent = self.settings.agent;
+        let mention = view.and_then(|view| {
+            let doc = self.docs.doc_of(view)?;
+            if doc.untitled {
+                return None;
+            }
+            let rel = doc
+                .path
+                .strip_prefix(self.explorer.root())
+                .unwrap_or(&doc.path);
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let v = self.docs.view(view)?;
+            let text = doc.buffer.text();
+            let (a, b) = (v.sel.anchor.min(v.sel.head), v.sel.anchor.max(v.sel.head));
+            let first = text.line_of(a).ok()?;
+            // a selection ending at a line's start doesn't take that line
+            let mut last = text.line_of(b).ok()?;
+            if b > a && last > first && text.line_start(last).ok() == Some(b) {
+                last -= 1;
+            }
+            Some(agent.mention(&rel, Some((first + 1, last + 1))))
+        });
+        if !self.shells.front_agent(agent) && self.shells.add_agent(agent).is_none() {
+            self.say(self.texts.tr("Shell limit reached").to_owned());
+            return;
+        }
+        if let Some(mention) = mention {
+            // typed before the agent is up, it waits and goes in once it is
+            self.shells.current_mut().write(&mention);
+        }
+        self.show_terminal();
     }
 
     pub fn run(&mut self, command: Command) {
@@ -1548,6 +1601,17 @@ impl App {
                     .and_then(|v| doc.buffer.text().line_of(v.sel.head).ok());
                 self.previews
                     .insert(view, crate::preview::Preview::new(kind, line, &self.texts));
+                return;
+            }
+            Command::NewAgent => {
+                if self.shells.add_agent(self.settings.agent).is_none() {
+                    self.say(self.texts.tr("Shell limit reached").to_owned());
+                }
+                self.show_terminal();
+                return;
+            }
+            Command::AskAgent => {
+                self.ask_agent(focus.or(self.last_editor));
                 return;
             }
             Command::NewTerminal => {
@@ -5926,6 +5990,7 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::E).shift(), Command::ToggleExplorer)
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::Grave).shift(), Command::NewTerminal)
+        .bind(Chord::command(KeyCode::A).shift(), Command::AskAgent)
         .bind(Chord::command(KeyCode::V).shift(), Command::TogglePreview)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)

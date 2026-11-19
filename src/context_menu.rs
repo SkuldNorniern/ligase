@@ -126,6 +126,7 @@ pub fn editor() -> Vec<Entry> {
     vec![
         Entry::Item("Quick Fix", Act::Run(Command::CodeActions)),
         Entry::Item("Preview", Act::Run(Command::TogglePreview)),
+        Entry::Item("Ask Agent About This", Act::Run(Command::AskAgent)),
         Entry::Item("Go to Definition", Act::Run(Command::GotoDefinition)),
         Entry::Item("Find References", Act::Run(Command::References)),
         Entry::Item("Rename Symbol", Act::Run(Command::Rename)),

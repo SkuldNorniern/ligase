@@ -97,6 +97,8 @@ pub struct Settings {
     /// brackets and quotes typed in pairs.
     pub auto_pairs: bool,
     pub terminal_size: f32,
+    /// the coding agent a new agent terminal starts.
+    pub agent: crate::terminal::agent::Agent,
     /// spaces and tabs at line ends go when saving.
     pub trim_trailing_whitespace: bool,
     /// a saved file ends in a line break.
@@ -138,6 +140,7 @@ impl Default for Settings {
             word_highlight: true,
             auto_pairs: true,
             terminal_size: 13.0,
+            agent: crate::terminal::agent::Agent::Claude,
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
@@ -180,6 +183,7 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # word_highlight = true
 # auto_pairs = true
 # terminal_size = 13
+# agent = "claude"          # "claude", "codex", "gemini", "opencode" or "aider"
 # trim_trailing_whitespace = false
 # final_newline = false
 # save_on_focus_loss = false
@@ -268,6 +272,12 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some("none") => out.whitespace = Whitespace::None,
             Some("selection") => out.whitespace = Whitespace::Selection,
             Some(_) => out.whitespace = Whitespace::All,
+            None => return false,
+        },
+        "agent" => match word(value, &["claude", "codex", "gemini", "opencode", "aider"])
+            .and_then(crate::terminal::agent::Agent::from_word)
+        {
+            Some(agent) => out.agent = agent,
             None => return false,
         },
         "terminal_size" => match number(value, 6.0, 72.0) {
@@ -458,6 +468,13 @@ pub const FIELDS: &[Field] = &[
         kind: FieldKind::Toggle,
     },
     Field {
+        key: "agent",
+        label: "Coding Agent",
+        about: "The agent a new agent terminal starts. It signs in on its own.",
+        group: "Terminal",
+        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "aider"]),
+    },
+    Field {
         key: "terminal_size",
         label: "Terminal Font Size",
         about: "Terminal text size.",
@@ -608,6 +625,7 @@ pub fn current(s: &Settings, key: &str) -> Option<String> {
             Whitespace::All => "all",
         }),
         "terminal_size" => number_literal(s.terminal_size),
+        "agent" => quote(s.agent.word()),
         "rail" => quote(match s.rail {
             RailPlace::Left => "left",
             RailPlace::Right => "right",
@@ -784,6 +802,7 @@ mod tests {
             "word_highlight",
             "auto_pairs",
             "terminal_size",
+            "agent",
             "trim_trailing_whitespace",
             "final_newline",
             "save_on_focus_loss",
