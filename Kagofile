@@ -1,0 +1,43 @@
+# the Windows setup: `kago build` builds ligase and writes it to dist/.
+package dev.eira.ligase
+  name Ligase
+  version from cargo
+  publisher Eira
+  description Native development environment
+  homepage https://github.com/SkuldNorniern/ligase
+  scope choose
+
+license LICENSE
+
+build cargo build --release
+
+app ligase
+  windows target/release/ligase.exe
+  icon windows assets/icons/app/ligase.ico
+
+shortcut
+path optional "Add ligase to PATH"
+
+update github SkuldNorniern/ligase
+
+brand
+  accent 6667ab
+  logo assets/icons/app/ligase-256.png
+  welcome Ligase opens a folder and gets out of the way.
+  finish Ligase is ready.
+
+component desktop "Desktop shortcut" off
+  shortcut desktop
+
+component folders "Open folders with Ligase"
+  about Adds Open with Ligase to a folder's right-click menu in Explorer
+  registry Software\Classes\Directory\shell\Ligase
+    set @ "Open with Ligase"
+    set Icon {app}\ligase.exe
+  registry Software\Classes\Directory\shell\Ligase\command
+    set @ "\"{app}\\ligase.exe\" \"%1\""
+  registry Software\Classes\Directory\Background\shell\Ligase
+    set @ "Open with Ligase"
+    set Icon {app}\ligase.exe
+  registry Software\Classes\Directory\Background\shell\Ligase\command
+    set @ "\"{app}\\ligase.exe\" \"%V\""
