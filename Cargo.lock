@@ -381,6 +381,7 @@ dependencies = [
 [[package]]
 name = "resolvase"
 version = "0.1.0"
+source = "git+https://github.com/SkuldNorniern/resolvase?rev=60b9fb8959715471d84741ae81b0127f9580a1e2#60b9fb8959715471d84741ae81b0127f9580a1e2"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -669,6 +670,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 [[package]]
 name = "vanta"
 version = "0.1.0"
+source = "git+https://github.com/SkuldNorniern/vanta?rev=40fe8683dab31a70327ac73b2b53a166a841877f#40fe8683dab31a70327ac73b2b53a166a841877f"
 
 [[package]]
 name = "walkdir"
