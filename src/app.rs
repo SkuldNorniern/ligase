@@ -75,6 +75,8 @@ pub enum Id {
     AgentList,
     /// the built-in agent's setup fields, by number.
     AgentField(u16),
+    /// the language server list in settings, by row and part.
+    ServerField(u16),
     /// the branch pill and the sync buttons in source control.
     ScmBranch,
     ScmPull,
@@ -654,6 +656,8 @@ pub struct App {
     feeds: HashMap<u16, extension::FeedState>,
     /// sheet changes not yet written, and whether a write is out.
     settings_writes: Vec<(&'static str, Option<String>)>,
+    /// server tables to write: the language, and its table or none.
+    server_writes: Vec<(String, Option<settings::ServerRule>)>,
     settings_writing: bool,
     /// files of tabs closed lately, newest last, for reopen.
     closed: Vec<PathBuf>,
@@ -785,6 +789,7 @@ impl App {
             view_states: HashMap::new(),
             feeds: HashMap::new(),
             settings_writes: Vec::new(),
+            server_writes: Vec::new(),
             settings_writing: false,
             dark: true,
             edit_opts: editor::EditOpts::default(),
@@ -1430,6 +1435,80 @@ impl App {
         });
     }
 
+    /// the language server list for settings: every language with a
+    /// server or a table, what it runs now and by default.
+    fn server_rows(&self) -> Vec<settings::view::ServerRow> {
+        let line = |spec: Option<lsp::ServerSpec>| {
+            spec.map_or_else(String::new, |s| {
+                std::iter::once(s.command)
+                    .chain(s.args)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        };
+        let mut languages = self.lsp.default_languages();
+        for rule in &self.settings.servers {
+            if !languages.contains(&rule.language) {
+                languages.push(rule.language.clone());
+            }
+        }
+        languages
+            .into_iter()
+            .map(|language| {
+                let default_line = line(self.lsp.default_for(&language));
+                match self
+                    .settings
+                    .servers
+                    .iter()
+                    .find(|r| r.language == language)
+                {
+                    Some(rule) => settings::view::ServerRow::from_rule(rule, default_line),
+                    None => settings::view::ServerRow {
+                        language,
+                        default_line,
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// file types from packages, then the settings' server `files` over
+    /// them: `*.ext` by extension, anything else by whole name.
+    fn refresh_associations(&mut self) {
+        let (mut associations, _) = self.extensions.associations();
+        for rule in &self.settings.servers {
+            let language = crate::syntax::bundled(&rule.language)
+                .unwrap_or_else(|| self.extensions.intern(&rule.language));
+            for pattern in &rule.files {
+                match pattern.strip_prefix("*.") {
+                    Some(ext) => {
+                        associations.extensions.insert(ext.to_lowercase(), language);
+                    }
+                    None => {
+                        associations.files.insert(pattern.clone(), language);
+                    }
+                }
+            }
+        }
+        self.docs.set_associations(associations);
+    }
+
+    /// the settings' servers take over: file types follow, and a language
+    /// whose server changed starts it again, the old one dropped off the
+    /// ui thread.
+    fn servers_from_settings(&mut self) {
+        self.refresh_associations();
+        for language in self.lsp.set_rules(&self.settings.servers) {
+            if let Some(old) = self.lsp.restart(&language) {
+                self.jobs.run(move || {
+                    drop(old);
+                    Done::Note(None)
+                });
+            }
+        }
+    }
+
     /// opens the built-in agent's setup card with what is set now; the key
     /// field starts empty, a saved key is never shown back.
     fn open_setup(&mut self) {
@@ -1745,6 +1824,7 @@ impl App {
             Command::OpenSettings => {
                 self.palette.close();
                 self.sheet.open(&self.settings);
+                self.sheet.servers = self.server_rows();
                 self.ui.focus(Id::SettingsSearch, 0);
                 return;
             }
@@ -3024,7 +3104,14 @@ impl App {
             lang.font_family().clone_into(&mut self.theme.font_family);
             self.texts = Texts::new(lang);
         }
+        let servers_moved = settings.servers != self.settings.servers;
         self.settings = settings;
+        if servers_moved {
+            self.servers_from_settings();
+            if self.sheet.is_open() {
+                self.sheet.servers = self.server_rows();
+            }
+        }
         if !problems.is_empty() {
             self.say(format!(
                 "{}: {}",
@@ -4994,6 +5081,10 @@ impl App {
                 self.settings_writes.push((key, literal));
                 self.write_settings();
             }
+            Some(settings::view::Ask::Server(language, rule)) => {
+                self.server_writes.push((language, rule));
+                self.write_settings();
+            }
             Some(settings::view::Ask::OpenFile) => {
                 self.sheet.close();
                 self.run(Command::OpenSettingsFile);
@@ -5739,7 +5830,7 @@ impl App {
         self.view_states.clear();
         self.feeds.clear();
         self.extensions.packages = packages;
-        let (associations, more) = self.extensions.associations();
+        let (_, more) = self.extensions.associations();
         notes.extend(more);
         self.extensions.notes = notes;
         let grammars: Vec<(String, String)> = self
@@ -5751,7 +5842,7 @@ impl App {
         for (_, text) in &grammars {
             self.syntax.add_grammar(text.clone());
         }
-        self.docs.set_associations(associations);
+        self.refresh_associations();
         let names: Vec<&str> = grammars.iter().map(|(n, _)| n.as_str()).collect();
         self.docs.recolour(&names);
         self.lsp.set_extra(self.extensions.servers());
@@ -5805,18 +5896,22 @@ impl App {
     /// sends the sheet's waiting changes to the file, one write at a time
     /// so none is lost between a read and a write.
     fn write_settings(&mut self) {
-        if self.settings_writing || self.settings_writes.is_empty() {
+        if self.settings_writing
+            || (self.settings_writes.is_empty() && self.server_writes.is_empty())
+        {
             return;
         }
         let Some(path) = settings::path() else {
             self.settings_writes.clear();
+            self.server_writes.clear();
             self.say(self.texts.tr("No settings folder").to_owned());
             return;
         };
         let edits = std::mem::take(&mut self.settings_writes);
+        let servers = std::mem::take(&mut self.server_writes);
         self.settings_writing = true;
         self.jobs
-            .run(move || Done::SettingsWrote(write_settings(&path, &edits)));
+            .run(move || Done::SettingsWrote(write_settings(&path, &edits, &servers)));
     }
 
     /// the rail's buttons: side bar panels on top; the panels under the
@@ -6065,7 +6160,11 @@ impl App {
 /// isn't there yet. runs on the worker.
 /// puts `edits` into the settings file, made from the starter when
 /// missing, through a temp file. gives the text written. runs on the worker.
-fn write_settings(path: &Path, edits: &[(&str, Option<String>)]) -> Result<String, String> {
+fn write_settings(
+    path: &Path,
+    edits: &[(&str, Option<String>)],
+    servers: &[(String, Option<settings::ServerRule>)],
+) -> Result<String, String> {
     let mut text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => settings::STARTER.to_owned(),
@@ -6073,6 +6172,9 @@ fn write_settings(path: &Path, edits: &[(&str, Option<String>)]) -> Result<Strin
     };
     for (key, literal) in edits {
         text = settings::with_line(&text, key, literal.as_deref());
+    }
+    for (language, rule) in servers {
+        text = settings::with_server(&text, language, rule.as_ref());
     }
     workbench::write_session(path, &text)?;
     Ok(text)

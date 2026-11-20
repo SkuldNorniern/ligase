@@ -244,13 +244,79 @@ pub struct Lsp {
     again: Option<ViewId>,
     /// servers packages declared and the user allowed.
     extra: Vec<ServerSpec>,
+    /// servers from the settings file, in place of the others.
+    user: Vec<ServerSpec>,
+    /// languages the settings turned off.
+    off: Vec<String>,
 }
 
 impl Lsp {
-    /// the server for files in `language`: a built-in one first, then one a
-    /// package brings.
+    /// the server for files in `language`: one from the settings first, then
+    /// a built-in one, then one a package brings. none for a language the
+    /// settings turned off.
     pub fn server_for(&self, language: &str) -> Option<ServerSpec> {
+        if self.off.iter().any(|l| l == language) {
+            return None;
+        }
+        self.user
+            .iter()
+            .find(|s| s.language == language)
+            .cloned()
+            .or_else(|| built_in(language))
+            .or_else(|| self.extra.iter().find(|s| s.language == language).cloned())
+    }
+
+    /// what would serve `language` with no settings: the built-in, else a
+    /// package's. for the settings list.
+    pub fn default_for(&self, language: &str) -> Option<ServerSpec> {
         built_in(language).or_else(|| self.extra.iter().find(|s| s.language == language).cloned())
+    }
+
+    /// the languages ligase has a server for without settings.
+    pub fn default_languages(&self) -> Vec<String> {
+        let mut out: Vec<String> = BUILT_IN.iter().map(|b| b.language.to_owned()).collect();
+        for s in &self.extra {
+            if !out.contains(&s.language) {
+                out.push(s.language.clone());
+            }
+        }
+        out
+    }
+
+    /// takes the servers from the settings. gives the languages whose
+    /// server changed, to start again.
+    pub fn set_rules(&mut self, rules: &[crate::settings::ServerRule]) -> Vec<String> {
+        let before: Vec<(String, Option<ServerSpec>)> = self
+            .servers
+            .keys()
+            .map(|l| ((*l).to_owned(), self.server_for(l)))
+            .collect();
+        self.user = rules
+            .iter()
+            .filter(|r| !r.disabled && !r.command.is_empty())
+            .map(|r| ServerSpec {
+                language: r.language.clone(),
+                command: r.command.clone(),
+                args: r.args.clone(),
+                language_id: r.language.clone(),
+                package: None,
+                roots: if r.roots.is_empty() {
+                    built_in(&r.language).map(|b| b.roots).unwrap_or_default()
+                } else {
+                    r.roots.clone()
+                },
+            })
+            .collect();
+        self.off = rules
+            .iter()
+            .filter(|r| r.disabled)
+            .map(|r| r.language.clone())
+            .collect();
+        before
+            .into_iter()
+            .filter(|(l, spec)| self.server_for(l) != *spec)
+            .map(|(l, _)| l)
+            .collect()
     }
 
     /// lets `language`'s server go so the next frame starts it again. the
@@ -1056,6 +1122,59 @@ mod tests {
         let none = vec!["Cargo.toml".to_owned()];
         assert_eq!(root_for(&file, &none, &dir), dir, "no mark found");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_servers_come_first_and_can_turn_one_off() {
+        use crate::settings::ServerRule;
+        let mut lsp = Lsp::default();
+        assert_eq!(lsp.server_for("rust").unwrap().command, "rust-analyzer");
+        let rules = vec![
+            ServerRule {
+                language: "rust".into(),
+                command: "ra-nightly".into(),
+                args: vec!["--x".into()],
+                ..ServerRule::default()
+            },
+            ServerRule {
+                language: "python".into(),
+                disabled: true,
+                ..ServerRule::default()
+            },
+            ServerRule {
+                language: "c".into(),
+                files: vec!["*.h".into()],
+                ..ServerRule::default()
+            },
+            ServerRule {
+                language: "nim".into(),
+                command: "nimlangserver".into(),
+                ..ServerRule::default()
+            },
+        ];
+        lsp.set_rules(&rules);
+        let rust = lsp.server_for("rust").unwrap();
+        assert_eq!(
+            (rust.command.as_str(), rust.args.clone()),
+            ("ra-nightly", vec!["--x".to_owned()])
+        );
+        assert_eq!(
+            rust.roots,
+            ["Cargo.lock", "Cargo.toml"],
+            "built-in roots kept"
+        );
+        assert!(lsp.server_for("python").is_none(), "turned off");
+        assert_eq!(
+            lsp.server_for("c").unwrap().command,
+            "clangd",
+            "files only: the built-in stays"
+        );
+        assert_eq!(lsp.server_for("nim").unwrap().command, "nimlangserver");
+        assert_eq!(lsp.default_for("rust").unwrap().command, "rust-analyzer");
+        // a running language whose server changed is named for a restart
+        lsp.servers.insert("rust", Slot::Failed);
+        let changed = lsp.set_rules(&[]);
+        assert_eq!(changed, ["rust"]);
     }
 
     #[test]

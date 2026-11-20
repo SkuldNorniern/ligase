@@ -17,8 +17,15 @@ use super::{FIELDS, Field, FieldKind, RailPlace, Settings, current, quote};
 use crate::app::Id;
 use crate::lang::Texts;
 
-const GROUPS: [&str; 7] = [
-    "All", "Look", "Editor", "Files", "Layout", "Terminal", "Agent",
+const GROUPS: [&str; 8] = [
+    "All",
+    "Look",
+    "Editor",
+    "Files",
+    "Layout",
+    "Terminal",
+    "Agent",
+    "Language Servers",
 ];
 /// a row with an inline control.
 const ROW: f32 = 58.0;
@@ -56,6 +63,8 @@ pub enum Ask {
     Set(&'static str, Option<String>),
     /// the file itself, in an editor.
     OpenFile,
+    /// write `language`'s server table, or take it out.
+    Server(String, Option<crate::settings::ServerRule>),
     Close,
 }
 
@@ -67,6 +76,10 @@ pub struct Sheet {
     scroll: f32,
     /// text fields being typed in, by key; read from the settings on open.
     typing: HashMap<&'static str, String>,
+    /// the language servers, as the list edits them.
+    pub servers: Vec<ServerRow>,
+    /// the language typed to add a server for.
+    adding: String,
 }
 
 impl Sheet {
@@ -350,6 +363,9 @@ pub fn show(
         }
     }
 
+    if GROUPS.get(sheet.group).copied() == Some("Language Servers") {
+        return Ok(servers_list(ui, sheet, list, texts)?.or(ask));
+    }
     let rows = sheet.shown(texts);
     if rows.is_empty() {
         let small = ui.theme.font(13.0);
@@ -420,6 +436,161 @@ pub fn show(
         },
     )?;
     Ok(asked.or(ask))
+}
+
+/// one language's server, as the settings list edits it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServerRow {
+    pub language: String,
+    /// program and arguments, split on spaces.
+    pub line: String,
+    /// file names, split on commas or spaces.
+    pub files: String,
+    pub roots: String,
+    pub off: bool,
+    /// what serves it with no setting, shown when `line` is empty.
+    pub default_line: String,
+    /// the settings file has a table for it.
+    pub set: bool,
+}
+
+impl ServerRow {
+    /// the table this row writes; none when it says nothing past the
+    /// default, so the table goes.
+    pub fn rule(&self) -> Option<crate::settings::ServerRule> {
+        let words = |s: &str| -> Vec<String> {
+            s.split([',', ' '])
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let mut line = words(&self.line).into_iter();
+        let rule = crate::settings::ServerRule {
+            language: self.language.clone(),
+            command: line.next().unwrap_or_default(),
+            args: line.collect(),
+            roots: words(&self.roots),
+            files: words(&self.files),
+            disabled: self.off,
+        };
+        let empty = rule.command.is_empty()
+            && rule.files.is_empty()
+            && rule.roots.is_empty()
+            && !rule.disabled;
+        (!empty).then_some(rule)
+    }
+
+    pub fn from_rule(rule: &crate::settings::ServerRule, default_line: String) -> Self {
+        let mut line = rule.command.clone();
+        for a in &rule.args {
+            line.push(' ');
+            line.push_str(a);
+        }
+        Self {
+            language: rule.language.clone(),
+            line,
+            files: rule.files.join(", "),
+            roots: rule.roots.join(", "),
+            off: rule.disabled,
+            default_line,
+            set: true,
+        }
+    }
+}
+
+/// the language servers: one card each, then a row to add one.
+fn servers_list(
+    ui: &mut Ui<'_, Id>,
+    sheet: &mut Sheet,
+    list: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let colours = ui.theme.palette;
+    let font = ui.theme.font(13.0);
+    let small = ui.theme.font(12.0);
+    let bold = ui.theme.bold(13.0);
+    const CARD: f32 = 168.0;
+    const ADD: f32 = 56.0;
+    let content = sheet.servers.len() as f32 * (CARD + 10.0) + ADD + 40.0;
+    sheet.scroll = sheet.scroll.min((content - list.height).max(0.0));
+    let rows = &mut sheet.servers;
+    let adding = &mut sheet.adding;
+    let (_, asked) = ScrollArea::new(&mut sheet.scroll, content).show(ui, Id::SettingsList, list, |ui, content, view| {
+        let mut asked = None;
+        let mut y = content.y;
+        let about = texts.tr("A server set here takes over from the built-in one. Empty fields keep the built-in values.");
+        ui.text(about, Rect::new(content.x + INSET, y, content.width - 2.0 * INSET, 20.0), &small, colours.dim, Align::Start)?;
+        y += 30.0;
+        for (i, row) in rows.iter_mut().enumerate() {
+            let card = Rect::new(content.x, y, content.width, CARD);
+            y += CARD + 10.0;
+            if card.bottom() < view.y || card.y > view.bottom() {
+                continue;
+            }
+            ui.round(card, 10.0, colours.raised)?;
+            let inner = card.inset(14.0);
+            let n = u16::try_from(i).unwrap_or(u16::MAX / 8) * 8;
+            ui.text(&row.language, Rect::new(inner.x, inner.y, inner.width, 20.0), &bold, colours.text, Align::Start)?;
+            let state = if row.off {
+                texts.tr("off")
+            } else if row.set {
+                texts.tr("set here")
+            } else {
+                texts.tr("built in")
+            };
+            ui.text(state, Rect::new(inner.x, inner.y, inner.width, 20.0), &small, colours.dim, Align::End)?;
+            let label_w = 76.0_f32.min(inner.width * 0.3);
+            let field = |ui: &mut Ui<'_, Id>, y: f32, label: &str| -> AureaResult<Rect> {
+                ui.text(label, Rect::new(inner.x, y, label_w, 28.0), &small, colours.dim, Align::Start)?;
+                Ok(Rect::new(inner.x + label_w, y, inner.width - label_w, 28.0))
+            };
+            let at = field(ui, inner.y + 26.0, texts.tr("Command"))?;
+            let hint = if row.default_line.is_empty() { texts.tr("program and arguments") } else { row.default_line.as_str() };
+            TextField::new(&mut row.line).placeholder(hint).max_chars(300).show(ui, Id::ServerField(n), at)?;
+            let at = field(ui, inner.y + 60.0, texts.tr("Files"))?;
+            TextField::new(&mut row.files).placeholder("*.ext, Name").max_chars(300).show(ui, Id::ServerField(n + 1), at)?;
+            let at = field(ui, inner.y + 94.0, texts.tr("Roots"))?;
+            TextField::new(&mut row.roots).placeholder("Cargo.toml, package.json").max_chars(300).show(ui, Id::ServerField(n + 2), at)?;
+            let by = inner.y + 128.0;
+            let mut bx = inner.right();
+            let mut button = |ui: &mut Ui<'_, Id>, label: &str, part: u16, primary: bool| -> AureaResult<bool> {
+                let w = ui.text_width(label, &small) + 26.0;
+                bx -= w;
+                let r = Rect::new(bx, by, w, 26.0);
+                bx -= 6.0;
+                let b = if primary { Button::new(label).primary() } else { Button::new(label).quiet() };
+                Ok(r.x > inner.x && b.show(ui, Id::ServerField(n + part), r)?.clicked)
+            };
+            if button(ui, texts.tr("Save"), 3, true)? {
+                asked = Some(Ask::Server(row.language.clone(), row.rule()));
+            }
+            if row.set && button(ui, texts.tr("Reset"), 4, false)? {
+                asked = Some(Ask::Server(row.language.clone(), None));
+            }
+            let toggle = if row.off { texts.tr("Turn on") } else { texts.tr("Turn off") };
+            if button(ui, toggle, 5, false)? {
+                row.off = !row.off;
+                asked = Some(Ask::Server(row.language.clone(), row.rule()));
+            }
+        }
+        // a server for another language
+        let at = Rect::new(content.x + INSET, y + 8.0, (content.width - 2.0 * INSET - 90.0).max(60.0), 30.0);
+        let typed = TextField::new(adding)
+            .placeholder(texts.tr("another language, like nim"))
+            .max_chars(40)
+            .show(ui, Id::ServerField(u16::MAX - 1), at)?;
+        let add = Rect::new(at.right() + 8.0, at.y, 82.0, 30.0);
+        let name = adding.trim().to_lowercase();
+        let ok = crate::settings::server_language_ok(&name) && !rows.iter().any(|r| r.language == name);
+        if (Button::new(texts.tr("Add")).enabled(ok).show(ui, Id::ServerField(u16::MAX), add)?.clicked || typed.submitted) && ok {
+            rows.push(ServerRow { language: name, ..ServerRow::default() });
+            adding.clear();
+        }
+        let _ = &font;
+        Ok(asked)
+    })?;
+    Ok(asked)
 }
 
 /// the dot that marks a changed setting at `x`, `y`; true when a click puts

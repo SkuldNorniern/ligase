@@ -386,7 +386,7 @@ impl Extensions {
 
     /// a grammar name that lives as long as the app. each name is kept
     /// once, so reading the packages again adds nothing.
-    fn intern(&mut self, name: &str) -> &'static str {
+    pub(crate) fn intern(&mut self, name: &str) -> &'static str {
         if let Some(kept) = self.names.get(name) {
             return kept;
         }

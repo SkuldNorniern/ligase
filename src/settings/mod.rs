@@ -107,6 +107,9 @@ pub struct Settings {
     pub openai_model: Option<String>,
     /// the model's context in tokens; auto compact starts at three quarters.
     pub openai_context: f32,
+    /// language servers set here, `[servers.<language>]`: new ones, or the
+    /// built-in and package ones changed or turned off.
+    pub servers: Vec<ServerRule>,
     /// spaces and tabs at line ends go when saving.
     pub trim_trailing_whitespace: bool,
     /// a saved file ends in a line break.
@@ -153,6 +156,7 @@ impl Default for Settings {
             openai_base_url: "https://api.openai.com/v1".to_owned(),
             openai_model: None,
             openai_context: 32_000.0,
+            servers: Vec::new(),
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
@@ -200,6 +204,14 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # openai_base_url = "https://api.openai.com/v1"  # any openai-compatible server, for agent = "openai"
 # openai_model = ""         # the model it asks; the key lives in the agent-key file
 # openai_context = 32000    # the model's context in tokens; older talk is summarized past 3/4
+
+# a language server, new or in place of the one ligase knows:
+# [servers.rust]
+# command = "rust-analyzer"
+# args = []
+# roots = ["Cargo.lock", "Cargo.toml"]   # where it starts: the first found above the file
+# files = ["*.rs"]                       # file names it takes: `*.ext` or a whole name
+# disabled = false
 # trim_trailing_whitespace = false
 # final_newline = false
 # save_on_focus_loss = false
@@ -224,12 +236,142 @@ pub fn parse(text: &str) -> (Option<Settings>, Vec<String>) {
         }
     };
     for (key, value) in &table {
+        if key == "servers" {
+            match value.as_table() {
+                Some(servers) => out.servers = server_rules(servers, &mut problems),
+                None => problems.push("servers must be a table".to_owned()),
+            }
+            continue;
+        }
         let ok = apply(&mut out, key, value);
         if !ok {
             problems.push(format!("{key} = {value}"));
         }
     }
     (Some(out), problems)
+}
+
+/// a language server from the settings file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerRule {
+    /// the language it serves: a bundled syntax name like `rust`, or a new
+    /// one its `files` bring in.
+    pub language: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// file names that mark the folder it starts in, most wanted first.
+    pub roots: Vec<String>,
+    /// file names it takes: `*.ext`, or a whole name like `Justfile`.
+    pub files: Vec<String>,
+    /// the language gets no server, not even the built-in one.
+    pub disabled: bool,
+}
+
+/// most server tables read.
+const MAX_SERVERS: usize = 64;
+/// most items in one list.
+const MAX_ITEMS: usize = 64;
+/// longest text in a rule.
+const MAX_TEXT: usize = 300;
+
+/// a language name a table may use: short, plain characters.
+pub fn server_language_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'#' | b'.'))
+}
+
+fn server_rules(table: &toml::Table, problems: &mut Vec<String>) -> Vec<ServerRule> {
+    let mut out = Vec::new();
+    for (language, value) in table.iter().take(MAX_SERVERS) {
+        let Some(t) = value.as_table().filter(|_| server_language_ok(language)) else {
+            problems.push(format!("servers.{language}"));
+            continue;
+        };
+        let text = |key: &str| {
+            t.get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| s.len() <= MAX_TEXT)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let list = |key: &str| -> Vec<String> {
+            t.get(key)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= MAX_TEXT)
+                .take(MAX_ITEMS)
+                .map(str::to_owned)
+                .collect()
+        };
+        let rule = ServerRule {
+            language: language.clone(),
+            command: text("command"),
+            args: list("args"),
+            roots: list("roots"),
+            files: list("files"),
+            disabled: t
+                .get("disabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+        };
+        if rule.command.is_empty() && !rule.disabled && rule.files.is_empty() {
+            problems.push(format!("servers.{language}: no command"));
+            continue;
+        }
+        out.push(rule);
+    }
+    out
+}
+
+/// `text` with `language`'s server table put in, or taken out when `rule`
+/// is none. the rest of the file stays as it was written.
+pub fn with_server(text: &str, language: &str, rule: Option<&ServerRule>) -> String {
+    let header = format!("[servers.{language}]");
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            skipping = trimmed == header;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    let Some(rule) = rule else { return out };
+    let list = |items: &[String]| {
+        let quoted: Vec<String> = items.iter().map(|i| quote(i)).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    out.push('\n');
+    out.push_str(&header);
+    out.push('\n');
+    if !rule.command.is_empty() {
+        out.push_str(&format!("command = {}\n", quote(&rule.command)));
+    }
+    if !rule.args.is_empty() {
+        out.push_str(&format!("args = {}\n", list(&rule.args)));
+    }
+    if !rule.roots.is_empty() {
+        out.push_str(&format!("roots = {}\n", list(&rule.roots)));
+    }
+    if !rule.files.is_empty() {
+        out.push_str(&format!("files = {}\n", list(&rule.files)));
+    }
+    if rule.disabled {
+        out.push_str("disabled = true\n");
+    }
+    out
 }
 
 fn word<'a>(value: &'a toml::Value, choices: &[&str]) -> Option<&'a str> {
@@ -778,7 +920,15 @@ fn key_line(line: &str, key: &str) -> Option<bool> {
 pub fn with_line(text: &str, key: &str, literal: Option<&str>) -> String {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    let found = lines.iter().position(|line| key_line(line, key).is_some());
+    // top-level keys live before the first table; one written after it
+    // would belong to that table
+    let tables = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let found = lines[..tables]
+        .iter()
+        .position(|line| key_line(line, key).is_some());
     match (found, literal) {
         (Some(i), Some(value)) => lines[i] = format!("{key} = {value}"),
         (Some(i), None) => {
@@ -787,7 +937,7 @@ pub fn with_line(text: &str, key: &str, literal: Option<&str>) -> String {
                 lines[i] = commented;
             }
         }
-        (None, Some(value)) => lines.push(format!("{key} = {value}")),
+        (None, Some(value)) => lines.insert(tables, format!("{key} = {value}")),
         (None, None) => return text.to_owned(),
     }
     let mut out = lines.join(eol);
@@ -798,6 +948,67 @@ pub fn with_line(text: &str, key: &str, literal: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_tables_read_write_and_keep_their_place() {
+        let text = "theme = \"light\"
+
+[servers.nim]
+command = \"nimlangserver\"
+files = [\"*.nim\"]
+
+[servers.rust]
+disabled = true
+";
+        let (s, problems) = parse(text);
+        let s = s.unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(s.servers.len(), 2);
+        let nim = s.servers.iter().find(|r| r.language == "nim").unwrap();
+        assert_eq!(
+            (nim.command.as_str(), nim.files.clone()),
+            ("nimlangserver", vec!["*.nim".to_owned()])
+        );
+        assert!(s.servers.iter().any(|r| r.language == "rust" && r.disabled));
+        // a new top-level key lands before the tables, not in the last one
+        let more = with_line(text, "tab_size", Some("2"));
+        let (s2, problems) = parse(&more);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(s2.unwrap().tab_size, 2);
+        // a table is replaced in place of the old one, others kept
+        let rule = ServerRule {
+            language: "nim".into(),
+            command: "nim-lsp".into(),
+            args: vec!["--stdio".into()],
+            ..ServerRule::default()
+        };
+        let changed = with_server(&more, "nim", Some(&rule));
+        let s3 = parse(&changed).0.unwrap();
+        let nim = s3.servers.iter().find(|r| r.language == "nim").unwrap();
+        assert_eq!(
+            (nim.command.as_str(), nim.args.clone()),
+            ("nim-lsp", vec!["--stdio".to_owned()])
+        );
+        assert!(s3.servers.iter().any(|r| r.language == "rust"));
+        let gone = with_server(&changed, "nim", None);
+        assert!(
+            parse(&gone)
+                .0
+                .unwrap()
+                .servers
+                .iter()
+                .all(|r| r.language != "nim")
+        );
+        // bad names and empty tables are named, not taken
+        let (s4, problems) = parse(
+            "[servers.\"a b\"]
+command = \"x\"
+[servers.empty]
+",
+        );
+        assert!(s4.unwrap().servers.is_empty());
+        assert_eq!(problems.len(), 2);
+    }
 
     #[test]
     fn starter_file_is_all_defaults() {
