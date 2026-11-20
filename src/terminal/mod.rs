@@ -556,6 +556,10 @@ pub fn show(
             let focused = ui
                 .interact(Id::Terminal, 1, rect, Sense::Click, true)
                 .focused;
+            if focused {
+                // typing ahead goes through the input method too
+                ui.set_ime_area(Rect::new(rect.x + PAD, rect.y + PAD, 8.0, line_h));
+            }
             hint(ui, texts.tr("Starting shell…"))?;
             return Ok(focused);
         }
@@ -625,7 +629,7 @@ pub fn show(
                     palette.dim,
                     Align::Start,
                 )?;
-            } else if focused && window.cursor_visible {
+            } else if focused {
                 let (line, col) = window.cursor;
                 let col = col.min(usize::from(cols).saturating_sub(1));
                 let at = Rect::new(
@@ -634,7 +638,13 @@ pub fn show(
                     cell,
                     line_h,
                 );
-                ui.fill(at, palette.text.with_alpha(120))?;
+                // macos types text only through the input method, which
+                // stays shut without an area; it also places korean
+                // composing at the cursor
+                ui.set_ime_area(at);
+                if window.cursor_visible {
+                    ui.fill(at, palette.text.with_alpha(120))?;
+                }
             }
             Ok(())
         })?;
