@@ -44,10 +44,47 @@ impl Server {
         root: &Path,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Server, String> {
+        let name = root.file_name().map_or_else(
+            || "workspace".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         let mut cmd = Command::new(command);
-        cmd.args(args)
-            .current_dir(root)
-            .stdin(Stdio::piped())
+        cmd.args(args).current_dir(root);
+        let init = init_params(&uri::from_path(root), &name, Some(std::process::id()));
+        Self::start(cmd, command, init, wake)
+    }
+
+    /// starts `command` on `host` over ssh, in the far folder `root`. the
+    /// server sees far paths; the caller maps them. no process id goes to
+    /// it, a pid from here means nothing there.
+    pub fn spawn_remote(
+        host: &str,
+        password: Option<&str>,
+        command: &str,
+        args: &[String],
+        root: &str,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Server, String> {
+        let far = crate::remote::login_command(root, command, args).ok_or("bad command")?;
+        let (ssh, env) = crate::remote::ssh_args(host, password, &far)?;
+        let mut cmd = Command::new("ssh");
+        cmd.args(&ssh).envs(env);
+        let name = root
+            .rsplit('/')
+            .find(|p| !p.is_empty())
+            .unwrap_or("workspace")
+            .to_owned();
+        let init = init_params(&uri::from_path(Path::new(root)), &name, None);
+        Self::start(cmd, command, init, wake)
+    }
+
+    fn start(
+        mut cmd: Command,
+        command: &str,
+        init: Value,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Server, String> {
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         #[cfg(windows)]
@@ -127,7 +164,7 @@ impl Server {
         };
         let _ = server
             .to_server
-            .send(rpc::request(INIT, "initialize", init_params(root)));
+            .send(rpc::request(INIT, "initialize", init));
         Ok(server)
     }
 
@@ -183,14 +220,9 @@ impl Server {
     }
 }
 
-fn init_params(root: &Path) -> Value {
-    let root_uri = uri::from_path(root);
-    let name = root.file_name().map_or_else(
-        || "workspace".to_owned(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+fn init_params(root_uri: &str, name: &str, pid: Option<u32>) -> Value {
     json!({
-        "processId": std::process::id(),
+        "processId": pid,
         "clientInfo": { "name": "ligase" },
         "rootUri": root_uri,
         "workspaceFolders": [{ "uri": root_uri, "name": name }],

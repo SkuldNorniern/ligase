@@ -251,9 +251,221 @@ pub struct Lsp {
     user: Vec<ServerSpec>,
     /// languages the settings turned off.
     off: Vec<String>,
+    /// set for a remote folder's servers: they run there and see far paths.
+    far: Option<Far>,
+}
+
+/// a remote folder's servers: the host, its folder, and the far path of
+/// each local copy they know.
+pub struct Far {
+    pub host: String,
+    pub root: String,
+    /// the password the link was made with, in memory only.
+    pub secret: Option<String>,
+    files: HashMap<PathBuf, String>,
+}
+
+impl Far {
+    pub fn new(host: String, root: String, secret: Option<String>) -> Self {
+        Self {
+            host,
+            root,
+            secret,
+            files: HashMap::new(),
+        }
+    }
+}
+
+/// the local servers, and the remote folder's while one is linked. each
+/// file goes to the side it belongs to.
+#[derive(Default)]
+pub struct Servers {
+    pub local: Lsp,
+    pub remote: Option<Lsp>,
+}
+
+impl Servers {
+    /// the side `doc`'s file belongs to.
+    pub fn for_doc(&mut self, docs: &Documents, doc: crate::document::DocumentId) -> &mut Lsp {
+        let far = docs.doc(doc).is_some_and(|d| {
+            self.remote
+                .as_ref()
+                .is_some_and(|r| r.far_path(&d.path).is_some())
+        });
+        match &mut self.remote {
+            Some(remote) if far => remote,
+            _ => &mut self.local,
+        }
+    }
+
+    /// the side `view`'s file belongs to.
+    pub fn of(&mut self, docs: &Documents, view: ViewId) -> &mut Lsp {
+        match docs.view(view).map(|v| v.doc) {
+            Some(doc) => self.for_doc(docs, doc),
+            None => &mut self.local,
+        }
+    }
+
+    pub fn poll(&mut self) -> Vec<Event> {
+        let mut events = self.local.poll();
+        if let Some(remote) = &mut self.remote {
+            events.extend(remote.poll());
+        }
+        events
+    }
+
+    /// servers to start: whether remote, the language, the file that asked.
+    pub fn wanted(&mut self, docs: &Documents) -> Vec<(bool, &'static str, PathBuf)> {
+        let mut out: Vec<_> = self
+            .local
+            .wanted(docs)
+            .into_iter()
+            .map(|(l, f)| (false, l, f))
+            .collect();
+        if let Some(remote) = &mut self.remote {
+            out.extend(remote.wanted(docs).into_iter().map(|(l, f)| (true, l, f)));
+        }
+        out
+    }
+
+    pub fn sync(&mut self, docs: &Documents) {
+        self.local.sync(docs);
+        if let Some(remote) = &mut self.remote {
+            remote.sync(docs);
+        }
+    }
+
+    pub fn take_again(&mut self) -> Option<ViewId> {
+        self.local
+            .take_again()
+            .or_else(|| self.remote.as_mut().and_then(Lsp::take_again))
+    }
+
+    pub fn triggers(&self, language: Option<&str>, typed: &str) -> bool {
+        self.local.triggers(language, typed)
+            || self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.triggers(language, typed))
+    }
+
+    pub fn sig_trigger(&self, language: Option<&str>, typed: &str) -> bool {
+        self.local.sig_trigger(language, typed)
+            || self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.sig_trigger(language, typed))
+    }
+
+    pub fn set_extra(&mut self, specs: Vec<ServerSpec>) {
+        if let Some(remote) = &mut self.remote {
+            remote.set_extra(specs.clone());
+        }
+        self.local.set_extra(specs);
+    }
+
+    /// the far path of a local copy the remote servers know.
+    pub fn far_path(&self, local: &Path) -> Option<String> {
+        self.remote.as_ref()?.far_path(local).map(str::to_owned)
+    }
+}
+
+/// the folder local copies of remote files sit in; local servers leave
+/// them alone.
+fn copies() -> Option<PathBuf> {
+    aurea::config_dir("ligase").map(|d| d.join("remote"))
 }
 
 impl Lsp {
+    /// servers for the remote folder `far`, with this one's settings.
+    pub fn far(&self, far: Far) -> Self {
+        Self {
+            extra: self.extra.clone(),
+            user: self.user.clone(),
+            off: self.off.clone(),
+            far: Some(far),
+            ..Self::default()
+        }
+    }
+
+    /// the host, far folder and password a remote side's servers start
+    /// with; none for local servers.
+    pub fn far_link(&self) -> Option<(String, String, Option<String>)> {
+        self.far
+            .as_ref()
+            .map(|f| (f.host.clone(), f.root.clone(), f.secret.clone()))
+    }
+
+    /// a local copy of a remote file and where it is there.
+    pub fn knows(&mut self, local: PathBuf, far: String) {
+        if let Some(f) = &mut self.far {
+            f.files.insert(local, far);
+        }
+    }
+
+    /// the far path of a local copy these servers know.
+    pub fn far_path(&self, local: &Path) -> Option<&str> {
+        self.far.as_ref()?.files.get(local).map(String::as_str)
+    }
+
+    /// whether files at `path` are this side's: a known remote copy for
+    /// remote servers, anything but a remote copy for local ones.
+    fn owns(&self, path: &Path, copies: Option<&Path>) -> bool {
+        match &self.far {
+            Some(f) => f.files.contains_key(path),
+            None => copies.is_none_or(|c| !path.starts_with(c)),
+        }
+    }
+
+    /// the uri a server knows `path` by.
+    fn uri_of(&self, path: &Path) -> Option<String> {
+        match &self.far {
+            Some(f) => f.files.get(path).map(|far| uri::from_path(Path::new(far))),
+            None => Some(uri::from_path(path)),
+        }
+    }
+
+    /// a path from a server as a path here: a far one becomes its local
+    /// copy, remembered so it can be fetched and synced.
+    fn here(&mut self, path: PathBuf) -> PathBuf {
+        let Some(f) = &mut self.far else {
+            return path;
+        };
+        let far = path.to_string_lossy().replace('\\', "/");
+        match crate::remote::browse::cache_path(&f.host, &far) {
+            Some(local) => {
+                f.files.insert(local.clone(), far);
+                local
+            }
+            None => path,
+        }
+    }
+
+    /// paths in server answers as paths here.
+    fn map_event(&mut self, event: Event) -> Event {
+        if self.far.is_none() {
+            return event;
+        }
+        match event {
+            Event::Goto(path, at, encoding) => Event::Goto(self.here(path), at, encoding),
+            Event::Edits(doc, revision, seen, files, encoding) => Event::Edits(
+                doc,
+                revision,
+                seen,
+                files.into_iter().map(|(p, e)| (self.here(p), e)).collect(),
+                encoding,
+            ),
+            Event::Locations(places, encoding) => Event::Locations(
+                places
+                    .into_iter()
+                    .map(|(p, at)| (self.here(p), at))
+                    .collect(),
+                encoding,
+            ),
+            other => other,
+        }
+    }
+
     /// the server for files in `language`: one from the settings first, then
     /// a built-in one, then one a package brings. none for a language the
     /// settings turned off.
@@ -379,10 +591,14 @@ impl Lsp {
     /// asked. marks them starting.
     pub fn wanted(&mut self, docs: &Documents) -> Vec<(&'static str, PathBuf)> {
         let mut out = Vec::new();
+        let copies = copies();
         for doc in docs.all() {
             let Some(language) = doc.language else {
                 continue;
             };
+            if !self.owns(&doc.path, copies.as_deref()) {
+                continue;
+            }
             if doc.load != Load::Ready || self.server_for(language).is_none() {
                 continue;
             }
@@ -431,7 +647,7 @@ impl Lsp {
             .iter()
             .filter(|(id, s)| {
                 docs.doc(**id)
-                    .is_none_or(|d| uri::from_path(&d.path) != s.uri)
+                    .is_none_or(|d| self.uri_of(&d.path).as_deref() != Some(s.uri.as_str()))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -445,8 +661,15 @@ impl Lsp {
                 );
             }
         }
+        let copies = copies();
         for (id, doc) in docs.all_with_ids() {
             let Some(language) = doc.language else {
+                continue;
+            };
+            if !self.owns(&doc.path, copies.as_deref()) {
+                continue;
+            }
+            let Some(uri) = self.uri_of(&doc.path) else {
                 continue;
             };
             let Some(spec) = self.server_for(language) else {
@@ -463,7 +686,6 @@ impl Lsp {
             let snapshot = doc.buffer.snapshot();
             match self.synced.get_mut(&id) {
                 None => {
-                    let uri = uri::from_path(&doc.path);
                     server.notify(
                         "textDocument/didOpen",
                         json!({ "textDocument": {
@@ -799,7 +1021,7 @@ impl Lsp {
                 self.handle(language, &msg, &mut events);
             }
         }
-        events
+        events.into_iter().map(|e| self.map_event(e)).collect()
     }
 
     fn handle(&mut self, language: &'static str, msg: &Value, events: &mut Vec<Event>) {
@@ -1116,6 +1338,30 @@ fn hover_text(contents: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_servers_see_far_paths() {
+        let Some(local) = crate::remote::browse::cache_path("box", "/srv/app/main.rs") else {
+            return;
+        };
+        let mut side = Lsp::default().far(Far::new("box".into(), "/srv/app".into(), None));
+        assert!(
+            !side.owns(&local, None),
+            "unknown copies are not the server's"
+        );
+        side.knows(local.clone(), "/srv/app/main.rs".into());
+        assert!(side.owns(&local, None));
+        assert_eq!(
+            side.uri_of(&local).as_deref(),
+            Some("file:///srv/app/main.rs")
+        );
+        // a place the server names comes back as its local copy, known after
+        let other = side.here(PathBuf::from("/srv/app/lib.rs"));
+        assert_eq!(side.far_path(&other), Some("/srv/app/lib.rs"));
+        // local servers leave remote copies alone
+        let copies = local.parent().and_then(Path::parent).map(Path::to_path_buf);
+        assert!(!Lsp::default().owns(&local, copies.as_deref()));
+    }
     use resolvase::TextBuffer;
 
     #[test]

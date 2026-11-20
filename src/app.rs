@@ -25,7 +25,7 @@ use crate::explorer::{self, Click, Explorer};
 use crate::extension::{self, Extensions};
 use crate::jobs::Jobs;
 use crate::lang::{Lang, Texts};
-use crate::lsp::{self, Lsp};
+use crate::lsp;
 use crate::palette::{self, Kind, Palette};
 use crate::problems::{self, Problems};
 use crate::search::{self, Finder};
@@ -530,7 +530,8 @@ enum Done {
     Preview(ViewId, Revision, crate::preview::Parsed),
     /// rows of a big table's file, read on the worker for its window.
     PreviewRows(ViewId, Range<usize>, Result<Vec<Vec<String>>, String>),
-    Server(&'static str, Result<lsp::server::Server, String>),
+    /// a language server came up, or not: remote or here, its language.
+    Server(bool, &'static str, Result<lsp::server::Server, String>),
     Found(DocumentId, Revision, String, Vec<Range<usize>>),
     Files(Vec<palette::Item>),
     FileOp(Result<FileDone, String>),
@@ -632,7 +633,7 @@ pub struct App {
     agent_saves: Vec<(DocumentId, serde_json::Value)>,
     finder: Finder,
     problems: Problems,
-    lsp: Lsp,
+    lsp: lsp::Servers,
     /// hover text for a view, while its caret stays where it was asked.
     hover: Option<(ViewId, usize, String)>,
     /// the call the caret is in, while typing its arguments.
@@ -807,7 +808,7 @@ impl App {
             agent_saves: Vec::new(),
             finder: Finder::default(),
             problems: Problems::default(),
-            lsp: Lsp::default(),
+            lsp: lsp::Servers::default(),
             hover: None,
             signature: None,
             pointing: None,
@@ -1213,10 +1214,20 @@ impl App {
 
     /// starts a language server on the worker, in the project folder of
     /// `file` when the server names its marks, else the workspace folder.
-    fn start_server(&mut self, language: &'static str, file: PathBuf) {
-        let Some(spec) = self.lsp.server_for(language) else {
+    fn start_server(&mut self, far: bool, language: &'static str, file: PathBuf) {
+        let side = if far {
+            match &mut self.lsp.remote {
+                Some(remote) => remote,
+                None => return,
+            }
+        } else {
+            &mut self.lsp.local
+        };
+        let Some(spec) = side.server_for(language) else {
             return;
         };
+        // a remote folder's server runs there, in the linked folder
+        let link = side.far_link();
         let workspace = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
         let job = move || {
@@ -1225,16 +1236,30 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            let root = lsp::root_for(&file, &spec.roots, &workspace);
-            let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
-            Done::Server(
-                language,
-                lsp::server::Server::spawn(&spec.command, &args, &root, wake),
-            )
+            let server = match link {
+                Some((host, root, secret)) => lsp::server::Server::spawn_remote(
+                    &host,
+                    secret.as_deref(),
+                    &spec.command,
+                    &spec.args,
+                    &root,
+                    wake,
+                ),
+                None => {
+                    let root = lsp::root_for(&file, &spec.roots, &workspace);
+                    let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+                    lsp::server::Server::spawn(&spec.command, &args, &root, wake)
+                }
+            };
+            Done::Server(far, language, server)
         };
         if !self.procs.run(job) {
-            self.lsp
-                .started(language, Err("the file worker is not running".to_owned()));
+            side_started(
+                &mut self.lsp,
+                far,
+                language,
+                Err("the file worker is not running".to_owned()),
+            );
         }
     }
 
@@ -1533,7 +1558,7 @@ impl App {
                     .join(" ")
             })
         };
-        let mut languages = self.lsp.default_languages();
+        let mut languages = self.lsp.local.default_languages();
         for rule in &self.settings.servers {
             if !languages.contains(&rule.language) {
                 languages.push(rule.language.clone());
@@ -1542,7 +1567,7 @@ impl App {
         languages
             .into_iter()
             .map(|language| {
-                let default_line = line(self.lsp.default_for(&language));
+                let default_line = line(self.lsp.local.default_for(&language));
                 match self
                     .settings
                     .servers
@@ -1586,8 +1611,18 @@ impl App {
     /// ui thread.
     fn servers_from_settings(&mut self) {
         self.refresh_associations();
-        for language in self.lsp.set_rules(&self.settings.servers) {
-            if let Some(old) = self.lsp.restart(&language) {
+        if let Some(remote) = &mut self.lsp.remote {
+            for language in remote.set_rules(&self.settings.servers) {
+                if let Some(old) = remote.restart(&language) {
+                    self.jobs.run(move || {
+                        drop(old);
+                        Done::Note(None)
+                    });
+                }
+            }
+        }
+        for language in self.lsp.local.set_rules(&self.settings.servers) {
+            if let Some(old) = self.lsp.local.restart(&language) {
                 self.jobs.run(move || {
                     drop(old);
                     Done::Note(None)
@@ -2072,7 +2107,7 @@ impl App {
                     .and_then(|v| self.docs.view(v))
                     .map(|v| v.doc);
                 if let Some(doc) = doc
-                    && self.lsp.reopen(doc)
+                    && self.lsp.for_doc(&self.docs, doc).reopen(doc)
                 {
                     self.say(self.texts.tr("Rechecking file").to_owned());
                 } else {
@@ -2081,13 +2116,13 @@ impl App {
                 return;
             }
             Command::RestartServer => {
-                let language = focus
-                    .or(self.last_editor)
+                let view = focus.or(self.last_editor);
+                let language = view
                     .and_then(|v| self.docs.doc_of(v))
                     .and_then(|d| d.language);
-                match language {
-                    Some(language) => {
-                        if let Some(old) = self.lsp.restart(language) {
+                match (language, view) {
+                    (Some(language), Some(view)) => {
+                        if let Some(old) = self.lsp.of(&self.docs, view).restart(language) {
                             self.jobs.run(move || {
                                 drop(old);
                                 Done::Note(None)
@@ -2098,7 +2133,7 @@ impl App {
                             self.texts.tr("Restarting language server:")
                         ));
                     }
-                    None => self.say(self.texts.tr("No language server").to_owned()),
+                    _ => self.say(self.texts.tr("No language server").to_owned()),
                 }
                 return;
             }
@@ -2190,7 +2225,7 @@ impl App {
             }
             Command::CodeActions => {
                 if let Some(view) = focus.or(self.last_editor)
-                    && !self.lsp.actions(&self.docs, view)
+                    && !self.lsp.of(&self.docs, view).actions(&self.docs, view)
                 {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
@@ -2198,7 +2233,7 @@ impl App {
             }
             Command::GotoDefinition => {
                 if let Some(view) = focus
-                    && !self.lsp.definition(&self.docs, view)
+                    && !self.lsp.of(&self.docs, view).definition(&self.docs, view)
                 {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
@@ -2229,7 +2264,11 @@ impl App {
             }
             Command::Format => {
                 if let Some(view) = focus.or(self.last_editor)
-                    && !self.lsp.format(&self.docs, view, self.settings.tab_size)
+                    && !self.lsp.of(&self.docs, view).format(
+                        &self.docs,
+                        view,
+                        self.settings.tab_size,
+                    )
                 {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
@@ -2237,7 +2276,7 @@ impl App {
             }
             Command::References => {
                 if let Some(view) = focus.or(self.last_editor)
-                    && !self.lsp.references(&self.docs, view)
+                    && !self.lsp.of(&self.docs, view).references(&self.docs, view)
                 {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
@@ -2245,7 +2284,7 @@ impl App {
             }
             Command::ShowHover => {
                 if let Some(view) = focus
-                    && !self.lsp.hover(&self.docs, view)
+                    && !self.lsp.of(&self.docs, view).hover(&self.docs, view)
                 {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
@@ -3386,7 +3425,7 @@ impl App {
                         files,
                         offered.encoding,
                     );
-                } else if !self.lsp.resolve_action(
+                } else if !self.lsp.for_doc(&self.docs, offered.doc).resolve_action(
                     offered.language,
                     action.raw,
                     offered.doc,
@@ -3600,7 +3639,11 @@ impl App {
                 if name.is_empty() {
                     return;
                 }
-                if !self.lsp.rename(&self.docs, view, &name) {
+                if !self
+                    .lsp
+                    .of(&self.docs, view)
+                    .rename(&self.docs, view, &name)
+                {
                     self.say(self.texts.tr("No language server").to_owned());
                 }
             }
@@ -3858,7 +3901,10 @@ impl App {
         if self.settings.format_on_save
             && !untitled
             && let Some(doc) = doc
-            && self.lsp.format(&self.docs, view, self.settings.tab_size)
+            && self
+                .lsp
+                .of(&self.docs, view)
+                .format(&self.docs, view, self.settings.tab_size)
         {
             self.save_after_format = Some((view, doc, Instant::now()));
             return;
@@ -4442,6 +4488,13 @@ impl App {
                     self.docs.set_busy(doc, revision, busy);
                 }
                 lsp::Event::Goto(path, at, encoding) => {
+                    // a remote file not fetched yet comes over first
+                    if !self.remote_files.contains_key(&path)
+                        && let Some(far) = self.lsp.far_path(&path)
+                    {
+                        self.remote_fetch(far, Some(at.line + 1), false);
+                        continue;
+                    }
                     let view = self.open_file(&path);
                     if let Some(v) = self.docs.view_mut(view) {
                         v.goto = Some((at, encoding));
@@ -4469,12 +4522,12 @@ impl App {
             }
         }
         self.find_again();
-        for (language, file) in self.lsp.wanted(&self.docs) {
-            self.start_server(language, file);
+        for (far, language, file) in self.lsp.wanted(&self.docs) {
+            self.start_server(far, language, file);
         }
         self.lsp.sync(&self.docs);
         if let Some(view) = self.want_signature.take()
-            && !self.lsp.signature(&self.docs, view)
+            && !self.lsp.of(&self.docs, view).signature(&self.docs, view)
         {
             // not synced yet: next frame
             self.want_signature = Some(view);
@@ -4496,7 +4549,7 @@ impl App {
                 .is_some_and(|(v, d)| {
                     completion::word_start(d.buffer.text(), v.sel.head) < v.sel.head
                 });
-            if !self.lsp.complete(&self.docs, view)
+            if !self.lsp.of(&self.docs, view).complete(&self.docs, view)
                 && on_word
                 && let Some(revision) = self.docs.doc_of(view).map(|d| d.buffer.revision())
             {
@@ -4618,11 +4671,29 @@ impl App {
                 Done::RemoteReady(result) => {
                     if let Some(browser) = &mut self.remote {
                         match result {
-                            Ok((session, root, entries)) => browser.ready(
-                                std::sync::Arc::new(std::sync::Mutex::new(session)),
-                                root,
-                                entries,
-                            ),
+                            Ok((session, root, entries)) => {
+                                // language servers for this folder run there
+                                let far = lsp::Far::new(
+                                    browser.host.clone(),
+                                    root.clone(),
+                                    browser.secret.clone(),
+                                );
+                                let mut side = self.lsp.local.far(far);
+                                for (local, path) in &self.remote_files {
+                                    side.knows(local.clone(), path.clone());
+                                }
+                                if let Some(old) = self.lsp.remote.replace(side) {
+                                    self.jobs.run(move || {
+                                        drop(old);
+                                        Done::Note(None)
+                                    });
+                                }
+                                browser.ready(
+                                    std::sync::Arc::new(std::sync::Mutex::new(session)),
+                                    root,
+                                    entries,
+                                );
+                            }
                             Err(why) => browser.state = crate::remote::browse::State::Failed(why),
                         }
                     }
@@ -4645,6 +4716,9 @@ impl App {
                     Ok((local, time)) => {
                         if let Some(time) = time {
                             self.remote_times.insert(path.clone(), time);
+                        }
+                        if let Some(remote) = &mut self.lsp.remote {
+                            remote.knows(local.clone(), path.clone());
                         }
                         self.remote_files.insert(local.clone(), path);
                         if refresh {
@@ -4900,10 +4974,10 @@ impl App {
                         self.texts.tr("Couldn't open settings")
                     ));
                 }
-                Done::Server(language, result) => {
+                Done::Server(far, language, result) => {
                     // a missing server is fine; the editor works without it, and
                     // the status bar says so beside the language
-                    let _ = self.lsp.started(language, result);
+                    side_started(&mut self.lsp, far, language, result);
                 }
                 Done::History(list) => {
                     if let Some(chat) = &mut self.chat {
@@ -5634,7 +5708,7 @@ impl App {
             self.completion = None;
         }
         if let Some(view) = definition
-            && !self.lsp.definition(&self.docs, view)
+            && !self.lsp.of(&self.docs, view).definition(&self.docs, view)
         {
             self.say(self.texts.tr("No language server").to_owned());
         }
@@ -5646,9 +5720,15 @@ impl App {
             }
             Some(search::view::Ask::ReplaceAll) => self.replace_all(),
             Some(search::view::Ask::Open(hit)) => {
-                let view = self.open_file(&hit.path);
-                if let Some(v) = self.docs.view_mut(view) {
-                    v.goto = Some((Point::new(hit.line, hit.column), Encoding::Utf8));
+                if !self.remote_files.contains_key(&hit.path)
+                    && let Some(far) = self.lsp.far_path(&hit.path)
+                {
+                    self.remote_fetch(far, Some(hit.line + 1), false);
+                } else {
+                    let view = self.open_file(&hit.path);
+                    if let Some(v) = self.docs.view_mut(view) {
+                        v.goto = Some((Point::new(hit.line, hit.column), Encoding::Utf8));
+                    }
                 }
             }
             None => {}
@@ -5842,7 +5922,11 @@ impl App {
                     }
                     extension::manifest::Source::Request(method) => {
                         let tag = (u32::from(n) << 8) | u32::try_from(i).unwrap_or(0);
-                        if self.lsp.feed(&self.docs, view, method, tag) {
+                        if self
+                            .lsp
+                            .of(&self.docs, view)
+                            .feed(&self.docs, view, method, tag)
+                        {
                             state.out += 1;
                         } else {
                             asked_all = false;
@@ -5946,7 +6030,7 @@ impl App {
             at: p,
             text: self.diag_text(view, at),
         });
-        if !self.lsp.peek(&self.docs, view, at)
+        if !self.lsp.of(&self.docs, view).peek(&self.docs, view, at)
             && self.peek.as_ref().is_some_and(|k| k.text.is_empty())
         {
             self.peek = None;
@@ -6001,10 +6085,13 @@ impl App {
                 return;
             }
             Ask::Disconnect => {
-                // the link's ssh is let go off the ui thread
+                // the link's ssh and its language servers are let go off the
+                // ui thread
+                let servers = self.lsp.remote.take();
                 if let Some(old) = self.remote.take() {
                     self.jobs.run(move || {
                         drop(old);
+                        drop(servers);
                         Done::Note(None)
                     });
                 }
@@ -6897,7 +6984,7 @@ impl App {
         let eol = if doc.crlf { "CRLF" } else { "LF" };
         // a click on the language starts its server again
         let (language, restart) = match doc.language {
-            Some(language) => match self.lsp.state(language) {
+            Some(language) => match self.lsp.local.state(language) {
                 Some(lsp::ServerState::Missing) => (
                     format!("{language} ({})", self.texts.tr("No language server")),
                     Some(Command::RestartServer),
@@ -7432,6 +7519,23 @@ fn smallest_edit(now: &str, want: &str) -> (std::ops::Range<usize>, String) {
 /// notches of one line's height.
 fn notches(scroll: &aurea::ScrollEvent) -> f64 {
     scroll.clicks.map_or(scroll.delta_y / 40.0, |(_, y)| y)
+}
+
+/// a server start came back to the side that asked; a remote one whose link
+/// is gone meanwhile is let go.
+fn side_started(
+    lsp: &mut lsp::Servers,
+    far: bool,
+    language: &'static str,
+    result: Result<lsp::server::Server, String>,
+) {
+    if far {
+        if let Some(remote) = &mut lsp.remote {
+            let _ = remote.started(language, result);
+        }
+    } else {
+        let _ = lsp.local.started(language, result);
+    }
 }
 
 #[cfg(test)]

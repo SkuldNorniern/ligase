@@ -40,6 +40,64 @@ pub struct Session {
 /// env var that makes ligase answer ssh's password prompt and exit.
 pub const ASKPASS: &str = "LIGASE_ASKPASS";
 
+/// `ssh`'s arguments and its environment.
+pub type SshCommand = (Vec<String>, Vec<(&'static str, String)>);
+
+/// what to run `ssh` with to reach `host` and run `command` there, quietly:
+/// its arguments and its environment. a password goes through ligase as
+/// ssh's askpass helper; without one no prompt can come up.
+pub fn ssh_args(host: &str, password: Option<&str>, command: &str) -> Result<SshCommand, String> {
+    if !terminal::host_ok(host) {
+        return Err(format!("not a host name: {host}"));
+    }
+    // a host seen the first time is learned, as vs code's remote does; a
+    // changed key still fails. the link is pinged so a dead one is noticed
+    // within the minute
+    let mut args: Vec<String> = [
+        "-T",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let mut env = Vec::new();
+    match password {
+        // nobody can answer a prompt on a hidden link: keys or an agent log
+        // in, and a password-only host fails fast instead of hanging
+        None => args.extend(["-o", "BatchMode=yes"].map(str::to_owned)),
+        Some(secret) => {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            args.extend(["-o", "NumberOfPasswordPrompts=1"].map(str::to_owned));
+            env.push(("SSH_ASKPASS", exe.to_string_lossy().into_owned()));
+            env.push(("SSH_ASKPASS_REQUIRE", "force".to_owned()));
+            env.push((
+                "DISPLAY",
+                std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+            ));
+            env.push((ASKPASS, secret.to_owned()));
+        }
+    }
+    args.extend(["--".to_owned(), host.to_owned(), command.to_owned()]);
+    Ok((args, env))
+}
+
+/// the far-side command that runs `program` with `args` in `dir` through a
+/// login shell, so tools from `~/.profile` (cargo, go, node) are found.
+pub fn login_command(dir: &str, program: &str, args: &[String]) -> Option<String> {
+    let mut inner = format!("cd {} 2>/dev/null; exec {}", quote(dir)?, quote(program)?);
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&quote(a)?);
+    }
+    Some(format!("exec sh -lc {}", quote(&inner)?))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
@@ -49,42 +107,8 @@ pub struct Entry {
 impl Session {
     /// `ssh -T -- host sh` (no window on windows: CREATE_NO_WINDOW). host must pass crate::terminal::host_ok.
     pub fn connect(host: &str, password: Option<&str>) -> Result<Session, String> {
-        if !terminal::host_ok(host) {
-            return Err(format!("not a host name: {host}"));
-        }
-        // a host seen the first time is learned, as vs code's remote does;
-        // a changed key still fails. the link is pinged so a dead one is
-        // noticed within the minute
-        let mut args = vec![
-            "-T",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-        ];
-        let mut env: Vec<(&str, String)> = Vec::new();
-        match password {
-            // nobody can answer a prompt on a hidden link: keys or an agent
-            // log in, and a password-only host fails fast instead of hanging
-            None => args.extend(["-o", "BatchMode=yes"]),
-            // ssh asks ligase itself for the password, once
-            Some(secret) => {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                args.extend(["-o", "NumberOfPasswordPrompts=1"]);
-                env.push(("SSH_ASKPASS", exe.to_string_lossy().into_owned()));
-                env.push(("SSH_ASKPASS_REQUIRE", "force".to_owned()));
-                env.push((
-                    "DISPLAY",
-                    std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
-                ));
-                env.push((ASKPASS, secret.to_owned()));
-            }
-        }
-        args.extend(["--", host, "sh"]);
+        let (args, env) = ssh_args(host, password, "sh")?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         Session::spawn_with("ssh", &args, &env)
     }
 
@@ -676,6 +700,14 @@ Host box
 
     #[test]
     fn quote_plain() {
+        // (the far command for a server: a login shell, every part quoted)
+        assert_eq!(
+            login_command("/srv/my app", "rust-analyzer", &["--x".into()]).as_deref(),
+            Some(
+                "exec sh -lc 'cd '\\''/srv/my app'\\'' 2>/dev/null; exec '\\''rust-analyzer'\\'' '\\''--x'\\'''"
+            )
+        );
+
         assert_eq!(quote("/a b/c").as_deref(), Some("'/a b/c'"));
     }
 
