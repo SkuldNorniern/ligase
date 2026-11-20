@@ -926,10 +926,16 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        let root = self.explorer.root().to_path_buf();
         self.jobs.run(move || {
+            // macos hands a program its own arguments as files to open: the
+            // folder this window was started on comes back here, and a new
+            // window for it would start the next one, forever
+            let here = std::fs::canonicalize(&root).ok();
             Done::Opened(
                 paths
                     .into_iter()
+                    .filter(|p| here.is_none() || std::fs::canonicalize(p).ok() != here)
                     .map(|p| {
                         let dir = p.is_dir();
                         (p, dir)
