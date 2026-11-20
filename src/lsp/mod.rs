@@ -28,6 +28,9 @@ const MAX_SYNCED: usize = 8 * 1024 * 1024;
 const KEEP_VERSIONS: usize = 8;
 /// most still-checking ranges kept from one progress note.
 const MAX_BUSY: usize = 1000;
+/// most problems kept per file; a server reporting more is cut, so the
+/// gutter and the problems list stay quick.
+const MAX_DIAGS: usize = 5000;
 /// a completion request not answered by then no longer holds up the next.
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -989,6 +992,7 @@ impl Lsp {
         let diags = params["diagnostics"]
             .as_array()?
             .iter()
+            .take(MAX_DIAGS)
             .filter_map(|d| {
                 let range = range_in(text, &d["range"], encoding)?;
                 let severity = match d["severity"].as_i64() {

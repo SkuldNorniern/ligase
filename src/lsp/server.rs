@@ -20,8 +20,11 @@ pub struct Server {
     next_id: i64,
     /// `initialize` answered and `initialized` sent.
     pub ready: bool,
-    /// notifications held until ready.
-    waiting: Vec<Vec<u8>>,
+    /// notifications held until ready, with the file a full-text change
+    /// is for: a newer change to the same file takes the older one's place.
+    waiting: Vec<(Option<String>, Vec<u8>)>,
+    /// the reader stopped: the stream broke, or the server closed it.
+    reader_gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for Server {
@@ -75,9 +78,19 @@ impl Server {
             .map_err(|e| e.to_string())?;
 
         let (incoming, from_server) = channel::<Value>();
+        let reader_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gone = std::sync::Arc::clone(&reader_gone);
         std::thread::Builder::new()
             .name("ligase-lsp-read".into())
             .spawn(move || {
+                // however the loop ends, the server counts as down after it
+                struct Mark(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Mark {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                let _mark = Mark(gone);
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 16 * 1024];
                 loop {
@@ -110,6 +123,7 @@ impl Server {
             next_id: INIT + 1,
             ready: false,
             waiting: Vec::new(),
+            reader_gone,
         };
         let _ = server
             .to_server
@@ -117,8 +131,11 @@ impl Server {
         Ok(server)
     }
 
+    /// running, with its output still readable. a server whose stream
+    /// broke answers nothing more, so it counts as down.
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        !self.reader_gone.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(self.child.try_wait(), Ok(None))
     }
 
     /// `initialize` came back: say `initialized` and send what waited.
@@ -126,7 +143,7 @@ impl Server {
         let _ = self
             .to_server
             .send(rpc::notification("initialized", json!({})));
-        for bytes in self.waiting.drain(..) {
+        for (_, bytes) in self.waiting.drain(..) {
             let _ = self.to_server.send(bytes);
         }
         self.ready = true;
@@ -140,12 +157,25 @@ impl Server {
     }
 
     pub fn notify(&mut self, method: &str, params: Value) {
+        // changes carry the whole text: only the newest per file matters
+        let file = (method == "textDocument/didChange")
+            .then(|| params["textDocument"]["uri"].as_str().map(str::to_owned))
+            .flatten();
         let bytes = rpc::notification(method, params);
         if self.ready {
             let _ = self.to_server.send(bytes);
-        } else {
-            self.waiting.push(bytes);
+            return;
         }
+        if let Some(file) = &file
+            && let Some(slot) = self
+                .waiting
+                .iter_mut()
+                .find(|(f, _)| f.as_deref() == Some(file.as_str()))
+        {
+            slot.1 = bytes;
+            return;
+        }
+        self.waiting.push((file, bytes));
     }
 
     pub fn reply(&self, id: &Value, result: Value) {
