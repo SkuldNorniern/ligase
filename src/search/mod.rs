@@ -354,6 +354,26 @@ fn walk(
     (read.into_inner(), capped.into_inner())
 }
 
+/// up to `max` hits for `query` under `root`, in walk order. for the
+/// built-in agent's search; runs where it is called, so off the ui thread.
+pub fn grep(root: &Path, query: &str, max: usize) -> Vec<Hit> {
+    let stop = AtomicBool::new(false);
+    let found: Mutex<Vec<(usize, Vec<Hit>)>> = Mutex::default();
+    let count = AtomicUsize::new(0);
+    walk(root, query, &stop, &mut |n, hits| {
+        let total = count.fetch_add(hits.len(), Ordering::Relaxed) + hits.len();
+        if let Ok(mut f) = found.lock() {
+            f.push((n, hits));
+        }
+        if total >= max {
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let mut found = found.into_inner().unwrap_or_default();
+    found.sort_by_key(|f| f.0);
+    found.into_iter().flat_map(|f| f.1).take(max).collect()
+}
+
 /// a file's text: none when it is too big, binary or not UTF-8.
 fn read_text(path: &Path) -> Option<String> {
     use std::io::Read;

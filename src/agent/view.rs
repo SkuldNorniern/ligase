@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use aurea::AureaResult;
 use aurea::CursorIcon;
 use aurea::render::{Color, Font, Rect};
-use aurea::ui::{Align, Button, ScrollArea, Sense, TextArea, Ui};
+use aurea::ui::{Align, Button, ScrollArea, Sense, TextArea, TextField, Ui};
 
 use super::{Chat, Entry, State, Step};
 use crate::app::Id;
@@ -43,6 +43,11 @@ pub enum Ask {
     Open(PathBuf, Option<u32>),
     /// take the file at this place off the next message.
     Unref(usize),
+    /// the built-in agent's setup card: open, a preset, save, close.
+    SetupOpen,
+    SetupPreset(usize),
+    SetupSave,
+    SetupCancel,
 }
 
 #[derive(Clone, Debug)]
@@ -231,8 +236,13 @@ pub fn show(
     let icon = Rect::new(head.x + PAD, head.y + (HEAD - 16.0) / 2.0, 16.0, 16.0);
     crate::icons::draw(ui, "agent", icon, palette.accent)?;
     // the name, its first word when narrow, none when narrower still
-    let room = head.right() - PAD - 56.0 - 8.0 - (icon.right() + 8.0);
-    let full = chat.agent.name();
+    let gear_w = if chat.agent == super::Agent::OpenAi {
+        30.0
+    } else {
+        0.0
+    };
+    let room = head.right() - PAD - 56.0 - gear_w - 8.0 - (icon.right() + 8.0);
+    let full = chat.title.as_str();
     let short = full.split(' ').next().unwrap_or(full);
     let shown = [full, short]
         .into_iter()
@@ -250,6 +260,25 @@ pub fn show(
         State::Failed(_) => (texts.tr("stopped"), palette.danger),
     };
     let new = Rect::new(head.right() - PAD - 56.0, head.y + 6.0, 56.0, HEAD - 12.0);
+    // the built-in agent's model can change any time
+    let gear = Rect::new(new.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
+    if chat.agent == super::Agent::OpenAi {
+        let input = ui.interact(Id::AgentButton(6), 0, gear, Sense::Click, true);
+        if input.hovered {
+            ui.round(gear, 6.0, palette.hover)?;
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        let icon = Rect::new(
+            gear.x + 5.0,
+            gear.y + (gear.height - 16.0) / 2.0,
+            16.0,
+            16.0,
+        );
+        crate::icons::draw(ui, "settings", icon, palette.dim)?;
+        if input.clicked {
+            ask = Some(Ask::SetupOpen);
+        }
+    }
     // the state's dot always; its word only where it fits before the button
     let dot = Rect::new(name.x + name_w + 10.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
     if dot.right() < new.x - 4.0 {
@@ -266,6 +295,13 @@ pub fn show(
         .clicked
     {
         ask = Some(Ask::New);
+    }
+
+    if chat.setup.is_some() {
+        if let Some(a) = setup_card(ui, chat, rest, texts)? {
+            ask = Some(a);
+        }
+        return Ok(ask);
     }
 
     // the box to write in, and what goes with it, at the bottom
@@ -669,5 +705,134 @@ pub fn show(
     )?;
     // scrolled up: stop following; back at the bottom: follow again
     chat.follow = chat.scroll >= bottom - 4.0;
+    Ok(ask)
+}
+
+/// the built-in agent's setup: a preset to start from, the server, the
+/// model, the key. the key field never shows a saved key.
+fn setup_card(
+    ui: &mut Ui<'_, Id>,
+    chat: &mut Chat,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let small = ui.theme.font(12.0);
+    let bold = ui
+        .theme
+        .font(14.0)
+        .with_weight(aurea::render::FontWeight::Bold);
+    let Some(setup) = chat.setup.as_mut() else {
+        return Ok(None);
+    };
+    let mut ask = None;
+    let area = rect.inset(PAD);
+    let mut y = area.y + 4.0;
+    ui.text(
+        texts.tr("Set up a model"),
+        Rect::new(area.x, y, area.width, 22.0),
+        &bold,
+        palette.text,
+        Align::Start,
+    )?;
+    y += 26.0;
+    let about = texts.tr("Any OpenAI-compatible server. The key stays in a file in Ligase's config folder; local servers need none.");
+    for line in hover::wrap(ui, about, &small, area.width) {
+        ui.text(
+            &line,
+            Rect::new(area.x, y, area.width, 17.0),
+            &small,
+            palette.dim,
+            Align::Start,
+        )?;
+        y += 17.0;
+    }
+    y += 10.0;
+    // presets as chips, wrapping
+    let mut x = area.x;
+    for (i, (name, base, ..)) in super::native::PRESETS.iter().enumerate() {
+        let w = ui.text_width(name, &small) + 20.0;
+        if x > area.x && x + w > area.right() {
+            x = area.x;
+            y += CHIP + 6.0;
+        }
+        let chip = Rect::new(x, y, w.min(area.width), CHIP);
+        let n = u16::try_from(60 + i).unwrap_or(u16::MAX);
+        let input = ui.interact(Id::AgentButton(n), 0, chip, Sense::Click, true);
+        let lit = setup.base == *base;
+        let fill = if lit {
+            palette.accent.fade(0.25)
+        } else if input.hovered {
+            palette.hover
+        } else {
+            palette.raised
+        };
+        ui.round(chip, 11.0, fill)?;
+        ui.text(
+            name,
+            chip,
+            &small,
+            if lit { palette.text } else { palette.dim },
+            Align::Center,
+        )?;
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        if input.clicked {
+            ask = Some(Ask::SetupPreset(i));
+        }
+        x += w + 6.0;
+    }
+    y += CHIP + 14.0;
+    let field = |ui: &mut Ui<'_, Id>, label: &str, y: f32| -> AureaResult<Rect> {
+        ui.text(
+            label,
+            Rect::new(area.x, y, area.width, 18.0),
+            &small,
+            palette.dim,
+            Align::Start,
+        )?;
+        Ok(Rect::new(area.x, y + 20.0, area.width, 30.0))
+    };
+    let at = field(ui, texts.tr("Server URL"), y)?;
+    TextField::new(&mut setup.base)
+        .placeholder("https://api.openai.com/v1")
+        .max_chars(500)
+        .show(ui, Id::AgentField(0), at)?;
+    y = at.bottom() + 10.0;
+    let at = field(ui, texts.tr("Model"), y)?;
+    TextField::new(&mut setup.model)
+        .placeholder("gpt-4.1")
+        .max_chars(200)
+        .show(ui, Id::AgentField(1), at)?;
+    y = at.bottom() + 10.0;
+    let at = field(ui, texts.tr("API key"), y)?;
+    let typed = TextField::new(&mut setup.key)
+        .placeholder(texts.tr("empty keeps the saved key"))
+        .password(true)
+        .max_chars(1000)
+        .show(ui, Id::AgentField(2), at)?;
+    y = at.bottom() + 16.0;
+    let ready = !setup.base.trim().is_empty() && !setup.model.trim().is_empty();
+    let save = Rect::new(area.x, y, 140.0_f32.min(area.width), 30.0);
+    if (Button::new(texts.tr("Save and start"))
+        .primary()
+        .enabled(ready)
+        .show(ui, Id::AgentButton(7), save)?
+        .clicked
+        || typed.submitted)
+        && ready
+    {
+        ask = Some(Ask::SetupSave);
+    }
+    let cancel = Rect::new(save.right() + 8.0, y, 90.0, 30.0);
+    if cancel.right() <= area.right()
+        && Button::new(texts.tr("Cancel"))
+            .quiet()
+            .show(ui, Id::AgentButton(8), cancel)?
+            .clicked
+    {
+        ask = Some(Ask::SetupCancel);
+    }
     Ok(ask)
 }

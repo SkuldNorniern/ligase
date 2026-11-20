@@ -6,6 +6,7 @@
 //! each edit can be undone.
 
 pub mod acp;
+pub mod native;
 pub mod view;
 
 use std::path::{Component, Path, PathBuf};
@@ -21,10 +22,18 @@ pub enum Agent {
     Codex,
     Gemini,
     OpenCode,
+    /// the built-in one, on any openai-compatible api.
+    OpenAi,
 }
 
 impl Agent {
-    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Gemini, Self::OpenCode];
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Gemini,
+        Self::OpenCode,
+        Self::OpenAi,
+    ];
 
     /// the settings word.
     pub fn word(self) -> &'static str {
@@ -33,6 +42,7 @@ impl Agent {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
+            Self::OpenAi => "openai",
         }
     }
 
@@ -46,6 +56,7 @@ impl Agent {
             Self::Codex => "Codex",
             Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
+            Self::OpenAi => "Model",
         }
     }
 
@@ -68,6 +79,8 @@ impl Agent {
             Self::Codex => ("codex-acp", &[], &["@zed-industries/codex-acp"]),
             Self::Gemini => ("gemini", &["--experimental-acp"], &[]),
             Self::OpenCode => ("opencode", &["acp"], &[]),
+            // runs inside ligase; never started as a program
+            Self::OpenAi => ("", &[], &[]),
         }
     }
 
@@ -296,9 +309,22 @@ enum Pending {
     Prompt,
 }
 
+/// the built-in agent's setup card, filled in by the person.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Setup {
+    pub base: String,
+    pub model: String,
+    /// typed here only; never shown back. empty keeps the key there is.
+    pub key: String,
+}
+
 /// one agent conversation and its pipe.
 pub struct Chat {
     pub agent: Agent,
+    /// shown in the header: the agent, or the built-in one's model.
+    pub title: String,
+    /// the setup card, while it is open.
+    pub setup: Option<Setup>,
     pub state: State,
     pub entries: Vec<Entry>,
     pub input: String,
@@ -327,6 +353,8 @@ impl Chat {
     pub fn new(agent: Agent, root: PathBuf) -> Self {
         Self {
             agent,
+            title: agent.name().to_owned(),
+            setup: None,
             state: State::Off,
             entries: Vec::new(),
             input: String::new(),

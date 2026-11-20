@@ -73,6 +73,8 @@ pub enum Id {
     AgentLink(u16),
     AgentInput,
     AgentList,
+    /// the built-in agent's setup fields, by number.
+    AgentField(u16),
     /// the branch pill and the sync buttons in source control.
     ScmBranch,
     ScmPull,
@@ -1227,7 +1229,15 @@ impl App {
             return;
         }
         chat.state = agent::State::Starting;
+        let model = self.settings.openai_model.clone().unwrap_or_default();
+        if agent == agent::Agent::OpenAi && !model.is_empty() {
+            chat.title = model.clone();
+        }
         let custom = self.settings.agent_command.clone().unwrap_or_default();
+        let (base, context) = (
+            self.settings.openai_base_url.clone(),
+            self.settings.openai_context as usize,
+        );
         let canvas = self.canvas;
         let job = move || {
             let wake = move || {
@@ -1235,9 +1245,22 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            let pipe = agent
-                .command(&custom)
-                .and_then(|(program, args)| agent::acp::Pipe::spawn(&program, &args, &root, wake));
+            let pipe = if agent == agent::Agent::OpenAi {
+                // the built-in one: the key is read here, off the ui thread
+                let config = agent::native::Config {
+                    base,
+                    model,
+                    key: agent::native::read_key(),
+                    context,
+                };
+                agent::acp::Pipe::in_process(move |lines, out| {
+                    agent::native::serve(config, root, lines, out, Box::new(wake));
+                })
+            } else {
+                agent.command(&custom).and_then(|(program, args)| {
+                    agent::acp::Pipe::spawn(&program, &args, &root, wake)
+                })
+            };
             Done::AgentUp(pipe)
         };
         if !self.procs.run(job)
@@ -1407,6 +1430,62 @@ impl App {
         });
     }
 
+    /// opens the built-in agent's setup card with what is set now; the key
+    /// field starts empty, a saved key is never shown back.
+    fn open_setup(&mut self) {
+        let setup = agent::Setup {
+            base: self.settings.openai_base_url.clone(),
+            model: self.settings.openai_model.clone().unwrap_or_default(),
+            key: String::new(),
+        };
+        if let Some(chat) = &mut self.chat {
+            chat.setup = Some(setup);
+        }
+        self.ui.focus(Id::AgentField(1), 0);
+    }
+
+    /// keeps the setup: server and model in settings, the key in its own
+    /// file, then the built-in agent starts on them.
+    fn save_setup(&mut self) {
+        let Some(setup) = self.chat.as_mut().and_then(|c| c.setup.take()) else {
+            return;
+        };
+        let base = setup.base.trim().trim_end_matches('/').to_owned();
+        let model = setup.model.trim().to_owned();
+        if !(base.starts_with("http://") || base.starts_with("https://")) || model.is_empty() {
+            self.say(
+                self.texts
+                    .tr("The server must start with http:// or https://, and a model is needed")
+                    .to_owned(),
+            );
+            if let Some(chat) = &mut self.chat {
+                chat.setup = Some(setup);
+            }
+            return;
+        }
+        self.settings.agent = agent::Agent::OpenAi;
+        self.settings.openai_base_url = base.clone();
+        self.settings.openai_model = Some(model.clone());
+        self.settings_writes
+            .push(("agent", Some(settings::quote("openai"))));
+        self.settings_writes
+            .push(("openai_base_url", Some(settings::quote(&base))));
+        self.settings_writes
+            .push(("openai_model", Some(settings::quote(&model))));
+        self.write_settings();
+        let key = setup.key.trim().to_owned();
+        if !key.is_empty() {
+            // on the procs worker, so the start after it sees the key
+            self.procs.run(move || {
+                let saved = agent::native::key_path()
+                    .ok_or_else(|| "no config folder".to_owned())
+                    .and_then(|path| save_key(&path, &key));
+                Done::Note(saved.err().map(|e| format!("the key was not saved: {e}")))
+            });
+        }
+        self.start_agent(true);
+    }
+
     /// what the agent panel asked for.
     fn agent_ask(&mut self, ask: agent::view::Ask) {
         use agent::view::Ask;
@@ -1432,6 +1511,35 @@ impl App {
                     chat.answer(&option);
                 }
             }
+            // the built-in agent signs in through its setup card
+            Ask::SignIn(_) | Ask::SetupOpen
+                if self
+                    .chat
+                    .as_ref()
+                    .is_some_and(|c| c.agent == agent::Agent::OpenAi) =>
+            {
+                self.open_setup();
+            }
+            Ask::SetupOpen => {}
+            Ask::SetupPreset(i) => {
+                if let (Some(setup), Some((_, base, model, _))) = (
+                    self.chat.as_mut().and_then(|c| c.setup.as_mut()),
+                    agent::native::PRESETS.get(i),
+                ) {
+                    // a model typed by hand stays; a preset's own one follows
+                    let preset_model = agent::native::PRESETS.iter().any(|p| p.2 == setup.model);
+                    setup.base = (*base).to_owned();
+                    if setup.model.trim().is_empty() || preset_model {
+                        setup.model = (*model).to_owned();
+                    }
+                }
+            }
+            Ask::SetupCancel => {
+                if let Some(chat) = &mut self.chat {
+                    chat.setup = None;
+                }
+            }
+            Ask::SetupSave => self.save_setup(),
             Ask::SignIn(n) => {
                 let need = self.chat.as_mut().and_then(|c| c.sign_in(n));
                 if let Some(agent::Need::Terminal(args)) = need {
@@ -6354,6 +6462,22 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
+}
+
+/// writes the agent key to its own file, readable only by its owner where
+/// the system allows saying so.
+fn save_key(path: &Path, key: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, format!("{key}\n")).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// the one edit that turns `now` into `want`: the middle between what both

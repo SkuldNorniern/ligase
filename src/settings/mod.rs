@@ -101,6 +101,12 @@ pub struct Settings {
     pub agent: crate::agent::Agent,
     /// a command that speaks acp in place of the agent's own; empty for none.
     pub agent_command: Option<String>,
+    /// the built-in agent's server, up to `/chat/completions`.
+    pub openai_base_url: String,
+    /// the built-in agent's model; none until set up.
+    pub openai_model: Option<String>,
+    /// the model's context in tokens; auto compact starts at three quarters.
+    pub openai_context: f32,
     /// spaces and tabs at line ends go when saving.
     pub trim_trailing_whitespace: bool,
     /// a saved file ends in a line break.
@@ -144,6 +150,9 @@ impl Default for Settings {
             terminal_size: 13.0,
             agent: crate::agent::Agent::Claude,
             agent_command: None,
+            openai_base_url: "https://api.openai.com/v1".to_owned(),
+            openai_model: None,
+            openai_context: 32_000.0,
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
@@ -188,6 +197,9 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # terminal_size = 13
 # agent = "claude"          # "claude", "codex", "gemini" or "opencode"
 # agent_command = ""        # a program and args that speak acp, in place of the agent's own
+# openai_base_url = "https://api.openai.com/v1"  # any openai-compatible server, for agent = "openai"
+# openai_model = ""         # the model it asks; the key lives in the agent-key file
+# openai_context = 32000    # the model's context in tokens; older talk is summarized past 3/4
 # trim_trailing_whitespace = false
 # final_newline = false
 # save_on_focus_loss = false
@@ -278,12 +290,29 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some(_) => out.whitespace = Whitespace::All,
             None => return false,
         },
+        "openai_base_url" => {
+            match value.as_str().map(str::trim).filter(|s| {
+                s.len() <= 500 && (s.starts_with("http://") || s.starts_with("https://"))
+            }) {
+                Some(url) => out.openai_base_url = url.trim_end_matches('/').to_owned(),
+                None => return false,
+            }
+        }
+        "openai_model" => match value.as_str().map(str::trim).filter(|s| s.len() <= 200) {
+            Some("") => out.openai_model = None,
+            Some(m) => out.openai_model = Some(m.to_owned()),
+            None => return false,
+        },
+        "openai_context" => match number(value, 2_000.0, 2_000_000.0) {
+            Some(n) => out.openai_context = n,
+            None => return false,
+        },
         "agent_command" => match value.as_str().filter(|s| s.len() <= 1000) {
             Some(c) if c.trim().is_empty() => out.agent_command = None,
             Some(c) => out.agent_command = Some(c.trim().to_owned()),
             None => return false,
         },
-        "agent" => match word(value, &["claude", "codex", "gemini", "opencode"])
+        "agent" => match word(value, &["claude", "codex", "gemini", "opencode", "openai"])
             .and_then(crate::agent::Agent::from_word)
         {
             Some(agent) => out.agent = agent,
@@ -481,7 +510,32 @@ pub const FIELDS: &[Field] = &[
         label: "Coding Agent",
         about: "The agent the agent panel talks to. It signs in on its own.",
         group: "Agent",
-        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode"]),
+        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "openai"]),
+    },
+    Field {
+        key: "openai_base_url",
+        label: "Model Server",
+        about: "An OpenAI-compatible server for the built-in agent (agent = openai).",
+        group: "Agent",
+        kind: FieldKind::Text,
+    },
+    Field {
+        key: "openai_model",
+        label: "Model",
+        about: "The model the built-in agent asks.",
+        group: "Agent",
+        kind: FieldKind::Text,
+    },
+    Field {
+        key: "openai_context",
+        label: "Model Context",
+        about: "The model's context in tokens. Older talk is summarized past three quarters of it.",
+        group: "Agent",
+        kind: FieldKind::Number {
+            min: 2_000.0,
+            max: 2_000_000.0,
+            step: 1_000.0,
+        },
     },
     Field {
         key: "agent_command",
@@ -643,6 +697,9 @@ pub fn current(s: &Settings, key: &str) -> Option<String> {
         "terminal_size" => number_literal(s.terminal_size),
         "agent" => quote(s.agent.word()),
         "agent_command" => quote(s.agent_command.as_deref().unwrap_or("")),
+        "openai_base_url" => quote(&s.openai_base_url),
+        "openai_model" => quote(s.openai_model.as_deref().unwrap_or("")),
+        "openai_context" => number_literal(s.openai_context),
         "rail" => quote(match s.rail {
             RailPlace::Left => "left",
             RailPlace::Right => "right",
@@ -821,6 +878,9 @@ mod tests {
             "terminal_size",
             "agent",
             "agent_command",
+            "openai_base_url",
+            "openai_model",
+            "openai_context",
             "trim_trailing_whitespace",
             "final_newline",
             "save_on_focus_loss",

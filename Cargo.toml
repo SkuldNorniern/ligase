@@ -12,6 +12,8 @@ resolvase = { git = "https://github.com/SkuldNorniern/resolvase", rev = "60b9fb8
 vanta = { git = "https://github.com/SkuldNorniern/vanta", rev = "40fe8683dab31a70327ac73b2b53a166a841877f" }
 toml = "1"
 serde_json = "1"
+# the built-in agent's https calls to openai-compatible servers
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-dsl = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }

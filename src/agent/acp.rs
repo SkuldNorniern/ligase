@@ -38,7 +38,8 @@ pub struct Fail {
 }
 
 pub struct Pipe {
-    child: Child,
+    /// none for an agent running inside ligase.
+    child: Option<Child>,
     to_agent: Sender<String>,
     pub from_agent: Receiver<Incoming>,
     next: u64,
@@ -53,15 +54,16 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         let (closed, _) = channel();
         drop(std::mem::replace(&mut self.to_agent, closed));
+        let Some(child) = &mut self.child else { return };
         let started = std::time::Instant::now();
         while started.elapsed() < GRACE {
-            if !matches!(self.child.try_wait(), Ok(None)) {
+            if !matches!(child.try_wait(), Ok(None)) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -158,7 +160,27 @@ impl Pipe {
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            child,
+            child: Some(child),
+            to_agent,
+            from_agent,
+            next: 1,
+        })
+    }
+
+    /// an agent running inside ligase on its own thread: `serve` gets the
+    /// lines ligase sends and answers on the channel, the same as a program
+    /// would on its pipes.
+    pub fn in_process(
+        serve: impl FnOnce(Receiver<String>, Sender<Incoming>) + Send + 'static,
+    ) -> Result<Self, String> {
+        let (to_agent, lines) = channel::<String>();
+        let (incoming, from_agent) = channel();
+        std::thread::Builder::new()
+            .name("ligase-agent".into())
+            .spawn(move || serve(lines, incoming))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            child: None,
             to_agent,
             from_agent,
             next: 1,
