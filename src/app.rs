@@ -576,6 +576,8 @@ pub struct App {
     shells: terminal::Shells,
     /// the agent conversation, made the first time the panel is used.
     chat: Option<agent::Chat>,
+    /// the editor and documents' stamp the symbol list was filled at.
+    symbols_seen: Option<(Option<ViewId>, u64)>,
     finder: Finder,
     problems: Problems,
     lsp: Lsp,
@@ -736,6 +738,7 @@ impl App {
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
             chat: None,
+            symbols_seen: None,
             finder: Finder::default(),
             problems: Problems::default(),
             lsp: Lsp::default(),
@@ -2924,8 +2927,15 @@ impl App {
     /// the `@` list: symbols of the file in the last editor, in file order.
     fn fill_symbols(&mut self) {
         if self.palette.wanted().0 != Kind::Symbols {
+            self.symbols_seen = None;
             return;
         }
+        // the same file at the same stamp: the list stands
+        let key = (self.last_editor, self.docs.stamp());
+        if self.symbols_seen == Some(key) {
+            return;
+        }
+        self.symbols_seen = Some(key);
         let symbols = self
             .last_editor
             .and_then(|v| self.docs.doc_of(v))

@@ -33,6 +33,8 @@ pub struct Problem {
 #[derive(Default)]
 pub struct Problems {
     pub rows: Vec<Problem>,
+    /// the documents' stamp the rows were gathered at.
+    seen: Option<u64>,
     scroll: f32,
     picked: Option<usize>,
 }
@@ -41,8 +43,14 @@ impl Problems {
     /// lists the diagnostics of every open document, worst first, then by
     /// file and place.
     pub fn gather(&mut self, docs: &Documents) {
+        // nothing moved since last time: the rows stand
+        let stamp = docs.stamp();
+        if self.seen == Some(stamp) {
+            return;
+        }
+        self.seen = Some(stamp);
         let mut rows = Vec::new();
-        for doc in docs.all() {
+        'docs: for doc in docs.all() {
             let text = doc.buffer.text();
             for diag in &doc.diags {
                 let Ok(at) = text.point(diag.range.start, resolvase::Encoding::Utf32) else {
@@ -56,7 +64,7 @@ impl Problems {
                     message: one_line(&diag.message),
                 });
                 if rows.len() >= MAX_ROWS {
-                    break;
+                    break 'docs;
                 }
             }
         }

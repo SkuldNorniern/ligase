@@ -162,6 +162,9 @@ pub struct Documents {
     next: u32,
     /// file types extensions added, beside the bundled ones.
     associations: syntax::Associations,
+    /// bumped when diagnostics, symbols, paths or the set of documents
+    /// change; text edits show in each buffer's revision. see [`Self::stamp`].
+    changes: u64,
 }
 
 impl Documents {
@@ -203,6 +206,7 @@ impl Documents {
     /// the document for `path`, made in `Loading` state if new. true when new,
     /// so the caller knows to start a load.
     pub fn open(&mut self, path: &Path) -> (DocumentId, bool) {
+        self.changes += 1;
         if let Some((&id, _)) = self.docs.iter().find(|(_, d)| d.path == path) {
             return (id, false);
         }
@@ -234,6 +238,7 @@ impl Documents {
 
     /// a new empty document with no file yet, named `Untitled-n`.
     pub fn new_untitled(&mut self) -> DocumentId {
+        self.changes += 1;
         let n = (1..)
             .find(|n| {
                 let name = format!("Untitled-{n}");
@@ -254,6 +259,7 @@ impl Documents {
     /// a file or folder was renamed: documents at or under `from` follow it
     /// to `to`, text and edits kept.
     pub fn moved(&mut self, from: &Path, to: &Path) {
+        self.changes += 1;
         for doc in self.docs.values_mut() {
             if let Ok(rest) = doc.path.strip_prefix(from) {
                 doc.path = if rest.as_os_str().is_empty() {
@@ -281,6 +287,7 @@ impl Documents {
 
     /// gives the document its real file, from save as.
     pub fn set_path(&mut self, id: DocumentId, path: &Path) {
+        self.changes += 1;
         if let Some(doc) = self.docs.get_mut(&id) {
             doc.path = path.to_path_buf();
             doc.language = syntax::language_for(path, &self.associations);
@@ -467,6 +474,7 @@ impl Documents {
     /// colours are back. kept only when they match the text now; older
     /// ones would sit on the wrong text, the moved spans are better.
     pub fn coloured(&mut self, parsed: Parsed) {
+        self.changes += 1;
         if let Some(doc) = self.docs.get_mut(&parsed.doc)
             && doc.buffer.revision() == parsed.revision
         {
@@ -474,6 +482,24 @@ impl Documents {
             doc.folds = parsed.folds;
             doc.symbols = parsed.symbols;
         }
+    }
+
+    /// changes when anything the panels show from documents changes: text,
+    /// diagnostics, symbols, paths, which are open. cheap: a hash over the
+    /// open documents' revisions. lists built from documents rebuild only
+    /// when it moves.
+    pub fn stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.changes.hash(&mut h);
+        let mut revs: Vec<_> = self
+            .docs
+            .iter()
+            .map(|(id, d)| (id.0, d.buffer.revision().get()))
+            .collect();
+        revs.sort_unstable();
+        revs.hash(&mut h);
+        h.finish()
     }
 
     /// every open document.
@@ -565,6 +591,7 @@ impl Documents {
     }
 
     pub fn set_diags(&mut self, id: DocumentId, revision: Revision, mut diags: Vec<Diag>) {
+        self.changes += 1;
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
@@ -648,6 +675,7 @@ impl Documents {
     /// puts the text read back from disk in, as one undoable edit. carets
     /// keep their line and column.
     pub fn reload(&mut self, id: DocumentId, text: &str, disk: Option<Stamp>) {
+        self.changes += 1;
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
@@ -732,6 +760,7 @@ impl Documents {
 
     /// drops a view, and its document when no view is left.
     pub fn close_view(&mut self, view: ViewId) {
+        self.changes += 1;
         let Some(v) = self.views.remove(&view) else {
             return;
         };
@@ -747,6 +776,7 @@ impl Documents {
 
     /// takes a file read and built on the worker.
     pub fn loaded_text(&mut self, id: DocumentId, result: Result<Loaded, String>) {
+        self.changes += 1;
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
