@@ -597,10 +597,11 @@ pub fn show(
                                     ui.text_width(label, &small).min(width - 20.0),
                                     rh,
                                 );
-                                let n =
-                                    u16::try_from((i * 8 + r) % usize::from(u16::MAX)).unwrap_or(0);
+                                // the entry names the widget, the row its part
+                                let n = u16::try_from(i % usize::from(u16::MAX)).unwrap_or(0);
+                                let part = u16::try_from(r).unwrap_or(u16::MAX);
                                 let input =
-                                    ui.interact(Id::AgentLink(n), 0, link, Sense::Click, true);
+                                    ui.interact(Id::AgentLink(n), part, link, Sense::Click, true);
                                 let c = if input.hovered {
                                     palette.accent
                                 } else {
