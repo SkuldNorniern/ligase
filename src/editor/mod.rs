@@ -810,7 +810,9 @@ fn review_bar(
     let label = if n == 1 {
         texts.tr("1 change by the agent").to_owned()
     } else {
-        format!("{n} {}", texts.tr("changes by the agent"))
+        texts
+            .tr("{n} changes by the agent")
+            .replace("{n}", &n.to_string())
     };
     let mut ask = None;
     let mut x = bar.right() - 6.0;

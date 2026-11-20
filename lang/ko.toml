@@ -413,7 +413,7 @@
 "Fit" = "맞춤"
 "Loading…" = "불러오는 중…"
 "1 change by the agent" = "에이전트가 바꾼 곳 1개"
-"changes by the agent" = "개, 에이전트가 바꾼 곳"
+"{n} changes by the agent" = "에이전트가 바꾼 곳 {n}개"
 "Keep all" = "모두 유지"
 "Undo all" = "모두 되돌리기"
 "Keep" = "유지"
