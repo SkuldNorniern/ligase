@@ -140,7 +140,16 @@ pub fn set_key(profile: &str, key: Option<&str>) -> Result<(), String> {
 
 fn set_key_in(path: &Path, profile: &str, key: Option<&str>) -> Result<(), String> {
     let path = path.to_path_buf();
-    let mut keys = keys_in(&path);
+    // a file there that can't be read stays as it is: writing one profile
+    // over it would lose every other key
+    let mut keys = match std::fs::read_to_string(&path) {
+        Ok(text) if text.len() >= 256 * 1024 => return Err("the keys file is too big".to_owned()),
+        Ok(text) => text
+            .parse::<toml::Table>()
+            .map_err(|e| format!("the keys file is not valid toml, fix it first: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     match key.map(str::trim).filter(|k| !k.is_empty()) {
         Some(k) if k.len() < MAX_KEY => {
             keys.insert(profile.to_owned(), toml::Value::String(k.to_owned()));
@@ -155,12 +164,19 @@ fn set_key_in(path: &Path, profile: &str, key: Option<&str>) -> Result<(), Strin
     }
     let text = toml::to_string(&keys).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    // owner only from the start, never readable by others for a moment
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = open.open(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
@@ -1076,6 +1092,26 @@ mod tests {
         );
         assert_eq!(file_uri("https://x"), None);
         assert_eq!(file_uri("file:///w/a.rs#Lx-9"), None);
+    }
+
+    #[test]
+    fn a_broken_keys_file_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!("ligase-badkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("agent-keys.toml");
+        std::fs::write(
+            &path,
+            "work = \"sk-1\"
+home = ",
+        )
+        .expect("write");
+        assert!(set_key_in(&path, "new", Some("sk-2")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "work = \"sk-1\"
+home = "
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
