@@ -24,6 +24,8 @@ const MAX_PATH: usize = 4096;
 const LINE_CHUNK: u64 = 1024 * 1024;
 const QUEUE: usize = 256;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// a search over the whole folder gets longer.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(90);
 const LINK_DOWN: &str = "the link is down";
 
 pub struct Session {
@@ -232,6 +234,26 @@ impl Session {
         Ok(())
     }
 
+    /// lines with `query` (taken as text, not a pattern) in files under
+    /// `root`: (path, line from 1, the line). `.git`, `node_modules` and
+    /// `target` are skipped, binary files too; 20 per file, 300 in all.
+    pub fn grep(
+        &mut self,
+        root: &str,
+        query: &str,
+    ) -> Result<Vec<(String, usize, String)>, String> {
+        if query.is_empty() || query.contains(['\n', '\0']) || query.len() > 500 {
+            return Err("bad query".into());
+        }
+        let q = quote(query).ok_or_else(|| "bad query".to_string())?;
+        let script = format!(
+            "grep -rnIF --null --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target -m 20 -e {q} -- {} | head -n 300",
+            quoted(root)?
+        );
+        let (out, _) = self.run(&script, SEARCH_TIMEOUT)?;
+        Ok(parse_grep(&out))
+    }
+
     /// the remote home directory (`printf %s "$HOME"`).
     pub fn home(&mut self) -> Result<String, String> {
         let (out, status) = self.run("printf %s \"$HOME\"", CALL_TIMEOUT)?;
@@ -296,6 +318,68 @@ fn read_lines(stdout: ChildStdout, tx: SyncSender<String>) {
             return;
         }
     }
+}
+
+/// grep's `path\0line:text` lines, or `path:line:text` from a grep with no
+/// `--null`. lines that don't read are left out.
+pub fn parse_grep(out: &str) -> Vec<(String, usize, String)> {
+    let mut hits = Vec::new();
+    for line in out.lines().take(300) {
+        let (path, rest) = match line.split_once('\0') {
+            Some(parts) => parts,
+            None => {
+                // the first `:<digits>:` ends the path
+                let mut found = None;
+                for (i, _) in line.match_indices(':') {
+                    let after = &line[i + 1..];
+                    let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+                    if digits > 0 && after.as_bytes().get(digits) == Some(&b':') {
+                        found = Some((&line[..i], after));
+                        break;
+                    }
+                }
+                let Some(parts) = found else { continue };
+                parts
+            }
+        };
+        let Some((n, text)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        if path.is_empty() || n == 0 {
+            continue;
+        }
+        let text: String = text.trim().chars().take(200).collect();
+        hits.push((path.to_owned(), n, text));
+    }
+    hits
+}
+
+/// the hosts named in an ssh config: `Host` lines, patterns left out.
+pub fn ssh_hosts(config: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in config.lines().take(10_000) {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("Host ")
+            .or_else(|| line.strip_prefix("Host\t"))
+            .or_else(|| line.strip_prefix("host "))
+        else {
+            continue;
+        };
+        for name in rest.split_whitespace() {
+            if !name.contains(['*', '?', '!'])
+                && crate::terminal::host_ok(name)
+                && !out.iter().any(|h| h == name)
+            {
+                out.push(name.to_owned());
+            }
+        }
+        if out.len() >= 200 {
+            break;
+        }
+    }
+    out
 }
 
 /// `s` as one single-quoted sh word: `'` becomes `'\''`. rejects NUL.
@@ -387,6 +471,32 @@ fn decode(text: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grep_lines_read_with_and_without_null() {
+        let out = "/srv/a.rs 12:fn main() {
+/srv/b:c.rs:3:x
+not a hit
+/srv/z 0:zero";
+        let hits = parse_grep(out);
+        assert_eq!(
+            hits[0],
+            ("/srv/a.rs".to_owned(), 12, "fn main() {".to_owned())
+        );
+        assert_eq!(hits[1], ("/srv/b:c.rs".to_owned(), 3, "x".to_owned()));
+        assert_eq!(hits.len(), 2, "no line 0, no junk");
+    }
+
+    #[test]
+    fn ssh_config_hosts_skip_patterns() {
+        let config = "Host box web1 *.lan
+  HostName 10.0.0.2
+Host -bad
+host lab
+Host box
+";
+        assert_eq!(ssh_hosts(config), ["box", "web1", "lab"]);
+    }
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -497,6 +607,42 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn grep_finds_text_and_skips_git() {
+        let Some(mut s) = session() else { return };
+        let dir = std::env::temp_dir().join(format!("ligase-rgrep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "one
+let needle = 1;
+",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".git/x"), "needle").unwrap();
+        std::fs::write(
+            dir.join("b.txt"),
+            "a 'needle' with quotes
+",
+        )
+        .unwrap();
+        let root = posix(&dir);
+        let mut hits = s.grep(&root, "needle").unwrap();
+        hits.sort();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().any(|h| h.0.ends_with("src/a.rs") && h.1 == 2));
+        assert!(
+            hits.iter()
+                .any(|h| h.0.ends_with("b.txt") && h.2.contains("'needle'"))
+        );
+        // a query with quotes stays one word
+        assert_eq!(s.grep(&root, "'needle'").unwrap().len(), 1);
+        assert!(s.grep(&root, "").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

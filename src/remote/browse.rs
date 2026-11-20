@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aurea::AureaResult;
 use aurea::render::Rect;
-use aurea::ui::{Align, ListView, Ui};
+use aurea::ui::{Align, Button, ListView, Sense, TextField, Ui};
+use aurea::{AureaResult, CursorIcon};
 
 use super::{Entry, Session};
 use crate::app::Id;
@@ -46,6 +46,22 @@ pub struct Browser {
     pub rows: Vec<Node>,
     scroll: f32,
     picked: Option<usize>,
+    /// the search box, open or not, and what it holds.
+    pub search_open: bool,
+    pub query: String,
+    /// what the last search found: path, line from 1, the line.
+    pub hits: Vec<(String, usize, String)>,
+    pub searching: bool,
+    hit_scroll: f32,
+}
+
+/// the panel before a link: a target to type, hosts to pick.
+#[derive(Default)]
+pub struct Picker {
+    pub input: String,
+    /// recent targets first, then `~/.ssh/config` hosts.
+    pub hosts: Vec<String>,
+    scroll: f32,
 }
 
 /// what the panel asks the app to do.
@@ -54,6 +70,20 @@ pub enum Ask {
     List(String),
     /// fetch this file and open it.
     Open(String),
+    /// fetch this file and open it at this line (from 1).
+    OpenAt(String, usize),
+    /// search the folder for this text.
+    Search(String),
+    /// a shell on the host, in the folder.
+    Terminal,
+    /// read the folder again.
+    Refresh,
+    /// connect again after the link went down.
+    Reconnect,
+    /// let the link go.
+    Disconnect,
+    /// connect to `user@host:/path` from the picker.
+    Connect(String),
 }
 
 /// `dir` and `name` as one far-side path.
@@ -119,7 +149,25 @@ impl Browser {
             rows: Vec::new(),
             scroll: 0.0,
             picked: None,
+            search_open: false,
+            query: String::new(),
+            hits: Vec::new(),
+            searching: false,
+            hit_scroll: 0.0,
         }
+    }
+
+    /// the root read again: the tree starts over, folded.
+    pub fn reset_root(&mut self, entries: &[Entry]) {
+        self.rows = nodes(&self.root, entries, 0);
+        self.picked = None;
+    }
+
+    /// a search came back.
+    pub fn found(&mut self, hits: Vec<(String, usize, String)>) {
+        self.searching = false;
+        self.hits = hits;
+        self.hit_scroll = 0.0;
     }
 
     /// the link came up on `root` with its entries.
@@ -205,10 +253,139 @@ pub fn show(
     ui.round(head, 8.0, palette.raised)?;
     let d = Rect::new(head.x + 10.0, head.y + 10.0, 7.0, 7.0);
     ui.round(d, 3.5, dot)?;
-    let text = Rect::new(head.x + 24.0, head.y, head.width - 30.0, head.height);
+    let ready = matches!(browser.state, State::Ready(_));
+    // tools at the head's right: search, a shell there, read again, let go
+    let tools: &[(&str, u16)] = if ready {
+        &[("search", 1), ("shell", 2), ("refresh", 3), ("close", 4)]
+    } else {
+        &[("close", 4)]
+    };
+    let mut asked = None;
+    let mut tx = head.right() - 4.0;
+    for (icon, part) in tools.iter().rev() {
+        tx -= 22.0;
+        let b = Rect::new(tx, head.y + 2.0, 22.0, 22.0);
+        let input = ui.interact(Id::RemoteTool(*part), 0, b, Sense::Click, true);
+        let lit = *part == 1 && browser.search_open;
+        if input.hovered || lit {
+            ui.round(b, 6.0, palette.hover)?;
+        }
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        icons::draw(
+            ui,
+            icon,
+            Rect::new(b.x + 3.0, b.y + 3.0, 16.0, 16.0),
+            palette.dim,
+        )?;
+        if input.clicked {
+            asked = match part {
+                1 => {
+                    browser.search_open = !browser.search_open;
+                    if !browser.search_open {
+                        browser.hits.clear();
+                    }
+                    None
+                }
+                2 => Some(Ask::Terminal),
+                3 => Some(Ask::Refresh),
+                _ => Some(Ask::Disconnect),
+            };
+        }
+    }
+    let text = Rect::new(
+        head.x + 24.0,
+        head.y,
+        (tx - head.x - 28.0).max(0.0),
+        head.height,
+    );
     ui.text_clipped(&label, text, &small, palette.dim, Align::Start)?;
-    if !matches!(browser.state, State::Ready(_)) {
-        return Ok(None);
+    if let State::Failed(_) = &browser.state {
+        let b = Rect::new(list.x, list.y + 6.0, 140.0_f32.min(list.width), 28.0);
+        if Button::new(texts.tr("Reconnect"))
+            .primary()
+            .show(ui, Id::RemoteTool(5), b)?
+            .clicked
+        {
+            asked = Some(Ask::Reconnect);
+        }
+    }
+    if !ready {
+        return Ok(asked);
+    }
+    let list = if browser.search_open {
+        let (field, rest) = list.split_top(28.0, 6.0);
+        let typed = TextField::new(&mut browser.query)
+            .placeholder(texts.tr("Search the remote folder"))
+            .max_chars(500)
+            .show(ui, Id::RemoteSearch, field)?;
+        if typed.submitted && !browser.query.trim().is_empty() {
+            browser.searching = true;
+            asked = Some(Ask::Search(browser.query.clone()));
+        }
+        rest
+    } else {
+        list
+    };
+    if browser.search_open && (browser.searching || !browser.hits.is_empty()) {
+        if browser.searching {
+            ui.text(
+                texts.tr("Searching…"),
+                Rect::new(list.x + 8.0, list.y, list.width, ROW),
+                &small,
+                palette.dim,
+                Align::Start,
+            )?;
+            return Ok(asked);
+        }
+        let hits = &browser.hits;
+        let root = browser.root.as_str();
+        let mut none = None;
+        let response = ListView::new(&mut browser.hit_scroll, hits.len(), ROW * 1.6)
+            .selected(&mut none)
+            .show(ui, Id::RemoteHits, list, |ui, row| {
+                let Some((path, line, text)) = hits.get(row.index) else {
+                    return Ok(());
+                };
+                if row.hovered {
+                    ui.round(row.rect.inset_xy(2.0, 1.0), 6.0, palette.hover)?;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .trim_start_matches('/');
+                let top = Rect::new(
+                    row.rect.x + 8.0,
+                    row.rect.y + 1.0,
+                    row.rect.width - 12.0,
+                    ROW * 0.8,
+                );
+                ui.text_clipped(
+                    &format!("{rel}:{line}"),
+                    top,
+                    &small,
+                    palette.dim,
+                    Align::Start,
+                )?;
+                let bottom = Rect::new(
+                    row.rect.x + 8.0,
+                    row.rect.y + ROW * 0.75,
+                    row.rect.width - 12.0,
+                    ROW * 0.8,
+                );
+                ui.text_clipped(text, bottom, &font, palette.text, Align::Start)?;
+                Ok(())
+            })?;
+        if let Some(i) = response.row_clicked
+            && let Some((path, line, _)) = hits.get(i)
+        {
+            asked = Some(Ask::OpenAt(path.clone(), *line));
+        }
+        return Ok(asked);
+    }
+    if browser.search_open && browser.query.is_empty() {
+        // the tree stays below an empty search box
     }
     let mut picked = browser.picked;
     let rows = &browser.rows;
@@ -246,7 +423,146 @@ pub fn show(
     let clicked = response
         .row_clicked
         .or(response.activated.then_some(picked).flatten());
-    Ok(clicked.and_then(|i| browser.click(i)))
+    Ok(clicked.and_then(|i| browser.click(i)).or(asked))
+}
+
+/// the panel before a link: a target to type, then known hosts to pick.
+pub fn picker(
+    ui: &mut Ui<'_, Id>,
+    pick: &mut Picker,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(13.0);
+    let small = ui.theme.font(12.0);
+    let inner = rect.inset_xy(8.0, 8.0);
+    let mut ask = None;
+    let (title, rest) = inner.split_top(22.0, 4.0);
+    ui.text(
+        texts.tr("Open a remote folder"),
+        title,
+        &ui.theme.bold(13.0),
+        palette.text,
+        Align::Start,
+    )?;
+    let (note, rest) = rest.split_top(34.0, 6.0);
+    ui.text_clipped(
+        texts.tr("Over ssh: keys and ~/.ssh/config are ssh's own."),
+        note,
+        &small,
+        palette.dim,
+        Align::Start,
+    )?;
+    let (field, rest) = rest.split_top(30.0, 6.0);
+    let typed = TextField::new(&mut pick.input)
+        .placeholder(texts.tr("user@host:/path"))
+        .max_chars(500)
+        .show(ui, Id::RemoteSearch, field)?;
+    let (go, rest) = rest.split_top(28.0, 12.0);
+    let go = Rect::new(go.x, go.y, 120.0_f32.min(go.width), go.height);
+    let target = pick.input.trim().to_owned();
+    if (Button::new(texts.tr("Connect"))
+        .primary()
+        .enabled(!target.is_empty())
+        .show(ui, Id::RemoteTool(6), go)?
+        .clicked
+        || typed.submitted)
+        && !target.is_empty()
+    {
+        ask = Some(Ask::Connect(target));
+    }
+    if pick.hosts.is_empty() {
+        return Ok(ask);
+    }
+    let (head, list) = rest.split_top(20.0, 4.0);
+    ui.text(
+        texts.tr("Known hosts"),
+        head,
+        &small,
+        palette.dim,
+        Align::Start,
+    )?;
+    let hosts = &pick.hosts;
+    let mut none = None;
+    let response = ListView::new(&mut pick.scroll, hosts.len(), ROW)
+        .selected(&mut none)
+        .show(ui, Id::RemoteHits, list, |ui, row| {
+            let Some(host) = hosts.get(row.index) else {
+                return Ok(());
+            };
+            if row.hovered {
+                ui.round(row.rect.inset_xy(2.0, 1.0), 6.0, palette.hover)?;
+                ui.set_cursor(CursorIcon::Pointer);
+            }
+            let icon = Rect::new(
+                row.rect.x + 6.0,
+                row.rect.y + (ROW - 16.0) / 2.0,
+                16.0,
+                16.0,
+            );
+            icons::draw(ui, "folder", icon, palette.dim)?;
+            let at = Rect::new(row.rect.x + 28.0, row.rect.y, row.rect.width - 32.0, ROW);
+            ui.text_clipped(host, at, &font, palette.text, Align::Start)?;
+            Ok(())
+        })?;
+    if let Some(i) = response.row_clicked
+        && let Some(host) = hosts.get(i)
+    {
+        ask = Some(Ask::Connect(host.clone()));
+    }
+    Ok(ask)
+}
+
+/// where recent remote targets are kept, one a line, newest first.
+pub fn recent_path() -> Option<PathBuf> {
+    aurea::config_dir("ligase").map(|d| d.join("remote-recent.txt"))
+}
+
+/// the picker's hosts: recent targets, then `~/.ssh/config` ones. reads the
+/// disk: worker only.
+pub fn known_hosts() -> Vec<String> {
+    let mut out: Vec<String> = recent_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(10)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home {
+        let config = PathBuf::from(home).join(".ssh").join("config");
+        if let Ok(text) = std::fs::read_to_string(config) {
+            for host in super::ssh_hosts(&text) {
+                if !out
+                    .iter()
+                    .any(|h| h == &host || h.starts_with(&format!("{host}:")))
+                {
+                    out.push(host);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// puts `target` first in the recent list, ten kept. worker only.
+pub fn remember(target: &str) {
+    let Some(path) = recent_path() else { return };
+    let mut list: Vec<String> = std::fs::read_to_string(&path)
+        .map(|t| t.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    list.retain(|l| l.trim() != target && !l.trim().is_empty());
+    list.insert(0, target.to_owned());
+    list.truncate(10);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, list.join("\n") + "\n");
 }
 
 #[cfg(test)]

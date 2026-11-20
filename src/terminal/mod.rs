@@ -72,6 +72,8 @@ pub struct Shell {
     early: String,
     /// the host this shell runs on over ssh; none for this machine.
     pub remote: Option<String>,
+    /// the folder on that host it starts in; its home when none.
+    pub remote_dir: Option<String>,
 }
 
 /// most shells in the panel.
@@ -144,6 +146,13 @@ impl Shells {
     pub fn add_remote(&mut self, host: &str) -> Option<u32> {
         let id = self.add()?;
         self.current_mut().remote = Some(host.to_owned());
+        Some(id)
+    }
+
+    /// a new shell on `host` over ssh, starting in `dir` there.
+    pub fn add_remote_at(&mut self, host: &str, dir: &str) -> Option<u32> {
+        let id = self.add_remote(host)?;
+        self.current_mut().remote_dir = Some(dir.to_owned());
         Some(id)
     }
 
@@ -264,6 +273,7 @@ pub fn host_ok(host: &str) -> bool {
 pub fn spawn(
     root: &Path,
     remote: Option<&str>,
+    remote_dir: Option<&str>,
     wake: impl Fn() + Send + 'static,
 ) -> Result<Terminal, String> {
     let mut config = SpawnConfig {
@@ -277,6 +287,14 @@ pub fn spawn(
         // `--` ends ssh's options; the host can only be a host
         config.program = Some("ssh".into());
         config.args = vec!["-t".into(), "--".into(), host.into()];
+        // a folder there: go in, then the login shell; quoted as one word
+        if let Some(dir) = remote_dir
+            && let Some(q) = crate::remote::quote(dir)
+        {
+            config
+                .args
+                .push(format!("cd {q} && exec \"${{SHELL:-sh}}\" -l").into());
+        }
     }
     Terminal::spawn_notify(&config, wake).map_err(|e| e.to_string())
 }

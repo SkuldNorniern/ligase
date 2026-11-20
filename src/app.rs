@@ -77,6 +77,10 @@ pub enum Id {
     AgentField(u16),
     /// the language server list in settings, by row and part.
     ServerField(u16),
+    /// the remote panel's tool buttons.
+    RemoteTool(u16),
+    RemoteSearch,
+    RemoteHits,
     /// the branch pill and the sync buttons in source control.
     ScmBranch,
     ScmPull,
@@ -415,8 +419,6 @@ enum Target {
 enum PromptFor {
     /// a host for a shell over ssh.
     RemoteShell,
-    /// `user@host:/path` for a remote folder.
-    RemoteFolder,
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
@@ -479,7 +481,13 @@ enum Done {
     /// a remote folder's entries.
     RemoteListed(String, Result<Vec<crate::remote::Entry>, String>),
     /// a remote file's local copy, ready to open.
-    RemoteFetched(String, Result<PathBuf, String>),
+    RemoteFetched(String, Option<usize>, Result<PathBuf, String>),
+    /// the remote root read again.
+    RemoteRoot(Result<Vec<crate::remote::Entry>, String>),
+    /// a search over the remote folder came back.
+    RemoteFound(Result<Vec<(String, usize, String)>, String>),
+    /// recent targets and ~/.ssh/config hosts, for the picker.
+    RemoteHosts(Vec<String>),
     /// a commit read in full for the graph's card.
     CommitShown(Result<crate::git::graph::Detail, String>),
     /// who last changed a line, or why not.
@@ -580,6 +588,8 @@ pub struct App {
     shells: terminal::Shells,
     /// the agent conversation, made the first time the panel is used.
     chat: Option<agent::Chat>,
+    /// the remote panel before a link: a target and known hosts.
+    remote_pick: crate::remote::browse::Picker,
     /// the editor and documents' stamp the symbol list was filled at.
     symbols_seen: Option<(Option<ViewId>, u64)>,
     /// agent writes into open files, answered when their save is done.
@@ -746,6 +756,7 @@ impl App {
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
             chat: None,
+            remote_pick: crate::remote::browse::Picker::default(),
             symbols_seen: None,
             agent_saves: Vec::new(),
             finder: Finder::default(),
@@ -1173,6 +1184,7 @@ impl App {
     fn start_shell(&mut self) {
         let id = self.shells.current_id();
         let remote = self.shells.current().remote.clone();
+        let remote_dir = self.shells.current().remote_dir.clone();
         self.shells.current_mut().state = terminal::State::Starting;
         let root = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
@@ -1182,7 +1194,10 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), wake))
+            Done::Shell(
+                id,
+                terminal::spawn(&root, remote.as_deref(), remote_dir.as_deref(), wake),
+            )
         };
         if !self.procs.run(job) {
             self.shells
@@ -2004,10 +2019,12 @@ impl App {
             }
             Command::ToggleTerminal => self.bench.toggle(Panel::Terminal),
             Command::OpenRemoteFolder => {
-                self.prompt_for = Some(PromptFor::RemoteFolder);
-                let hint = self.texts.tr("user@host:/path").to_owned();
-                self.palette.prompt(hint, String::new());
-                self.ui.focus(Id::PaletteField, 0);
+                // the panel: the link there is, or the picker to make one
+                self.bench.show(Panel::Remote);
+                if self.remote.is_none() {
+                    self.load_hosts();
+                    self.ui.focus(Id::RemoteSearch, 0);
+                }
                 return;
             }
             Command::NewRemoteShell => {
@@ -2446,10 +2463,6 @@ impl App {
         let Some(prompt) = self.prompt_for.take() else {
             return;
         };
-        if let PromptFor::RemoteFolder = prompt {
-            self.open_remote(answer);
-            return;
-        }
         if let PromptFor::RemoteShell = prompt {
             let host = answer.trim();
             if !terminal::host_ok(host) {
@@ -2472,7 +2485,7 @@ impl App {
         };
         let name = name.to_owned();
         let job: Box<dyn FnOnce() -> Done + Send> = match prompt {
-            PromptFor::RemoteShell | PromptFor::RemoteFolder => return,
+            PromptFor::RemoteShell => return,
             PromptFor::NewFile(dir) => Box::new(move || {
                 let path = dir.join(&name);
                 Done::FileOp(explorer::create_file(&path).map(|()| FileDone {
@@ -4284,15 +4297,39 @@ impl App {
                     (Err(why), _) => self.say(why),
                     _ => {}
                 },
-                Done::RemoteFetched(path, result) => match result {
+                Done::RemoteFetched(path, line, result) => match result {
                     Ok(local) => {
                         self.remote_files.insert(local.clone(), path);
-                        let view = self.open_file(&local);
-                        self.ui.focus(Id::Editor(view), 1);
-                        self.last_editor = Some(view);
+                        match line {
+                            Some(line) => self.open_at_start(local, Some(line.saturating_sub(1))),
+                            None => {
+                                let view = self.open_file(&local);
+                                self.ui.focus(Id::Editor(view), 1);
+                                self.last_editor = Some(view);
+                            }
+                        }
                     }
                     Err(why) => self.say(why),
                 },
+                Done::RemoteRoot(result) => match (result, &mut self.remote) {
+                    (Ok(entries), Some(browser)) => browser.reset_root(&entries),
+                    (Err(why), _) => self.say(why),
+                    _ => {}
+                },
+                Done::RemoteFound(result) => {
+                    let note = match &result {
+                        Ok(hits) if hits.is_empty() => Some(self.texts.tr("No matches").to_owned()),
+                        Ok(_) => None,
+                        Err(why) => Some(why.clone()),
+                    };
+                    if let Some(browser) = &mut self.remote {
+                        browser.found(result.unwrap_or_default());
+                    }
+                    if let Some(note) = note {
+                        self.say(note);
+                    }
+                }
+                Done::RemoteHosts(hosts) => self.remote_pick.hosts = hosts,
                 Done::CommitShown(result) => match result {
                     Ok(detail) => self.scm.detail = Some(detail),
                     Err(why) => self.say(why),
@@ -4741,6 +4778,7 @@ impl App {
             let peek_now = &self.peek;
             let blame_now = &self.blame;
             let remote = &mut self.remote;
+            let remote_pick = &mut self.remote_pick;
             let previews = &mut self.previews;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
@@ -4863,9 +4901,10 @@ impl App {
                     Ok(())
                 }
                 Some(Panel::Remote) => {
-                    if let Some(browser) = remote.as_mut() {
-                        remote_asked = crate::remote::browse::show(ui, browser, rect, texts)?;
-                    }
+                    remote_asked = match remote.as_mut() {
+                        Some(browser) => crate::remote::browse::show(ui, browser, rect, texts)?,
+                        None => crate::remote::browse::picker(ui, remote_pick, rect, texts)?,
+                    };
                     Ok(())
                 }
                 Some(Panel::SideView(n) | Panel::BottomView(n)) => {
@@ -5488,6 +5527,9 @@ impl App {
                 let entries = session.list(&root)?;
                 Ok((session, root, entries))
             })();
+            if let Ok((_, root, _)) = &result {
+                crate::remote::browse::remember(&format!("{host}:{root}"));
+            }
             Done::RemoteReady(result)
         });
     }
@@ -5495,6 +5537,46 @@ impl App {
     /// what the remote panel asked for, on the worker over the link.
     fn remote_ask(&mut self, ask: crate::remote::browse::Ask) {
         use crate::remote::browse::{Ask, State};
+        match &ask {
+            Ask::Connect(target) => {
+                let target = target.clone();
+                self.open_remote(&target);
+                return;
+            }
+            Ask::Disconnect => {
+                // the link's ssh is let go off the ui thread
+                if let Some(old) = self.remote.take() {
+                    self.jobs.run(move || {
+                        drop(old);
+                        Done::Note(None)
+                    });
+                }
+                self.load_hosts();
+                return;
+            }
+            Ask::Reconnect => {
+                if let Some(b) = &self.remote {
+                    let target = if b.root.is_empty() {
+                        b.host.clone()
+                    } else {
+                        format!("{}:{}", b.host, b.root)
+                    };
+                    self.open_remote(&target);
+                }
+                return;
+            }
+            Ask::Terminal => {
+                if let Some(b) = &self.remote {
+                    let (host, root) = (b.host.clone(), b.root.clone());
+                    if self.shells.add_remote_at(&host, &root).is_none() {
+                        self.say(self.texts.tr("Shell limit reached").to_owned());
+                    }
+                    self.show_terminal();
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some(browser) = &self.remote else {
             return;
         };
@@ -5503,7 +5585,27 @@ impl App {
         };
         let link = std::sync::Arc::clone(link);
         let host = browser.host.clone();
+        let root = browser.root.clone();
         match ask {
+            Ask::Connect(_) | Ask::Disconnect | Ask::Reconnect | Ask::Terminal => {}
+            Ask::Refresh => {
+                self.procs.run(move || {
+                    let result = link
+                        .lock()
+                        .map_err(|_| "the link broke".to_owned())
+                        .and_then(|mut s| s.list(&root));
+                    Done::RemoteRoot(result)
+                });
+            }
+            Ask::Search(query) => {
+                self.procs.run(move || {
+                    let result = link
+                        .lock()
+                        .map_err(|_| "the link broke".to_owned())
+                        .and_then(|mut s| s.grep(&root, &query));
+                    Done::RemoteFound(result)
+                });
+            }
             Ask::List(dir) => {
                 self.procs.run(move || {
                     let result = link
@@ -5513,7 +5615,20 @@ impl App {
                     Done::RemoteListed(dir, result)
                 });
             }
-            Ask::Open(path) => {
+            Ask::Open(_) | Ask::OpenAt(..) => {
+                let (path, line) = match ask {
+                    Ask::OpenAt(path, line) => (path, Some(line)),
+                    Ask::Open(path) => (path, None),
+                    _ => return,
+                };
+                // open already: its local copy may hold unsaved edits; never
+                // fetch over it
+                if let Some(local) = crate::remote::browse::cache_path(&host, &path)
+                    && self.view_of_path(&local).is_some()
+                {
+                    self.open_at_start(local, line.map(|l| l.saturating_sub(1)));
+                    return;
+                }
                 self.procs.run(move || {
                     let result = (|| {
                         let local = crate::remote::browse::cache_path(&host, &path)
@@ -5528,10 +5643,16 @@ impl App {
                         std::fs::write(&local, bytes).map_err(|e| e.to_string())?;
                         Ok(local)
                     })();
-                    Done::RemoteFetched(path, result)
+                    Done::RemoteFetched(path, line, result)
                 });
             }
         }
+    }
+
+    /// the picker's hosts, read on the worker.
+    fn load_hosts(&mut self) {
+        self.jobs
+            .run(|| Done::RemoteHosts(crate::remote::browse::known_hosts()));
     }
 
     /// a saved local copy of a remote file goes back over the link.
