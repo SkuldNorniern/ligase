@@ -158,8 +158,10 @@ pub fn show(
         } else {
             explorer.typed.0.clone()
         };
+        // the same letter again steps on; a fresh word starts at the row
+        // it is on, so "ca" on Cargo.toml stays there
         let from = match explorer.selected {
-            Some(i) if one || fresh => i + 1,
+            Some(i) if one => i + 1,
             Some(i) => i,
             None => 0,
         };
