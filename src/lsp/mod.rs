@@ -293,18 +293,26 @@ impl Lsp {
             .collect();
         self.user = rules
             .iter()
-            .filter(|r| !r.disabled && !r.command.is_empty())
-            .map(|r| ServerSpec {
-                language: r.language.clone(),
-                command: r.command.clone(),
-                args: r.args.clone(),
-                language_id: r.language.clone(),
-                package: None,
-                roots: if r.roots.is_empty() {
-                    built_in(&r.language).map(|b| b.roots).unwrap_or_default()
+            .filter(|r| !r.disabled)
+            .filter_map(|r| {
+                let base = self.default_for(&r.language);
+                // only roots: the default server with these roots
+                let mut spec = if r.command.is_empty() {
+                    base.clone()?
                 } else {
-                    r.roots.clone()
-                },
+                    ServerSpec {
+                        language: r.language.clone(),
+                        command: r.command.clone(),
+                        args: r.args.clone(),
+                        language_id: r.language.clone(),
+                        package: None,
+                        roots: base.map(|b| b.roots).unwrap_or_default(),
+                    }
+                };
+                if !r.roots.is_empty() {
+                    spec.roots = r.roots.clone();
+                }
+                Some(spec)
             })
             .collect();
         self.off = rules

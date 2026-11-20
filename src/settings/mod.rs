@@ -320,7 +320,11 @@ fn server_rules(table: &toml::Table, problems: &mut Vec<String>) -> Vec<ServerRu
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false),
         };
-        if rule.command.is_empty() && !rule.disabled && rule.files.is_empty() {
+        if rule.command.is_empty()
+            && !rule.disabled
+            && rule.files.is_empty()
+            && rule.roots.is_empty()
+        {
             problems.push(format!("servers.{language}: no command"));
             continue;
         }
@@ -332,13 +336,16 @@ fn server_rules(table: &toml::Table, problems: &mut Vec<String>) -> Vec<ServerRu
 /// `text` with `language`'s server table put in, or taken out when `rule`
 /// is none. the rest of the file stays as it was written.
 pub fn with_server(text: &str, language: &str, rule: Option<&ServerRule>) -> String {
-    let header = format!("[servers.{language}]");
+    // quoted: `c++`, `c#` or a `.` are no bare toml keys, and one written
+    // bare would stop the whole file from reading
+    let header = format!("[servers.{}]", quote(language));
+    let bare = format!("[servers.{language}]");
     let mut out = String::new();
     let mut skipping = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            skipping = trimmed == header;
+            skipping = trimmed == header || trimmed == bare;
         }
         if !skipping {
             out.push_str(line);
@@ -999,6 +1006,33 @@ disabled = true
                 .iter()
                 .all(|r| r.language != "nim")
         );
+
+        // names toml can't take bare still write a file that reads
+        let cpp = ServerRule {
+            language: "c++".into(),
+            command: "clangd".into(),
+            ..ServerRule::default()
+        };
+        let text = with_server(&gone, "c++", Some(&cpp));
+        let (s5, problems) = parse(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(s5.unwrap().servers.iter().any(|r| r.language == "c++"));
+        assert!(
+            parse(&with_server(&text, "c++", None))
+                .0
+                .unwrap()
+                .servers
+                .iter()
+                .all(|r| r.language != "c++")
+        );
+        // only roots: kept
+        let roots = ServerRule {
+            language: "rust".into(),
+            roots: vec!["Cargo.toml".into()],
+            ..ServerRule::default()
+        };
+        let s6 = parse(&with_server("", "rust", Some(&roots))).0.unwrap();
+        assert_eq!(s6.servers[0].roots, ["Cargo.toml"]);
         // bad names and empty tables are named, not taken
         let (s4, problems) = parse(
             "[servers.\"a b\"]
