@@ -60,6 +60,9 @@ pub struct Finder {
     /// what replace all puts in place of each hit.
     pub replace: String,
     pub hits: Vec<Hit>,
+    /// the query the hits were found with; none for hits from elsewhere
+    /// (references), which replace must never take as text to change.
+    pub searched: Option<String>,
     /// for each hit, the walk order of its file, so readers finishing out
     /// of turn still list in order.
     order: Vec<usize>,
@@ -75,6 +78,17 @@ impl Finder {
         self.running.is_some()
     }
 
+    /// the text replace all may change: the query the finished hits came
+    /// from, while the box still says it and the cap didn't cut the search
+    /// short. none otherwise, so a changed box or a reference list never
+    /// gets replaced.
+    pub fn replaceable(&self) -> Option<&str> {
+        let searched = self.searched.as_deref()?;
+        let whole = matches!(self.done, Some((_, false)));
+        (whole && !self.hits.is_empty() && !self.searching() && searched == self.query)
+            .then_some(searched)
+    }
+
     /// shows `hits` found some other way (a language server's references)
     /// as the panel's results, under `title`.
     pub fn show_results(&mut self, title: String, hits: Vec<Hit>) {
@@ -86,6 +100,7 @@ impl Finder {
             paths.len()
         };
         self.query = title;
+        self.searched = None;
         self.order = vec![0; hits.len()];
         self.hits = hits;
         self.done = Some((files, false));
@@ -99,6 +114,7 @@ impl Finder {
         self.hits.clear();
         self.order.clear();
         self.done = None;
+        self.searched = (!self.query.is_empty()).then(|| self.query.clone());
         self.selected = None;
         self.scroll = 0.0;
         if self.query.is_empty() {
@@ -558,6 +574,32 @@ mod tests {
         });
         assert_eq!(inner, [".gitignore", "c.rs", "keep.log"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_takes_only_the_searched_text() {
+        let hit = Hit {
+            path: PathBuf::from("a.rs"),
+            line: 0,
+            column: 0,
+            len: 3,
+            preview: String::new(),
+        };
+        let mut f = Finder::default();
+        // references: their title is no text to replace
+        f.show_results("references".to_owned(), vec![hit.clone()]);
+        assert_eq!(f.replaceable(), None);
+        // a finished search, then the box changed
+        f.query = "old".to_owned();
+        f.searched = Some("old".to_owned());
+        f.hits = vec![hit];
+        f.done = Some((1, false));
+        assert_eq!(f.replaceable(), Some("old"));
+        f.query = "older".to_owned();
+        assert_eq!(f.replaceable(), None, "the box moved on");
+        f.query = "old".to_owned();
+        f.done = Some((1, true));
+        assert_eq!(f.replaceable(), None, "the cap cut it short");
     }
 
     #[test]

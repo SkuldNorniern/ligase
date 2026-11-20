@@ -3438,7 +3438,15 @@ impl App {
     /// saving, never a silent write. the matches are found again in the text
     /// as it is, so a file changed since the search is still right.
     fn replace_all(&mut self) {
-        let query = self.finder.query.clone();
+        let Some(query) = self.finder.replaceable().map(str::to_owned) else {
+            let why = if matches!(self.finder.done, Some((_, true))) {
+                "Too many matches to replace all; narrow the search first"
+            } else {
+                "Search again before replacing"
+            };
+            self.say(self.texts.tr(why).to_owned());
+            return;
+        };
         let with = self.finder.replace.clone();
         let mut paths: Vec<PathBuf> = self.finder.hits.iter().map(|h| h.path.clone()).collect();
         paths.dedup();
@@ -6471,6 +6479,8 @@ mod tests {
             preview: String::new(),
         };
         app.finder.hits = vec![hit(&a, 0), hit(&a, 1), hit(&b, 0)];
+        app.finder.searched = Some("old".to_owned());
+        app.finder.done = Some((2, false));
         app.replace_all();
         // the files load on the worker; take what it sends until both are in
         let start = std::time::Instant::now();

@@ -96,7 +96,7 @@ pub fn show(
         .placeholder(texts.tr("replace with"))
         .max_chars(500)
         .show(ui, Id::ReplaceInFiles, replace_field)?;
-    let can_replace = !finder.hits.is_empty() && !finder.searching();
+    let can_replace = finder.replaceable().is_some();
     if Button::new(texts.tr("Replace All"))
         .enabled(can_replace)
         .show(ui, Id::ReplaceAllButton, button)?
