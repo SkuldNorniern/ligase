@@ -36,12 +36,15 @@ impl Rules {
     /// or holds no rule.
     pub fn read(base: &Path, file: &Path) -> Option<Arc<Self>> {
         use std::io::Read;
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         std::fs::File::open(file)
             .ok()?
             .take(MAX_FILE)
-            .read_to_string(&mut text)
+            .read_to_end(&mut bytes)
             .ok()?;
+        // a stray byte in a comment, or a cut inside a char, loses that
+        // line at most, not every rule in the file
+        let text = String::from_utf8_lossy(&bytes);
         let rules = Self::parse(base, &text);
         (!rules.rules.is_empty()).then(|| Arc::new(rules))
     }

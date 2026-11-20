@@ -306,8 +306,11 @@ fn outer_rules(root: &Path) -> ignore::Stack {
         stack = stack.with(r);
     }
     // the root's own .gitignore is read by the walk
-    let mut above: Vec<&Path> = root.ancestors().skip(1).take_while(|d| *d != top).collect();
+    // folders between the root and the repository top, the top too; none
+    // when the root is the top, and never past it
+    let mut above: Vec<&Path> = Vec::new();
     if top != root {
+        above = root.ancestors().skip(1).take_while(|d| *d != top).collect();
         above.push(top);
     }
     for dir in above.into_iter().rev() {
@@ -603,6 +606,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rules_above_the_repository_are_not_read() {
+        let dir = std::env::temp_dir().join(format!("ligase-above-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        // a folder over the repository ignores everything; git never reads it
+        std::fs::write(
+            dir.join(".gitignore"),
+            "*
+",
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.rs"), "x").unwrap();
+        let mut seen = Vec::new();
+        files(&repo, &AtomicBool::new(false), &mut |p| {
+            seen.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            true
+        });
+        assert_eq!(seen, ["a.rs"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
