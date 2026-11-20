@@ -961,7 +961,9 @@ impl App {
     /// puts `text` in the status bar for a while; the same text again starts
     /// the while over.
     fn say(&mut self, text: impl Into<String>) {
-        self.status = text.into();
+        // one line: breaks and tabs from servers and tools become spaces
+        let text: String = text.into();
+        self.status = text.split_whitespace().collect::<Vec<_>>().join(" ");
         self.status_at = Instant::now();
         if let Some(canvas) = self.canvas {
             request_canvas_redraw_at(canvas, self.status_at + STATUS_FOR);
@@ -1166,6 +1168,7 @@ impl App {
                 command @ (Command::ToggleTerminal
                 | Command::NewTerminal
                 | Command::NewAgent
+                | Command::ToggleAgent
                 | Command::ToggleSidebar
                 | Command::ToggleExplorer
                 | Command::ToggleSearch
