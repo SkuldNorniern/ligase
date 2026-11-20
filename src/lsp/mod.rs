@@ -475,6 +475,11 @@ impl Lsp {
         let Some(Slot::Running(server, encoding)) = self.servers.get_mut(synced.language) else {
             return false;
         };
+        // before initialize answers: no position encoding yet, and the
+        // file may not be open there; ask again once it is up
+        if !server.ready {
+            return false;
+        }
         let text = doc.buffer.text();
         let range = v.sel.range();
         let Some(at) = range_json(text, range.clone(), *encoding) else {
@@ -525,6 +530,11 @@ impl Lsp {
         let Some(Slot::Running(server, _)) = self.servers.get_mut(language) else {
             return false;
         };
+        // before initialize answers: no position encoding yet, and the
+        // file may not be open there; ask again once it is up
+        if !server.ready {
+            return false;
+        }
         let id = server.request("codeAction/resolve", action);
         self.pending
             .insert((language, id), Pending::Resolved(doc, revision, seen));
@@ -676,6 +686,11 @@ impl Lsp {
         let Some(Slot::Running(server, encoding)) = self.servers.get_mut(synced.language) else {
             return None;
         };
+        // before initialize answers: no position encoding yet, and the
+        // file may not be open there; ask again once it is up
+        if !server.ready {
+            return None;
+        }
         let at = doc.buffer.text().point(at, *encoding).ok()?;
         let mut params = json!({
             "textDocument": { "uri": synced.uri },
@@ -713,7 +728,7 @@ impl Lsp {
     fn handle(&mut self, language: &'static str, msg: &Value, events: &mut Vec<Event>) {
         if std::env::var_os("LIGASE_LSP_TRACE").is_some() {
             let text = msg.to_string();
-            eprintln!("lsp <- {}", &text[..text.len().min(300)]);
+            eprintln!("lsp <- {}", text.chars().take(300).collect::<String>());
         }
         let Some(Slot::Running(server, encoding)) = self.servers.get_mut(language) else {
             return;
