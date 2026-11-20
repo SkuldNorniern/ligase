@@ -402,13 +402,16 @@ const LETTERS: [KeyCode; 26] = [
     KeyCode::Z,
 ];
 
-/// a key as xterm sends it. alt puts ESC in front, ctrl+letter is its
-/// control byte, arrows carry shift/alt/ctrl as `ESC [ 1 ; n X`.
+/// a key as xterm sends it, the same rules as glacia. modified keys carry
+/// `1 + shift + 2 alt + 4 ctrl`; alt alone puts ESC in front; ctrl+letter
+/// is its control byte. plain arrows, home and end go as `ESC O x` while
+/// the app asked for its own cursor keys.
 fn key_bytes(key: KeyCode, m: Modifiers, app_keys: bool) -> Option<String> {
     if m.meta {
         return None;
     }
-    let arrow = match key {
+    let code = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
+    let cursor = match key {
         KeyCode::Up => Some('A'),
         KeyCode::Down => Some('B'),
         KeyCode::Right => Some('C'),
@@ -417,47 +420,80 @@ fn key_bytes(key: KeyCode, m: Modifiers, app_keys: bool) -> Option<String> {
         KeyCode::End => Some('F'),
         _ => None,
     };
-    if let Some(end) = arrow {
-        let code = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
+    if let Some(end) = cursor {
         return Some(match (code, app_keys) {
             (1, true) => format!("{ESC}O{end}"),
             (1, false) => format!("{ESC}[{end}"),
             _ => format!("{ESC}[1;{code}{end}"),
         });
     }
-    if key == KeyCode::Tab && m.shift && !m.ctrl && !m.alt {
-        return Some(format!("{ESC}[Z"));
-    }
-    let plain = match key {
-        KeyCode::Enter => Some("\r".to_owned()),
-        KeyCode::Backspace => Some("\x7f".to_owned()),
-        KeyCode::Tab => Some("\t".to_owned()),
-        KeyCode::Escape => Some(ESC.to_owned()),
-        KeyCode::Delete => Some(format!("{ESC}[3~")),
-        KeyCode::PageUp => Some(format!("{ESC}[5~")),
-        KeyCode::PageDown => Some(format!("{ESC}[6~")),
+    let tilde = match key {
+        KeyCode::Insert => Some(2),
+        KeyCode::Delete => Some(3),
+        KeyCode::PageUp => Some(5),
+        KeyCode::PageDown => Some(6),
+        KeyCode::F5 => Some(15),
+        KeyCode::F6 => Some(17),
+        KeyCode::F7 => Some(18),
+        KeyCode::F8 => Some(19),
+        KeyCode::F9 => Some(20),
+        KeyCode::F10 => Some(21),
+        KeyCode::F11 => Some(23),
+        KeyCode::F12 => Some(24),
         _ => None,
     };
-    if let Some(plain) = plain {
-        if m.ctrl {
-            return None;
-        }
-        return Some(if m.alt {
-            format!("{ESC}{plain}")
+    if let Some(n) = tilde {
+        return Some(if code > 1 {
+            format!("{ESC}[{n};{code}~")
         } else {
-            plain
+            format!("{ESC}[{n}~")
         });
     }
-    let letter = u8::try_from(LETTERS.iter().position(|k| *k == key)?).ok()?;
-    match (m.ctrl, m.alt) {
-        (true, false) => Some(char::from(letter + 1).to_string()),
-        (true, true) => Some(format!("{ESC}{}", char::from(letter + 1))),
-        (false, true) => {
-            let c = if m.shift { b'A' } else { b'a' } + letter;
-            Some(format!("{ESC}{}", char::from(c)))
-        }
-        (false, false) => None,
+    let f1_to_f4 = match key {
+        KeyCode::F1 => Some('P'),
+        KeyCode::F2 => Some('Q'),
+        KeyCode::F3 => Some('R'),
+        KeyCode::F4 => Some('S'),
+        _ => None,
+    };
+    if let Some(end) = f1_to_f4 {
+        return Some(if code > 1 {
+            format!("{ESC}[1;{code}{end}")
+        } else {
+            format!("{ESC}O{end}")
+        });
     }
+    let base = match key {
+        KeyCode::Enter => "\r".to_owned(),
+        // ctrl+backspace is ^H, the word rub-out powershell and others use
+        KeyCode::Backspace if m.ctrl => "\x08".to_owned(),
+        KeyCode::Backspace => "\x7f".to_owned(),
+        KeyCode::Tab if m.shift && m.ctrl => return Some(format!("{ESC}[1;{code}Z")),
+        KeyCode::Tab if m.shift => format!("{ESC}[Z"),
+        KeyCode::Tab => "\t".to_owned(),
+        KeyCode::Escape => ESC.to_owned(),
+        KeyCode::Space if m.ctrl => "\0".to_owned(),
+        // ctrl with punctuation, as xterm sends it on a us layout
+        KeyCode::LeftBracket if m.ctrl => ESC.to_owned(),
+        KeyCode::Backslash if m.ctrl => "\x1c".to_owned(),
+        KeyCode::RightBracket if m.ctrl => "\x1d".to_owned(),
+        KeyCode::Key6 if m.ctrl => "\x1e".to_owned(),
+        KeyCode::Slash if m.ctrl => "\x1f".to_owned(),
+        KeyCode::Minus if m.ctrl && m.shift => "\x1f".to_owned(),
+        KeyCode::Key2 if m.ctrl => "\0".to_owned(),
+        _ => {
+            let letter = u8::try_from(LETTERS.iter().position(|k| *k == key)?).ok()?;
+            if m.ctrl {
+                char::from(letter + 1).to_string()
+            } else if m.alt {
+                char::from(if m.shift { b'A' } else { b'a' } + letter).to_string()
+            } else {
+                // typed text comes as text input
+                return None;
+            }
+        }
+    };
+    Some(if m.alt { format!("{ESC}{base}") } else { base })
 }
 
 fn resolve(color: TermColor, default: Color) -> Color {
