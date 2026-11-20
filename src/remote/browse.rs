@@ -112,7 +112,10 @@ pub fn split_target(text: &str) -> (String, Option<String>) {
 }
 
 /// where the local copy of `path` on `host` lives: under the config
-/// folder, each part made safe for this file system. none without one.
+/// folder, in a folder named by a hash of the whole path, under the file's
+/// own name made safe. two remote paths never share a copy, even where
+/// `a b` and `a_b`, or `A` and `a`, would be one name here. none without
+/// a config folder.
 pub fn cache_path(host: &str, path: &str) -> Option<PathBuf> {
     let safe = |part: &str| -> String {
         let s: String = part
@@ -132,15 +135,18 @@ pub fn cache_path(host: &str, path: &str) -> Option<PathBuf> {
             s
         }
     };
-    let mut out = aurea::config_dir("ligase")?.join("remote").join(safe(host));
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    for part in parts {
-        out.push(safe(part));
-    }
-    Some(out)
+    let name = path.split('/').rfind(|p| !p.is_empty())?;
+    // fnv-1a: the same path finds the same copy across runs
+    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    Some(
+        aurea::config_dir("ligase")?
+            .join("remote")
+            .join(safe(host))
+            .join(format!("{hash:016x}"))
+            .join(safe(name)),
+    )
 }
 
 impl Browser {
@@ -617,6 +623,13 @@ mod tests {
         );
         assert!(s.ends_with("pass_wd"), "{s}");
         assert!(cache_path("box", "/").is_none());
+        // names this file system would fold together stay apart
+        assert_ne!(cache_path("box", "/srv/a b"), cache_path("box", "/srv/a_b"));
+        assert_ne!(
+            cache_path("box", "/srv/A.txt"),
+            cache_path("box", "/srv/a.txt")
+        );
+        assert_eq!(cache_path("box", "/srv/a"), cache_path("box", "/srv/a"));
     }
 
     #[test]
