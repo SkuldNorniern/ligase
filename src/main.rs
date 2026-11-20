@@ -34,10 +34,9 @@ use std::rc::{Rc, Weak};
 
 use aurea::clipboard::ClipboardImage;
 use aurea::dialog::{FileDialog, MessageButtons, MessageChoice, MessageDialog, MessageKind};
-use aurea::elements::{Orientation, Stack};
 use aurea::menu::{MenuItem, SubMenu};
 use aurea::render::{Canvas, CanvasId, Image, ImageSet, RendererBackend, request_canvas_redraw};
-use aurea::{AureaResult, Container, Window, WindowEvent};
+use aurea::{AureaResult, Window, WindowEvent};
 
 use crate::app::{App, Command, Dialog, DialogStart};
 use crate::editor::{CaretOp, FoldOp, LineOp};
@@ -163,9 +162,9 @@ fn run() -> AureaResult<()> {
         result
     })?;
 
-    let mut layout = Stack::new(Orientation::Vertical)?;
-    layout.add_weighted(canvas, 1.0)?;
-    window.set_content(layout)?;
+    // the canvas is the whole window: a stack around it keeps its first
+    // height and insets on macOS
+    window.set_content(canvas)?;
     // closing waits for the layout to be written
     window.set_close_guard(true);
     let window = Rc::new(window);
