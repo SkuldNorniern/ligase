@@ -291,15 +291,17 @@ fn show_inner(
     } else {
         0.0
     };
-    let room = head.right() - PAD - 56.0 - gear_w - 30.0 - 8.0 - (icon.right() + 8.0) - 14.0;
+    // narrow panels get a "+" in place of "New"
+    let new_w = if head.width < 320.0 { 30.0 } else { 56.0 };
+    let room = head.right() - PAD - new_w - gear_w - 30.0 - 8.0 - (icon.right() + 8.0) - 14.0;
     let full = chat.title.as_str();
     let short = full.split(' ').next().unwrap_or(full);
     let shown = [full, short]
         .into_iter()
         .find(|n| ui.text_width(n, &bold) <= room)
-        .unwrap_or("");
+        .unwrap_or(short);
     let name = Rect::new(icon.right() + 8.0, head.y, room.max(0.0), HEAD);
-    let name_w = ui.text_width(shown, &bold);
+    let name_w = ui.text_width(shown, &bold).min(name.width);
     // the name is the agent switch: a click lists the others
     let hit = Rect::new(icon.x - 4.0, head.y + 5.0, name_w + 40.0, HEAD - 10.0);
     let input = ui.interact(Id::AgentButton(20), 0, hit, Sense::Click, true);
@@ -307,7 +309,7 @@ fn show_inner(
         ui.round(hit, 6.0, palette.hover)?;
         ui.set_cursor(CursorIcon::Pointer);
     }
-    ui.text(shown, name, &bold, palette.text, Align::Start)?;
+    ui.text_clipped(shown, name, &bold, palette.text, Align::Start)?;
     let arrow = Rect::new(name.x + name_w + 4.0, head.y, 12.0, HEAD);
     ui.text("▾", arrow, &small, palette.dim, Align::Start)?;
     if input.clicked {
@@ -326,7 +328,7 @@ fn show_inner(
         State::Working => (texts.tr("working…"), palette.accent),
         State::Failed(_) => (texts.tr("stopped"), palette.danger),
     };
-    let new = Rect::new(head.right() - PAD - 56.0, head.y + 6.0, 56.0, HEAD - 12.0);
+    let new = Rect::new(head.right() - PAD - new_w, head.y + 6.0, new_w, HEAD - 12.0);
     // the saved conversations
     let clock = Rect::new(new.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
     let input = ui.interact(Id::AgentButton(21), 0, clock, Sense::Click, true);
@@ -384,7 +386,7 @@ fn show_inner(
             ui.text(state, state_at, &small, palette.dim, Align::Start)?;
         }
     }
-    if Button::new(texts.tr("New"))
+    if Button::new(if new_w < 56.0 { "+" } else { texts.tr("New") })
         .quiet()
         .show(ui, Id::AgentButton(0), new)?
         .clicked
