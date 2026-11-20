@@ -182,13 +182,17 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
     )?;
     let mut ask = None;
     let mut x = rect.x + 8.0;
+    // tabs share the strip when they don't fit, room kept for `+`
+    let room = (rect.width - 8.0 - 32.0).max(0.0);
+    let count = shells.list.len().max(1) as f32;
+    let fair = (room / count - 4.0).max(44.0);
     for (i, (_, shell)) in shells.list.iter().enumerate() {
         let n = u16::try_from(i).unwrap_or(u16::MAX);
         let label = match &shell.remote {
             Some(host) => format!("⇄ {}", host.chars().take(24).collect::<String>()),
             None => format!("{}", i + 1),
         };
-        let w = ui.text_width(&label, &font) + 34.0;
+        let w = (ui.text_width(&label, &font) + 34.0).min(fair);
         let tab = Rect::new(x, rect.y + 3.0, w, rect.height - 6.0);
         let front = i == shells.at;
         let input = ui.interact(Id::TerminalTab(n), 0, tab, Sense::Click, true);
@@ -203,7 +207,7 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
             _ => palette.dim,
         };
         let text = Rect::new(tab.x + 10.0, tab.y, w - 30.0, tab.height);
-        ui.text(&label, text, &font, colour, Align::Start)?;
+        ui.text_clipped(&label, text, &font, colour, Align::Start)?;
         // the close mark, only when there is more than one
         let close = Rect::new(
             tab.x + w - 20.0,
