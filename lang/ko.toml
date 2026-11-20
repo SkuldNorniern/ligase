@@ -382,3 +382,4 @@
 "Match case" = "대소문자 구분"
 "Whole word" = "단어 단위"
 "The remote link is down" = "원격 연결이 끊겼습니다"
+"Changed on the remote side. Save again to overwrite" = "원격에서 바뀌었습니다. 다시 저장하면 덮어씁니다"

@@ -491,7 +491,18 @@ enum Done {
     /// a remote folder's entries.
     RemoteListed(String, Result<Vec<crate::remote::Entry>, String>),
     /// a remote file's local copy, ready to open.
-    RemoteFetched(String, Option<usize>, Result<PathBuf, String>),
+    /// a remote file's local copy, with its change time there; `bool` for
+    /// a refresh of a copy already open.
+    RemoteFetched(
+        String,
+        Option<usize>,
+        bool,
+        Result<(PathBuf, Option<i64>), String>,
+    ),
+    /// open remote files' change times there.
+    RemoteTimes(Vec<String>, Result<Vec<Option<i64>>, String>),
+    /// a save went to the far side; the change time it has now.
+    RemoteSent(String, Option<i64>),
     /// the remote root read again.
     RemoteRoot(Result<Vec<crate::remote::Entry>, String>),
     /// a search over the remote folder came back.
@@ -600,6 +611,8 @@ pub struct App {
     chat: Option<agent::Chat>,
     /// the remote path a delete is waiting on the person for.
     remote_delete: Option<String>,
+    /// quick open lists the remote folder's files, not the workspace's.
+    remote_quick: bool,
     /// the remote panel before a link: a target and known hosts.
     remote_pick: crate::remote::browse::Picker,
     /// the editor and documents' stamp the symbol list was filled at.
@@ -629,6 +642,11 @@ pub struct App {
     remote: Option<crate::remote::browse::Browser>,
     /// local copies of remote files: where each goes back to on save.
     remote_files: HashMap<PathBuf, String>,
+    /// each open remote file's change time there, as last fetched or sent.
+    remote_times: HashMap<String, i64>,
+    /// remote files changed there while edited here: the next save stops
+    /// once with a warning, the one after writes over.
+    remote_conflicts: std::collections::HashSet<String>,
     /// markdown views read as pages.
     previews: crate::preview::Previews,
     /// signature help to ask for once the text is synced.
@@ -769,6 +787,7 @@ impl App {
             shells: terminal::Shells::default(),
             chat: None,
             remote_delete: None,
+            remote_quick: false,
             remote_pick: crate::remote::browse::Picker::default(),
             symbols_seen: None,
             agent_saves: Vec::new(),
@@ -783,6 +802,8 @@ impl App {
             blame_asked: None,
             remote: None,
             remote_files: HashMap::new(),
+            remote_times: HashMap::new(),
+            remote_conflicts: std::collections::HashSet::new(),
             rail_out: false,
             frame_stats: std::env::var_os("LIGASE_FRAME_STATS").map(|_| FrameStats::default()),
             previews: crate::preview::Previews::default(),
@@ -971,6 +992,7 @@ impl App {
             // back from another program: files may have changed under us
             self.check_disk();
             self.refresh_git();
+            self.check_remote();
         }
         if matches!(event, WindowEvent::Unfocused) && self.settings.save_on_focus_loss {
             for view in self.docs.dirty_views() {
@@ -1873,6 +1895,11 @@ impl App {
             Command::QuickOpen | Command::Commands => {
                 if command == Command::QuickOpen {
                     self.palette.open(Kind::Files);
+                    // the remote panel in front and linked: its files
+                    if self.shows(Panel::Remote) && self.remote_files_list() {
+                        return;
+                    }
+                    self.remote_quick = false;
                     self.list_files();
                 } else {
                     self.palette.commands = COMMANDS
@@ -2747,6 +2774,7 @@ impl App {
     /// lists the workspace files on the worker for quick open. the old
     /// list stays up meanwhile.
     fn list_files(&mut self) {
+        self.remote_quick = false;
         if self.palette.listing {
             return;
         }
@@ -3086,6 +3114,13 @@ impl App {
                 let Some(rel) = self.palette.files.get(item).map(|i| i.text.clone()) else {
                     return;
                 };
+                if self.remote_quick {
+                    if let Some(root) = self.remote.as_ref().map(|b| b.root.clone()) {
+                        let path = crate::remote::browse::join(&root, &rel);
+                        self.remote_ask(crate::remote::browse::Ask::Open(path));
+                    }
+                    return;
+                }
                 let path = self.explorer.root().join(rel);
                 let view = self.open_file(&path);
                 self.ui.focus(Id::Editor(view), 1);
@@ -4346,9 +4381,26 @@ impl App {
                     (Err(why), _) => self.say(why),
                     _ => {}
                 },
-                Done::RemoteFetched(path, line, result) => match result {
-                    Ok(local) => {
+                Done::RemoteSent(path, time) => {
+                    if let Some(time) = time {
+                        self.remote_times.insert(path, time);
+                    }
+                }
+                Done::RemoteTimes(paths, times) => match times {
+                    Ok(times) => self.remote_times(paths, times),
+                    Err(why) => self.say(why),
+                },
+                Done::RemoteFetched(path, line, refresh, result) => match result {
+                    Ok((local, time)) => {
+                        if let Some(time) = time {
+                            self.remote_times.insert(path.clone(), time);
+                        }
                         self.remote_files.insert(local.clone(), path);
+                        if refresh {
+                            // the copy changed on disk: the disk check reloads it
+                            self.check_disk();
+                            continue;
+                        }
                         match line {
                             Some(line) => self.open_at_start(local, Some(line.saturating_sub(1))),
                             None => {
@@ -5687,22 +5739,8 @@ impl App {
                     self.open_at_start(local, line.map(|l| l.saturating_sub(1)));
                     return;
                 }
-                self.procs.run(move || {
-                    let result = (|| {
-                        let local = crate::remote::browse::cache_path(&host, &path)
-                            .ok_or_else(|| "no place for a local copy".to_owned())?;
-                        let bytes = link
-                            .lock()
-                            .map_err(|_| "the link broke".to_owned())?
-                            .read(&path)?;
-                        if let Some(dir) = local.parent() {
-                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                        }
-                        std::fs::write(&local, bytes).map_err(|e| e.to_string())?;
-                        Ok(local)
-                    })();
-                    Done::RemoteFetched(path, line, result)
-                });
+                let _ = link;
+                self.remote_fetch(path, line, false);
             }
         }
     }
@@ -5789,6 +5827,127 @@ impl App {
         });
     }
 
+    /// asks the far side when the open remote files last changed; ones
+    /// changed there come back as `RemoteTimes`.
+    fn check_remote(&mut self) {
+        let Some(crate::remote::browse::State::Ready(link)) =
+            self.remote.as_ref().map(|b| &b.state)
+        else {
+            return;
+        };
+        let paths: Vec<String> = self.remote_files.values().cloned().collect();
+        if paths.is_empty() {
+            return;
+        }
+        let link = std::sync::Arc::clone(link);
+        self.procs.run(move || {
+            let times = link
+                .lock()
+                .map_err(|_| "the link broke".to_owned())
+                .and_then(|mut s| s.changed_at(&paths));
+            Done::RemoteTimes(paths, times)
+        });
+    }
+
+    /// change times came back: a file changed there and not edited here
+    /// is fetched again; one with edits here gets a warning, never a fetch
+    /// over them.
+    fn remote_times(&mut self, paths: Vec<String>, times: Vec<Option<i64>>) {
+        for (path, time) in paths.into_iter().zip(times) {
+            let Some(time) = time else { continue };
+            let seen = self.remote_times.get(&path).copied();
+            if seen.is_none_or(|t| t == time) {
+                self.remote_times.insert(path, time);
+                continue;
+            }
+            let local = self
+                .remote_files
+                .iter()
+                .find(|(_, r)| **r == path)
+                .map(|(l, _)| l.clone());
+            let dirty = local
+                .as_ref()
+                .and_then(|l| self.view_of_path(l))
+                .and_then(|v| self.docs.doc_of(v))
+                .is_some_and(document::Document::is_dirty);
+            if dirty {
+                let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                self.say(format!(
+                    "{name}: {}",
+                    self.texts
+                        .tr("Changed on the remote side. Save again to overwrite")
+                ));
+                self.remote_times.insert(path.clone(), time);
+                self.remote_conflicts.insert(path);
+                continue;
+            }
+            self.remote_fetch(path, None, true);
+        }
+    }
+
+    /// fetches `path` into its local copy over the link, with its change
+    /// time; `refresh` takes it again for a copy already open.
+    fn remote_fetch(&mut self, path: String, line: Option<usize>, refresh: bool) {
+        let Some(browser) = &self.remote else { return };
+        let crate::remote::browse::State::Ready(link) = &browser.state else {
+            return;
+        };
+        let (link, host) = (std::sync::Arc::clone(link), browser.host.clone());
+        self.procs.run(move || {
+            let result = (|| {
+                let local = crate::remote::browse::cache_path(&host, &path)
+                    .ok_or_else(|| "no place for a local copy".to_owned())?;
+                let mut session = link.lock().map_err(|_| "the link broke".to_owned())?;
+                let bytes = session.read(&path)?;
+                let time = session
+                    .changed_at(std::slice::from_ref(&path))?
+                    .first()
+                    .copied()
+                    .flatten();
+                drop(session);
+                if let Some(dir) = local.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                // through a temp file: a reload never sees half of it
+                let tmp = local.with_extension("ligase-fetch");
+                std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+                std::fs::rename(&tmp, &local).map_err(|e| e.to_string())?;
+                Ok((local, time))
+            })();
+            Done::RemoteFetched(path, line, refresh, result)
+        });
+    }
+
+    /// asks the remote folder's file list for quick open. false without a
+    /// link, so the workspace's files show instead.
+    fn remote_files_list(&mut self) -> bool {
+        let Some(browser) = &self.remote else {
+            return false;
+        };
+        let crate::remote::browse::State::Ready(link) = &browser.state else {
+            return false;
+        };
+        let (link, root) = (std::sync::Arc::clone(link), browser.root.clone());
+        self.remote_quick = true;
+        self.palette.listing = self.procs.run(move || {
+            let files = link
+                .lock()
+                .map_err(|_| "the link broke".to_owned())
+                .and_then(|mut s| s.files(&root))
+                .unwrap_or_default();
+            Done::Files(
+                files
+                    .into_iter()
+                    .map(|text| palette::Item {
+                        text,
+                        note: String::new(),
+                    })
+                    .collect(),
+            )
+        });
+        true
+    }
+
     /// the picker's hosts, read on the worker.
     fn load_hosts(&mut self) {
         self.jobs
@@ -5803,6 +5962,17 @@ impl App {
         let Some(remote) = self.remote_files.get(&local).cloned() else {
             return;
         };
+        // changed there since it was fetched: this save stops once; the
+        // local copy keeps the text, the next save writes over
+        if self.remote_conflicts.remove(&remote) {
+            let name = remote.rsplit('/').next().unwrap_or(&remote).to_owned();
+            self.say(format!(
+                "{name}: {}",
+                self.texts
+                    .tr("Changed on the remote side. Save again to overwrite")
+            ));
+            return;
+        }
         let Some(crate::remote::browse::State::Ready(link)) =
             self.remote.as_ref().map(|b| &b.state)
         else {
@@ -5818,11 +5988,15 @@ impl App {
             let result = std::fs::read(&local)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| {
-                    link.lock()
-                        .map_err(|_| "the link broke".to_owned())?
-                        .write(&remote, &bytes)
+                    let mut s = link.lock().map_err(|_| "the link broke".to_owned())?;
+                    s.write(&remote, &bytes)?;
+                    s.changed_at(std::slice::from_ref(&remote))
                 });
-            Done::Note(result.err().map(|why| format!("{remote}: {why}")))
+            match result {
+                // the time it has now is ours: no change to report later
+                Ok(times) => Done::RemoteSent(remote, times.first().copied().flatten()),
+                Err(why) => Done::Note(Some(format!("{remote}: {why}"))),
+            }
         });
     }
 

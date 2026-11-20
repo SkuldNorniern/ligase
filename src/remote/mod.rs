@@ -254,6 +254,43 @@ impl Session {
         Ok(parse_grep(&out))
     }
 
+    /// the files under `root`, as paths from it: `.git`, `node_modules`
+    /// and `target` left out, 20000 at most. for quick open.
+    pub fn files(&mut self, root: &str) -> Result<Vec<String>, String> {
+        let q = quoted(root)?;
+        let script = format!(
+            "cd -- {q} && find . \\( -name .git -o -name node_modules -o -name target \\) -prune -o -type f -print | head -n 20000"
+        );
+        let (out, _) = self.run(&script, SEARCH_TIMEOUT)?;
+        let mut files: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("./"))
+            .filter(|l| !l.is_empty() && l.len() <= MAX_PATH)
+            .map(str::to_owned)
+            .collect();
+        files.sort();
+        Ok(files)
+    }
+
+    /// each path's last change time in seconds, none for one that is gone.
+    /// gnu `stat -c`, else bsd `stat -f`.
+    pub fn changed_at(&mut self, paths: &[String]) -> Result<Vec<Option<i64>>, String> {
+        let mut script = String::new();
+        for p in paths.iter().take(200) {
+            let q = quoted(p)?;
+            script.push_str(&format!(
+                "t=$(stat -c %Y -- {q} 2>/dev/null || stat -f %m -- {q} 2>/dev/null); echo \"${{t:--}}\"\n"
+            ));
+        }
+        let (out, _) = self.run(&script, CALL_TIMEOUT)?;
+        Ok(out
+            .lines()
+            .map(|l| l.trim().parse::<i64>().ok())
+            .chain(std::iter::repeat(None))
+            .take(paths.len().min(200))
+            .collect())
+    }
+
     /// makes an empty file, or a folder, at `path`. never over something
     /// already there.
     pub fn create(&mut self, path: &str, folder: bool) -> Result<(), String> {
@@ -671,6 +708,38 @@ Host box
         );
         s.remove(&format!("{root}/sub")).unwrap();
         assert!(!dir.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_are_listed_from_the_root() {
+        let Some(mut s) = session() else { return };
+        let dir = std::env::temp_dir().join(format!("ligase-rfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "").unwrap();
+        std::fs::write(dir.join("b c.txt"), "").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "").unwrap();
+        std::fs::write(dir.join("target/debug/x"), "").unwrap();
+        assert_eq!(s.files(&posix(&dir)).unwrap(), ["b c.txt", "src/a.rs"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn change_times_read_and_gone_files_say_none() {
+        let Some(mut s) = session() else { return };
+        let dir = std::env::temp_dir().join(format!("ligase-rstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        let root = posix(&dir);
+        let got = s
+            .changed_at(&[format!("{root}/a"), format!("{root}/gone")])
+            .unwrap();
+        assert!(got[0].is_some_and(|t| t > 1_000_000_000), "{got:?}");
+        assert_eq!(got[1], None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
