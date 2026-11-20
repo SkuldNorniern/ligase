@@ -284,7 +284,11 @@ pub fn show(
         for (i, r) in chat.refs.iter().enumerate() {
             let label = format!("@ {}  ×", r.label());
             let w = ui.text_width(&label, &small) + 16.0;
-            let chip = Rect::new(x, y, w, CHIP);
+            // a chip that doesn't fit waits; the rest still go with the message
+            if x > foot.x && x + w > foot.right() {
+                break;
+            }
+            let chip = Rect::new(x, y, w.min(foot.width), CHIP);
             let n = u16::try_from(i + 1).unwrap_or(u16::MAX);
             let input = ui.interact(Id::AgentRef(n), 0, chip, Sense::Click, true);
             ui.round(
@@ -350,7 +354,17 @@ pub fn show(
     // a permission the agent waits on sits over the box
     let talk = if let Some(p) = &chat.permission {
         let lines = hover::wrap(ui, &p.title, &font, talk.width - 2.0 * PAD - 20.0);
-        let card_h = 30.0 + lines.len().min(4) as f32 * TEXT_ROW + 40.0;
+        // the options on one row when they fit, else one under another
+        let inner_w = talk.width - 2.0 * PAD - 24.0;
+        let widths: Vec<f32> = p
+            .options
+            .iter()
+            .map(|(_, label, _)| ui.text_width(label, &small) + 24.0)
+            .collect();
+        let row = widths.iter().sum::<f32>() + 6.0 * widths.len().saturating_sub(1) as f32;
+        let stacked = row > inner_w;
+        let button_rows = if stacked { widths.len() } else { 1 };
+        let card_h = 30.0 + lines.len().min(4) as f32 * TEXT_ROW + 8.0 + button_rows as f32 * 32.0;
         let (card, above) = talk.split_bottom(card_h + PAD, 0.0);
         let card = Rect::new(card.x + PAD, card.y, card.width - 2.0 * PAD, card_h);
         ui.round(card, 8.0, palette.raised)?;
@@ -361,7 +375,7 @@ pub fn show(
         let mut cy = card.y + 8.0;
         ui.text(
             texts.tr("The agent asks"),
-            Rect::new(card.x + 12.0, cy, card.width, 20.0),
+            Rect::new(card.x + 12.0, cy, card.width - 24.0, 20.0),
             &small,
             palette.dim,
             Align::Start,
@@ -378,9 +392,13 @@ pub fn show(
             cy += TEXT_ROW;
         }
         let mut bx = card.x + 12.0;
-        for (i, (id, label, allows)) in p.options.iter().enumerate() {
-            let w = ui.text_width(label, &small) + 24.0;
-            let b = Rect::new(bx, card.bottom() - 36.0, w, 26.0);
+        let mut by = cy + 8.0;
+        for (i, ((id, label, allows), w)) in p.options.iter().zip(&widths).enumerate() {
+            let b = if stacked {
+                Rect::new(card.x + 12.0, by, inner_w.max(40.0), 26.0)
+            } else {
+                Rect::new(bx, by, *w, 26.0)
+            };
             let n = u16::try_from(10 + i).unwrap_or(u16::MAX);
             let button = if *allows {
                 Button::new(label).primary()
@@ -391,6 +409,9 @@ pub fn show(
                 ask = Some(Ask::Answer(id.clone()));
             }
             bx += w + 6.0;
+            if stacked {
+                by += 32.0;
+            }
         }
         above
     } else {
