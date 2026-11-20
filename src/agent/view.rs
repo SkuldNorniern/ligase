@@ -51,6 +51,16 @@ pub enum Ask {
     SetupSave,
     SetupDelete,
     SetupCancel,
+    /// the agent picker, then a pick from it.
+    Agents,
+    PickAgent(usize),
+    /// the saved conversations, then one to read.
+    History,
+    OpenPast(usize),
+    /// back from history, a past conversation or the picker.
+    CloseOver,
+    /// the agent to this mode.
+    Mode(String),
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +79,12 @@ enum Row {
 /// laid out rows per entry: (width, text length, rows, height).
 #[derive(Default)]
 pub struct Cache(HashMap<usize, (f32, usize, Vec<Row>, f32)>);
+
+impl std::fmt::Debug for Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cache({} entries)", self.0.len())
+    }
+}
 
 impl Cache {
     pub fn forget(&mut self, i: usize) {
@@ -219,6 +235,37 @@ pub fn show(
     rect: Rect,
     texts: &Texts,
 ) -> AureaResult<Option<Ask>> {
+    // a saved conversation is drawn as the live one is: its entries, rows
+    // and scroll are swapped in for the frame, and back out after
+    if let super::Over::Past(_, entries, laid, scroll) = &mut chat.over {
+        let (mut entries, mut laid, mut scroll) =
+            (std::mem::take(entries), std::mem::take(laid), *scroll);
+        std::mem::swap(&mut chat.entries, &mut entries);
+        std::mem::swap(&mut chat.laid, &mut laid);
+        std::mem::swap(&mut chat.scroll, &mut scroll);
+        let follow = std::mem::replace(&mut chat.follow, false);
+        let ask = show_inner(ui, chat, rect, texts, true);
+        std::mem::swap(&mut chat.entries, &mut entries);
+        std::mem::swap(&mut chat.laid, &mut laid);
+        std::mem::swap(&mut chat.scroll, &mut scroll);
+        chat.follow = follow;
+        if let super::Over::Past(_, e, l, s) = &mut chat.over {
+            *e = entries;
+            *l = laid;
+            *s = scroll;
+        }
+        return ask;
+    }
+    show_inner(ui, chat, rect, texts, false)
+}
+
+fn show_inner(
+    ui: &mut Ui<'_, Id>,
+    chat: &mut Chat,
+    rect: Rect,
+    texts: &Texts,
+    reading: bool,
+) -> AureaResult<Option<Ask>> {
     let palette = ui.theme.palette;
     let font = ui.theme.font(13.0);
     let small = ui.theme.font(12.0);
@@ -244,7 +291,7 @@ pub fn show(
     } else {
         0.0
     };
-    let room = head.right() - PAD - 56.0 - gear_w - 8.0 - (icon.right() + 8.0);
+    let room = head.right() - PAD - 56.0 - gear_w - 30.0 - 8.0 - (icon.right() + 8.0) - 14.0;
     let full = chat.title.as_str();
     let short = full.split(' ').next().unwrap_or(full);
     let shown = [full, short]
@@ -252,8 +299,25 @@ pub fn show(
         .find(|n| ui.text_width(n, &bold) <= room)
         .unwrap_or("");
     let name = Rect::new(icon.right() + 8.0, head.y, room.max(0.0), HEAD);
-    ui.text(shown, name, &bold, palette.text, Align::Start)?;
     let name_w = ui.text_width(shown, &bold);
+    // the name is the agent switch: a click lists the others
+    let hit = Rect::new(icon.x - 4.0, head.y + 5.0, name_w + 40.0, HEAD - 10.0);
+    let input = ui.interact(Id::AgentButton(20), 0, hit, Sense::Click, true);
+    if input.hovered {
+        ui.round(hit, 6.0, palette.hover)?;
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    ui.text(shown, name, &bold, palette.text, Align::Start)?;
+    let arrow = Rect::new(name.x + name_w + 4.0, head.y, 12.0, HEAD);
+    ui.text("▾", arrow, &small, palette.dim, Align::Start)?;
+    if input.clicked {
+        ask = Some(if matches!(chat.over, super::Over::Agents(_)) {
+            Ask::CloseOver
+        } else {
+            Ask::Agents
+        });
+    }
+    let name_w = name_w + 14.0;
     let (state, tone) = match &chat.state {
         State::Off => (texts.tr("not started"), palette.faint),
         State::Starting => (texts.tr("starting…"), palette.dim),
@@ -263,8 +327,31 @@ pub fn show(
         State::Failed(_) => (texts.tr("stopped"), palette.danger),
     };
     let new = Rect::new(head.right() - PAD - 56.0, head.y + 6.0, 56.0, HEAD - 12.0);
+    // the saved conversations
+    let clock = Rect::new(new.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
+    let input = ui.interact(Id::AgentButton(21), 0, clock, Sense::Click, true);
+    if input.hovered || matches!(chat.over, super::Over::History(_) | super::Over::Past(..)) {
+        ui.round(clock, 6.0, palette.hover)?;
+    }
+    if input.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    let at = Rect::new(
+        clock.x + 5.0,
+        clock.y + (clock.height - 16.0) / 2.0,
+        16.0,
+        16.0,
+    );
+    crate::icons::draw(ui, "history", at, palette.dim)?;
+    if input.clicked {
+        ask = Some(if matches!(chat.over, super::Over::History(_)) {
+            Ask::CloseOver
+        } else {
+            Ask::History
+        });
+    }
     // the built-in agent's model can change any time
-    let gear = Rect::new(new.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
+    let gear = Rect::new(clock.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
     if chat.agent == super::Agent::OpenAi {
         let input = ui.interact(Id::AgentButton(6), 0, gear, Sense::Click, true);
         if input.hovered {
@@ -283,10 +370,15 @@ pub fn show(
         }
     }
     // the state's dot always; its word only where it fits before the button
+    let first_button = if chat.agent == super::Agent::OpenAi {
+        gear.x
+    } else {
+        clock.x
+    };
     let dot = Rect::new(name.x + name_w + 10.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
-    if dot.right() < new.x - 4.0 {
+    if dot.right() < first_button - 4.0 {
         ui.round(dot, 3.0, tone)?;
-        let room = new.x - 8.0 - (dot.right() + 6.0);
+        let room = first_button - 8.0 - (dot.right() + 6.0);
         if ui.text_width(state, &small) <= room {
             let state_at = Rect::new(dot.right() + 6.0, head.y, room, HEAD);
             ui.text(state, state_at, &small, palette.dim, Align::Start)?;
@@ -305,6 +397,40 @@ pub fn show(
             ask = Some(a);
         }
         return Ok(ask);
+    }
+
+    // the agent picker or the history, over everything below the header
+    if let Some(a) = over_list(ui, chat, rest, texts)? {
+        return Ok(Some(a));
+    }
+    if matches!(chat.over, super::Over::Agents(_) | super::Over::History(_)) {
+        return Ok(ask);
+    }
+    // reading a saved one: a bar to go back in place of the box
+    if reading {
+        let (bar, talk) = rest.split_bottom(48.0, 0.0);
+        ui.fill(Rect::new(bar.x, bar.y, bar.width, 1.0), palette.border)?;
+        let inner = bar.inset(PAD).inset_xy(0.0, -4.0);
+        let back = Rect::new(inner.right() - 80.0, inner.y, 80.0, 28.0);
+        let title = match &chat.over {
+            super::Over::Past(t, ..) => t.clone(),
+            _ => String::new(),
+        };
+        let words = Rect::new(inner.x, inner.y, (back.x - inner.x - 8.0).max(0.0), 28.0);
+        ui.text_clipped(
+            &format!("{} · {title}", texts.tr("Saved")),
+            words,
+            &small,
+            palette.dim,
+            Align::Start,
+        )?;
+        if Button::new(texts.tr("Back"))
+            .show(ui, Id::AgentButton(22), back)?
+            .clicked
+        {
+            ask = Some(Ask::CloseOver);
+        }
+        return Ok(transcript(ui, chat, talk, (&font, &small, &bold, &mono))?.or(ask));
     }
 
     // the box to write in, and what goes with it, at the bottom
@@ -368,11 +494,48 @@ pub fn show(
     }
     let buttons = Rect::new(foot.x, field.bottom() + 8.0, foot.width, 28.0);
     let go = Rect::new(buttons.right() - 76.0, buttons.y, 76.0, 28.0);
-    // the keys, quietly, where there is room left of the button
-    let keys = texts.tr("Enter to send · Ctrl+Shift+J adds lines");
-    let keys_at = Rect::new(buttons.x, buttons.y, go.x - buttons.x - 8.0, 28.0);
-    if ui.text_width(keys, &small) <= keys_at.width {
-        ui.text(keys, keys_at, &small, palette.faint, Align::Start)?;
+    // the agent's mode left of the button, a click for the next; with no
+    // modes, the keys, quietly
+    let left = Rect::new(buttons.x, buttons.y, go.x - buttons.x - 8.0, 28.0);
+    if chat.modes.is_empty() {
+        let keys = texts.tr("Enter to send · Ctrl+Shift+J adds lines");
+        if ui.text_width(keys, &small) <= left.width {
+            ui.text(keys, left, &small, palette.faint, Align::Start)?;
+        }
+    } else {
+        let name = chat
+            .mode
+            .as_ref()
+            .and_then(|m| chat.modes.iter().find(|(id, _)| id == m))
+            .map_or_else(|| chat.modes[0].1.clone(), |(_, n)| n.clone());
+        let label = format!("◇ {name}");
+        let w = (ui.text_width(&label, &small) + 22.0).min(left.width);
+        let chip = Rect::new(left.x, left.y + 2.0, w, 24.0);
+        let input = ui.interact(Id::AgentButton(23), 0, chip, Sense::Click, true);
+        ui.round(
+            chip,
+            12.0,
+            if input.hovered {
+                palette.hover
+            } else {
+                palette.raised
+            },
+        )?;
+        ui.text_clipped(
+            &label,
+            chip.inset_xy(10.0, 0.0),
+            &small,
+            palette.text,
+            Align::Start,
+        )?;
+        if input.hovered {
+            ui.set_cursor(CursorIcon::Pointer);
+        }
+        if input.clicked
+            && let Some(next) = chat.next_mode()
+        {
+            ask = Some(Ask::Mode(next));
+        }
     }
     if chat.state == State::Working {
         if Button::new(texts.tr("Stop"))
@@ -529,6 +692,20 @@ pub fn show(
         return Ok(ask);
     }
 
+    Ok(transcript(ui, chat, talk, (&font, &small, &bold, &mono))?.or(ask))
+}
+
+/// the conversation in `talk`: rows laid out where they changed, the ones
+/// in sight drawn, following the end while it is in sight.
+fn transcript(
+    ui: &mut Ui<'_, Id>,
+    chat: &mut Chat,
+    talk: Rect,
+    (font, small, bold, mono): (&Font, &Font, &Font, &Font),
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let (font, small, bold, mono) = (font.clone(), small.clone(), bold.clone(), mono.clone());
+    let mut ask = None;
     // the conversation: lay out what changed, then draw what is in sight
     let width = (talk.width - 2.0 * PAD).max(80.0);
     let root = chat.root.clone();
@@ -926,4 +1103,123 @@ fn setup_card(
         ask = Some(Ask::SetupCancel);
     }
     Ok(ask)
+}
+
+/// the agent picker or the saved conversations, in `rect`: rows to click.
+/// none when neither is up.
+fn over_list(
+    ui: &mut Ui<'_, Id>,
+    chat: &mut Chat,
+    rect: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let palette = ui.theme.palette;
+    let font = ui.theme.font(13.0);
+    let small = ui.theme.font(12.0);
+    let rows: Vec<(String, String, bool)> = match &chat.over {
+        super::Over::Agents(list) => list
+            .iter()
+            .map(|(label, word, profile)| {
+                let lit = match profile {
+                    Some(p) => {
+                        chat.agent == super::Agent::OpenAi && chat.title.starts_with(p.as_str())
+                    }
+                    None => chat.agent.word() == word,
+                };
+                (label.clone(), String::new(), lit)
+            })
+            .collect(),
+        super::Over::History(list) => list
+            .iter()
+            .map(|p| {
+                (
+                    p.title.clone(),
+                    format!("{} · {}", p.agent, ago(p.when)),
+                    false,
+                )
+            })
+            .collect(),
+        _ => return Ok(None),
+    };
+    let agents = matches!(chat.over, super::Over::Agents(_));
+    let area = rect.inset(PAD);
+    let head = if agents {
+        texts.tr("Talk to")
+    } else {
+        texts.tr("Saved conversations")
+    };
+    ui.text(
+        head,
+        Rect::new(area.x, area.y, area.width, 20.0),
+        &small,
+        palette.dim,
+        Align::Start,
+    )?;
+    if rows.is_empty() {
+        ui.text(
+            texts.tr("Nothing saved yet"),
+            Rect::new(area.x, area.y + 28.0, area.width, 20.0),
+            &font,
+            palette.faint,
+            Align::Start,
+        )?;
+        return Ok(None);
+    }
+    let row_h = if agents { 32.0 } else { 46.0 };
+    let list = Rect::new(area.x, area.y + 26.0, area.width, area.height - 26.0);
+    let mut ask = None;
+    let mut none = None;
+    let response = aurea::ui::ListView::new(&mut chat.list_scroll, rows.len(), row_h)
+        .selected(&mut none)
+        .show(ui, Id::AgentList, list, |ui, row| {
+            let Some((title, note, lit)) = rows.get(row.index) else {
+                return Ok(());
+            };
+            let r = row.rect.inset_xy(0.0, 2.0);
+            if *lit {
+                ui.round(r, 8.0, palette.accent.fade(0.18))?;
+            } else if row.hovered {
+                ui.round(r, 8.0, palette.hover)?;
+            }
+            if row.hovered {
+                ui.set_cursor(CursorIcon::Pointer);
+            }
+            if note.is_empty() {
+                ui.text_clipped(
+                    title,
+                    r.inset_xy(12.0, 0.0),
+                    &font,
+                    palette.text,
+                    Align::Start,
+                )?;
+            } else {
+                let top = Rect::new(r.x + 12.0, r.y + 4.0, r.width - 24.0, 20.0);
+                ui.text_clipped(title, top, &font, palette.text, Align::Start)?;
+                let bottom = Rect::new(r.x + 12.0, r.y + 23.0, r.width - 24.0, 16.0);
+                ui.text_clipped(note, bottom, &small, palette.dim, Align::Start)?;
+            }
+            Ok(())
+        })?;
+    if let Some(i) = response.row_clicked {
+        ask = Some(if agents {
+            Ask::PickAgent(i)
+        } else {
+            Ask::OpenPast(i)
+        });
+    }
+    Ok(ask)
+}
+
+/// how long ago `when` (seconds since 1970) was, said short.
+fn ago(when: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let s = now.saturating_sub(when);
+    match s {
+        0..60 => "now".to_owned(),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
 }

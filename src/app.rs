@@ -468,6 +468,10 @@ enum Done {
     Conflict(DocumentId, String, Option<document::Stamp>),
     Session(Option<String>),
     Saved(Result<(), String>),
+    /// the saved agent conversations, newest first.
+    History(Vec<agent::Past>),
+    /// one saved conversation: its title and entries.
+    Past(String, Result<Vec<agent::Entry>, String>),
     Wrote(
         DocumentId,
         String,
@@ -1279,9 +1283,14 @@ impl App {
         if fresh || !same {
             // the old pipe's child is killed on drop, off the ui thread
             if let Some(old) = self.chat.take() {
+                let record = old.record();
                 self.jobs.run(move || {
                     drop(old);
-                    Done::Note(None)
+                    let kept = record.as_ref().map(agent::keep);
+                    Done::Note(
+                        kept.and_then(Result::err)
+                            .map(|e| format!("the conversation was not kept: {e}")),
+                    )
                 });
             }
             self.chat = Some(agent::Chat::new(agent, root.clone()));
@@ -1728,6 +1737,44 @@ impl App {
         self.open_setup();
     }
 
+    /// the agent picked from the panel's list: kept in settings, and a new
+    /// conversation with it. the custom one with no server opens its setup.
+    fn pick_agent(&mut self, i: usize) {
+        let picked = match self.chat.as_ref().map(|c| &c.over) {
+            Some(agent::Over::Agents(list)) => list.get(i).cloned(),
+            _ => None,
+        };
+        let Some((_, word, profile)) = picked else {
+            return;
+        };
+        let Some(agent) = agent::Agent::from_word(&word) else {
+            return;
+        };
+        let same = self.settings.agent == agent
+            && (profile.is_none() || self.settings.model_profile == profile);
+        if let Some(chat) = &mut self.chat {
+            chat.over = agent::Over::None;
+        }
+        if same && self.chat.as_ref().is_some_and(agent::Chat::running) {
+            return;
+        }
+        self.settings.agent = agent;
+        self.settings_writes
+            .push(("agent", Some(settings::quote(agent.word()))));
+        if let Some(name) = &profile {
+            self.settings.model_profile = Some(name.clone());
+            self.settings_writes
+                .push(("model_profile", Some(settings::quote(name))));
+        }
+        self.write_settings();
+        if agent == agent::Agent::OpenAi && self.settings.models.is_empty() {
+            self.start_agent(true);
+            self.open_setup();
+        } else {
+            self.start_agent(true);
+        }
+    }
+
     /// what the agent panel asked for.
     fn agent_ask(&mut self, ask: agent::view::Ask) {
         use agent::view::Ask;
@@ -1800,6 +1847,57 @@ impl App {
             }
             Ask::Open(path, line) => {
                 self.open_at_start(path, line.map(|l| l.saturating_sub(1) as usize));
+            }
+            Ask::Agents => {
+                let mut list: Vec<(String, String, Option<String>)> = agent::Agent::ALL
+                    .iter()
+                    .filter(|a| **a != agent::Agent::OpenAi)
+                    .map(|a| (a.name().to_owned(), a.word().to_owned(), None))
+                    .collect();
+                if self.settings.models.is_empty() {
+                    list.push((
+                        self.texts.tr("Custom (set up a model server)").to_owned(),
+                        "custom".to_owned(),
+                        None,
+                    ));
+                } else {
+                    for m in &self.settings.models {
+                        list.push((
+                            format!("Custom · {} · {}", m.name, m.model),
+                            "custom".to_owned(),
+                            Some(m.name.clone()),
+                        ));
+                    }
+                }
+                if let Some(chat) = &mut self.chat {
+                    chat.over = agent::Over::Agents(list);
+                    chat.list_scroll = 0.0;
+                }
+            }
+            Ask::PickAgent(i) => self.pick_agent(i),
+            Ask::History => {
+                self.jobs.run(|| Done::History(agent::history()));
+            }
+            Ask::OpenPast(i) => {
+                let past = match self.chat.as_ref().map(|c| &c.over) {
+                    Some(agent::Over::History(list)) => {
+                        list.get(i).map(|p| (p.title.clone(), p.path.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((title, path)) = past {
+                    self.jobs.run(move || Done::Past(title, agent::past(&path)));
+                }
+            }
+            Ask::CloseOver => {
+                if let Some(chat) = &mut self.chat {
+                    chat.over = agent::Over::None;
+                }
+            }
+            Ask::Mode(id) => {
+                if let Some(chat) = &mut self.chat {
+                    chat.set_mode(&id);
+                }
             }
             Ask::Unref(i) => {
                 if let Some(chat) = &mut self.chat
@@ -3615,8 +3713,28 @@ impl App {
 
     /// closes the window once the layout is written.
     fn close_saving_layout(&mut self) {
+        // the agent conversation is kept with the layout, in one job
+        let record = self.chat.as_ref().and_then(agent::Chat::record);
         // before the saved session is back, writing would wipe it
-        if self.restored && self.save_layout() {
+        let session = self
+            .restored
+            .then(|| self.session.clone())
+            .flatten()
+            .map(|path| (path, self.bench.save(&self.docs)));
+        if record.is_none() && session.is_none() {
+            self.close_now = true;
+            return;
+        }
+        self.layout_dirty = false;
+        let queued = self.jobs.run(move || {
+            if let Some(record) = &record {
+                let _ = agent::keep(record);
+            }
+            Done::Saved(session.map_or(Ok(()), |(path, text)| {
+                workbench::write_session(&path, &text)
+            }))
+        });
+        if queued {
             self.closing = true;
         } else {
             self.close_now = true;
@@ -4756,6 +4874,24 @@ impl App {
                     // a missing server is fine; the editor works without it, and
                     // the status bar says so beside the language
                     let _ = self.lsp.started(language, result);
+                }
+                Done::History(list) => {
+                    if let Some(chat) = &mut self.chat {
+                        chat.over = agent::Over::History(list);
+                        chat.list_scroll = 0.0;
+                    }
+                }
+                Done::Past(title, Ok(entries)) => {
+                    if let Some(chat) = &mut self.chat {
+                        chat.over =
+                            agent::Over::Past(title, entries, agent::view::Cache::default(), 0.0);
+                    }
+                }
+                Done::Past(_, Err(why)) => {
+                    self.say(format!(
+                        "{}: {why}",
+                        self.texts.tr("Couldn't open the conversation")
+                    ));
                 }
                 Done::Saved(result) => {
                     if let Err(why) = result {

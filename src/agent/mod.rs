@@ -311,6 +311,33 @@ enum Pending {
     Session,
     SignIn,
     Prompt,
+    Mode,
+}
+
+/// a saved conversation, listed in the history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Past {
+    pub path: PathBuf,
+    /// its first message, cut short.
+    pub title: String,
+    /// who it was with.
+    pub agent: String,
+    /// seconds since 1970.
+    pub when: u64,
+}
+
+/// what the panel shows over the conversation, when not the conversation.
+#[derive(Debug, Default)]
+pub enum Over {
+    #[default]
+    None,
+    /// the saved conversations, newest first.
+    History(Vec<Past>),
+    /// one saved conversation, read only: its title, entries, their laid
+    /// out rows and the scroll.
+    Past(String, Vec<Entry>, view::Cache, f32),
+    /// agents to switch to: (label, settings word, model profile).
+    Agents(Vec<(String, String, Option<String>)>),
 }
 
 /// the built-in agent's setup card, filled in by the person.
@@ -359,8 +386,15 @@ pub struct Chat {
     queued: Option<Value>,
     /// stop was asked once this turn; asked again, the agent is ended.
     stopping: bool,
+    /// the agent's modes, (id, name), and the one it is in.
+    pub modes: Vec<(String, String)>,
+    pub mode: Option<String>,
+    /// history, a past conversation or the agent picker over the talk.
+    pub over: Over,
     /// laid out rows per entry, kept while width and text stay.
     pub(crate) laid: view::Cache,
+    /// how far the picker or history list is scrolled.
+    pub(crate) list_scroll: f32,
 }
 
 impl Chat {
@@ -384,7 +418,11 @@ impl Chat {
             pending: Vec::new(),
             queued: None,
             stopping: false,
+            modes: Vec::new(),
+            mode: None,
+            over: Over::None,
             laid: view::Cache::default(),
+            list_scroll: 0.0,
         }
     }
 
@@ -602,6 +640,7 @@ impl Chat {
                 Some(session) => {
                     self.session = Some(session.to_owned());
                     self.state = State::Ready;
+                    self.take_modes(&result["modes"]);
                     if let Some(prompt) = self.queued.take()
                         && let Some(pipe) = &mut self.pipe
                     {
@@ -626,6 +665,8 @@ impl Chat {
                 }
             }
             (Pending::SignIn, Ok(_)) => self.new_session(),
+            (Pending::Mode, Ok(_)) => {}
+            (Pending::Mode, Err(fail)) => self.note(fail.message, true),
             (Pending::Prompt, Ok(result)) => {
                 self.state = State::Ready;
                 self.stopping = false;
@@ -825,6 +866,11 @@ impl Chat {
                 let i = at.unwrap_or(self.entries.len() - 1);
                 self.laid.forget(i);
             }
+            "current_mode_update" => {
+                if let Some(id) = update["currentModeId"].as_str() {
+                    self.mode = Some(id.chars().take(60).collect());
+                }
+            }
             "plan" => {
                 let steps: Vec<(String, Step)> = update["entries"]
                     .as_array()
@@ -869,10 +915,191 @@ impl Chat {
         }
     }
 
+    /// acp's `modes`: what the agent offers and where it is.
+    fn take_modes(&mut self, modes: &Value) {
+        self.modes = modes["availableModes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(12)
+            .filter_map(|m| {
+                let id: String = m["id"].as_str()?.chars().take(60).collect();
+                let name = m["name"]
+                    .as_str()
+                    .map_or_else(|| id.clone(), |n| n.chars().take(40).collect());
+                Some((id, name))
+            })
+            .collect();
+        self.mode = modes["currentModeId"]
+            .as_str()
+            .map(|m| m.chars().take(60).collect());
+    }
+
+    /// moves the agent to mode `id`; shown at once, the agent says if not.
+    pub fn set_mode(&mut self, id: &str) {
+        let (Some(pipe), Some(session)) = (&mut self.pipe, &self.session) else {
+            return;
+        };
+        let rid = pipe.request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": id}),
+        );
+        self.pending.push((rid, Pending::Mode));
+        self.mode = Some(id.to_owned());
+    }
+
+    /// the mode after the one it is in, round; for one click.
+    pub fn next_mode(&self) -> Option<String> {
+        let at = self
+            .mode
+            .as_ref()
+            .and_then(|m| self.modes.iter().position(|(id, _)| id == m))
+            .map_or(0, |i| i + 1);
+        self.modes
+            .get(at % self.modes.len().max(1))
+            .map(|(id, _)| id.clone())
+    }
+
+    /// the conversation as a plain record to keep: none when nothing was
+    /// said. text only; tool steps by their title.
+    pub fn record(&self) -> Option<Value> {
+        let first = self.entries.iter().find_map(|e| match e {
+            Entry::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })?;
+        let entries: Vec<Value> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::User { text, .. } => Some(json!({"kind": "user", "text": text})),
+                Entry::Agent(t) => Some(json!({"kind": "agent", "text": t})),
+                Entry::Tool(t) => Some(json!({"kind": "tool", "text": t.title, "status": t.status})),
+                Entry::Plan(steps) => Some(json!({"kind": "plan", "text": steps.iter().map(|s| s.0.clone()).collect::<Vec<_>>().join("\n")})),
+                Entry::Note { text, bad } => Some(json!({"kind": "note", "text": text, "bad": bad})),
+                Entry::Thought(_) => None,
+            })
+            .collect();
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Some(json!({
+            "title": first.chars().take(120).collect::<String>(),
+            "agent": self.title,
+            "when": when,
+            "entries": entries,
+        }))
+    }
+
     /// whether the pipe is up or on its way.
     pub fn running(&self) -> bool {
         self.pipe.is_some() || self.state == State::Starting
     }
+}
+
+/// most conversations kept; the oldest go.
+const MAX_PAST: usize = 200;
+
+/// the folder saved conversations live in, beside the settings.
+fn history_dir() -> Option<PathBuf> {
+    aurea::config_dir("ligase").map(|d| d.join("agent-history"))
+}
+
+/// keeps `record` as a file, the oldest past the cap let go. worker only.
+pub fn keep(record: &Value) -> Result<(), String> {
+    let dir = history_dir().ok_or("no config folder")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let when = record["when"].as_u64().unwrap_or(0);
+    let mut n = 0;
+    let path = loop {
+        let p = dir.join(format!("{when}-{n}.json"));
+        if !p.exists() {
+            break p;
+        }
+        n += 1;
+    };
+    std::fs::write(&path, record.to_string()).map_err(|e| e.to_string())?;
+    let mut all: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    if all.len() > MAX_PAST {
+        all.sort();
+        for old in &all[..all.len() - MAX_PAST] {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(())
+}
+
+/// the saved conversations, newest first. worker only.
+pub fn history() -> Vec<Past> {
+    let Some(dir) = history_dir() else {
+        return Vec::new();
+    };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Past> = read
+        .flatten()
+        .take(MAX_PAST * 2)
+        .filter_map(|e| {
+            let path = e.path();
+            if e.metadata().ok()?.len() > 16 * 1024 * 1024 {
+                return None;
+            }
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            Some(Past {
+                title: v["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect(),
+                agent: v["agent"].as_str().unwrap_or("").chars().take(60).collect(),
+                when: v["when"].as_u64().unwrap_or(0),
+                path,
+            })
+        })
+        .collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.when));
+    out
+}
+
+/// a saved conversation's entries, to read. worker only.
+pub fn past(path: &Path) -> Result<Vec<Entry>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if text.len() > 16 * 1024 * 1024 {
+        return Err("too big".to_owned());
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(v["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_ENTRIES)
+        .filter_map(|e| {
+            let text: String = e["text"].as_str()?.chars().take(MAX_TEXT).collect();
+            Some(match e["kind"].as_str()? {
+                "user" => Entry::User {
+                    text,
+                    refs: Vec::new(),
+                },
+                "agent" => Entry::Agent(text),
+                "tool" => Entry::Tool(Tool {
+                    title: text,
+                    status: e["status"].as_str().unwrap_or("completed").to_owned(),
+                    ..Tool::default()
+                }),
+                "plan" => Entry::Plan(text.lines().map(|l| (l.to_owned(), Step::Done)).collect()),
+                _ => Entry::Note {
+                    text,
+                    bad: e["bad"].as_bool().unwrap_or(false),
+                },
+            })
+        })
+        .collect())
 }
 
 /// adds `more` to a streamed message, up to the cap.
@@ -1022,6 +1249,51 @@ pub fn lines_of(text: &str, line: Option<usize>, limit: Option<usize>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_conversation_reads_back() {
+        let mut c = chat();
+        assert!(c.record().is_none(), "nothing said, nothing kept");
+        c.entries.push(Entry::User {
+            text: "fix the bug".to_owned(),
+            refs: Vec::new(),
+        });
+        c.entries.push(Entry::Thought("hm".to_owned()));
+        c.entries.push(Entry::Agent("done".to_owned()));
+        let record = c.record().expect("a record");
+        assert_eq!(record["title"], "fix the bug");
+        let dir = std::env::temp_dir().join(format!("ligase-past-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("one.json");
+        std::fs::write(&file, record.to_string()).expect("write");
+        let back = past(&file).expect("read");
+        assert_eq!(back.len(), 2, "thoughts are not kept");
+        assert!(matches!(&back[0], Entry::User { text, .. } if text == "fix the bug"));
+        assert!(matches!(&back[1], Entry::Agent(t) if t == "done"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_history_files_do_not_panic() {
+        let dir = std::env::temp_dir().join(format!("ligase-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cases = [
+            "",
+            "{",
+            "[]",
+            r#"{"entries": 5}"#,
+            r#"{"entries": [1, null, {"kind": 3}, {"text": "x"}, {"kind": "tool", "text": "t", "status": 9}]}"#,
+        ];
+        for (i, text) in cases.iter().enumerate() {
+            let file = dir.join(format!("{i}.json"));
+            std::fs::write(&file, text).expect("write");
+            if let Ok(entries) = past(&file) {
+                assert!(entries.len() <= 1, "{text}");
+            }
+        }
+        assert!(past(&dir.join("missing.json")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn chat() -> Chat {
         Chat::new(
