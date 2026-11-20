@@ -399,7 +399,8 @@ impl Chat {
     /// it isn't up; false when there is nothing to send or the agent is busy.
     pub fn send(&mut self) -> bool {
         let text = self.input.trim().to_owned();
-        if text.is_empty() || self.state == State::Working {
+        // one message at a time: one out, or one waiting for the session
+        if text.is_empty() || self.state == State::Working || self.queued.is_some() {
             return false;
         }
         let refs = std::mem::take(&mut self.refs);
@@ -597,11 +598,13 @@ impl Chat {
                 if let Some(why) = why {
                     self.note(why.to_owned(), stop == "refusal");
                 }
-                self.permission = None;
+                // a card left from the turn still gets its answer
+                self.stop_permission();
             }
             (Pending::Prompt, Err(fail)) => {
                 self.state = State::Ready;
                 self.stopping = false;
+                self.stop_permission();
                 self.note(fail.message, true);
             }
             (Pending::Init | Pending::Session | Pending::SignIn, Err(fail)) => {
@@ -652,6 +655,13 @@ impl Chat {
                     path,
                     text: text.to_owned(),
                 })
+            }
+            // after stop, nothing more is allowed this turn
+            "session/request_permission" if self.stopping => {
+                if let Some(pipe) = &self.pipe {
+                    pipe.reply(&id, Ok(json!({"outcome": {"outcome": "cancelled"}})));
+                }
+                None
             }
             "session/request_permission" => {
                 let call = &params["toolCall"];
@@ -1092,6 +1102,17 @@ mod tests {
         assert_eq!(queued[1]["name"], "a.rs:3-9");
         c.input = "  ".into();
         assert!(!c.send(), "nothing typed");
+    }
+
+    #[test]
+    fn a_second_message_never_replaces_a_waiting_one() {
+        let mut c = chat();
+        c.input = "first".into();
+        assert!(c.send());
+        c.input = "second".into();
+        assert!(!c.send(), "the first still waits for the session");
+        assert_eq!(c.input, "second", "kept to send later");
+        assert_eq!(c.queued.as_ref().unwrap()[0]["text"], "first");
     }
 
     #[test]
