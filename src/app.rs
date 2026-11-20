@@ -74,6 +74,8 @@ pub enum Id {
     AgentLink(u16),
     AgentInput,
     AgentList,
+    /// an agent change's card in an editor, by part.
+    AgentMark(ViewId, u16),
     /// a picture tab, by its number; its tools by number too.
     Picture(u32),
     PictureTool(u32),
@@ -706,6 +708,9 @@ pub struct App {
     settings: Settings,
     /// server edits for files still being read, put in once they are.
     waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
+    /// agent writes to files being opened for them: the document, the
+    /// request, the path and the text.
+    agent_waiting: Vec<(DocumentId, serde_json::Value, PathBuf, String)>,
     /// replace all waiting on files to load: the query and what replaces it.
     waiting_replace: Vec<(DocumentId, String, String, crate::search::Opts)>,
     sheet: settings::view::Sheet,
@@ -854,6 +859,7 @@ impl App {
             settings: Settings::default(),
             closed: Vec::new(),
             waiting_edits: Vec::new(),
+            agent_waiting: Vec::new(),
             waiting_replace: Vec::new(),
             sheet: settings::view::Sheet::default(),
             extensions: Extensions::default(),
@@ -1496,6 +1502,13 @@ impl App {
                 .filter(|d| d.load == document::Load::Ready)
                 .map(|d| String::from(&d.buffer.snapshot()));
             if let Some(now) = now {
+                // the file before the agent's changes still waiting: the new
+                // marks are against it, so kept ones stay kept
+                let base = self
+                    .docs
+                    .doc_of(view)
+                    .and_then(|d| document::before_agent(&now, &d.agent))
+                    .unwrap_or_else(|| now.clone());
                 let (range, middle) = smallest_edit(&now, &text);
                 let same = range.is_empty() && middle.is_empty();
                 let doc = self.docs.view(view).map(|v| v.doc);
@@ -1518,10 +1531,36 @@ impl App {
                 }
                 // answered by after_save, once the disk says how it went
                 if let Some(doc) = doc {
+                    if let Some(marks) = self.docs.agent_marks(doc) {
+                        *marks = document::agent_marks(&base, &text);
+                    }
                     self.agent_saves.push((doc, id));
                 }
                 self.save_with(view, false);
                 return;
+            }
+        }
+        // a file there but not open: it opens, and the write goes in once
+        // it is read, so the change can be looked over and undone
+        if path.is_file() && !viewer::is_picture(&path) {
+            let view = self.open_file_quiet(&path);
+            if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
+                let loading = self
+                    .docs
+                    .doc(doc)
+                    .is_some_and(|d| d.load == document::Load::Loading);
+                if loading {
+                    self.agent_waiting.push((doc, id, path, text));
+                    return;
+                }
+                if self
+                    .docs
+                    .doc(doc)
+                    .is_some_and(|d| d.load == document::Load::Ready)
+                {
+                    self.agent_write(id, path, text);
+                    return;
+                }
             }
         }
         self.jobs.run(move || {
@@ -4174,6 +4213,109 @@ impl App {
         }
     }
 
+    /// a click on the agent's changes in `view`: keep one or all, undo one
+    /// or all as a plain edit that undo can take back, or show what was
+    /// there.
+    fn review(&mut self, view: ViewId, ask: editor::Review) {
+        use editor::Review;
+        let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
+            return;
+        };
+        let marks = self
+            .docs
+            .doc(doc)
+            .map(|d| d.agent.clone())
+            .unwrap_or_default();
+        match ask {
+            Review::Show(k) => {
+                if let Some(v) = self.docs.view_mut(view) {
+                    v.old_shown = if v.old_shown == Some(k) {
+                        None
+                    } else {
+                        Some(k)
+                    };
+                }
+                return;
+            }
+            Review::Keep(k) => {
+                if let Some(m) = self.docs.agent_marks(doc)
+                    && k < m.len()
+                {
+                    m.remove(k);
+                }
+            }
+            Review::KeepAll => {
+                if let Some(m) = self.docs.agent_marks(doc) {
+                    m.clear();
+                }
+            }
+            Review::Undo(k) => {
+                let Some(mark) = marks.get(k) else { return };
+                if !self
+                    .docs
+                    .edit(view, vec![(mark.range.clone(), mark.old.clone())], false)
+                {
+                    self.say(self.texts.tr("The change could not be undone").to_owned());
+                    return;
+                }
+                if let Some(m) = self.docs.agent_marks(doc)
+                    && k < m.len()
+                {
+                    m.remove(k);
+                }
+                self.save_with(view, false);
+            }
+            Review::UndoAll => {
+                // last first, so the earlier places don't move
+                let mut edits: Vec<_> = marks
+                    .iter()
+                    .map(|m| (m.range.clone(), m.old.clone()))
+                    .collect();
+                edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+                if !self.docs.edit(view, edits, false) {
+                    self.say(self.texts.tr("The change could not be undone").to_owned());
+                    return;
+                }
+                if let Some(m) = self.docs.agent_marks(doc) {
+                    m.clear();
+                }
+                self.save_with(view, false);
+            }
+        }
+        if let Some(v) = self.docs.view_mut(view) {
+            v.old_shown = None;
+        }
+    }
+
+    /// agent changes taken back some other way (ctrl+z, typed over, the
+    /// file read again) stop asking to be looked over.
+    fn drop_undone_marks(&mut self) {
+        let stale: Vec<DocumentId> = self
+            .docs
+            .all_with_ids()
+            .filter(|(_, d)| {
+                let text = d.buffer.text();
+                d.agent.iter().any(|m| {
+                    m.range.end > text.len()
+                        || text.slice(m.range.clone()).is_ok_and(|now| now == m.old)
+                })
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in stale {
+            let Some(text) = self
+                .docs
+                .doc(id)
+                .map(|d| String::from(&d.buffer.snapshot()))
+            else {
+                continue;
+            };
+            if let Some(marks) = self.docs.agent_marks(id) {
+                marks.retain(|m| text.get(m.range.clone()).is_some_and(|now| now != m.old));
+            }
+        }
+    }
+
     /// a picture file opens in a picture tab, the one already open for it if
     /// any. false for files that aren't pictures.
     fn open_picture(&mut self, path: &Path) -> bool {
@@ -4515,6 +4657,7 @@ impl App {
     fn poll(&mut self) {
         self.finder.poll();
         self.poll_agent();
+        self.drop_undone_marks();
         self.watcher.watch(self.docs.on_disk());
         if self.watcher.take_changed() {
             self.check_disk();
@@ -4670,6 +4813,14 @@ impl App {
                     self.docs.set_disk(doc, disk);
                     self.ask_git_base(doc);
                     self.replace_waiting(doc);
+                    // agent writes that waited for the file: it is open now
+                    let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.agent_waiting)
+                        .into_iter()
+                        .partition(|w| w.0 == doc);
+                    self.agent_waiting = later;
+                    for (_, id, path, text) in now {
+                        self.agent_write(id, path, text);
+                    }
                     let waiting: Vec<_> = self
                         .waiting_edits
                         .iter()
@@ -5300,6 +5451,7 @@ impl App {
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let mut crumb: Option<(editor::Crumb, ViewId)> = None;
+        let mut review: Option<(editor::Review, ViewId)> = None;
         let mut remote_asked: Option<crate::remote::browse::Ask> = None;
         let mut read_ask: Option<(ViewId, crate::preview::Ask)> = None;
         let mut pointer: Option<(ViewId, usize, aurea::render::Point)> = None;
@@ -5464,6 +5616,9 @@ impl App {
                         }
                         if let Some(c) = shown.crumb {
                             crumb = Some((c, view));
+                        }
+                        if let Some(r) = shown.review {
+                            review = Some((r, view));
                         }
                         if let Some((at, p)) = shown.pointing {
                             pointer = Some((view, at, p));
@@ -5949,6 +6104,9 @@ impl App {
                 self.run(Command::TogglePreview);
             }
             None => {}
+        }
+        if let Some((r, view)) = review {
+            self.review(view, r);
         }
         if let Some((c, view)) = crumb {
             self.last_editor = Some(view);

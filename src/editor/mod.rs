@@ -17,7 +17,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use aurea::render::{Color, Font, Point, Rect};
-use aurea::ui::{Align, Channel, Palette, ScrollArea, Sense, Ui};
+use aurea::ui::{Align, Button, Channel, Palette, ScrollArea, Sense, Ui};
 use aurea::{AureaResult, CursorIcon};
 use resolvase::{Encoding, TextSnapshot};
 
@@ -769,6 +769,102 @@ pub struct Shown {
     pub crumb: Option<Crumb>,
     /// the text offset under the pointer, and where the pointer is.
     pub pointing: Option<(usize, Point)>,
+    /// what the agent change marks asked for.
+    pub review: Option<Review>,
+}
+
+/// what a click on the agent's changes asks for, by change number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Review {
+    Keep(usize),
+    Undo(usize),
+    /// the old text under the change, or not.
+    Show(usize),
+    KeepAll,
+    UndoAll,
+}
+
+/// height of the bar over a file the agent changed.
+const REVIEW_BAR: f32 = 30.0;
+
+/// the bar over a file with agent changes: how many, a step to the next
+/// or last one, and keep or undo them all.
+fn review_bar(
+    ui: &mut Ui<'_, Id>,
+    id: ViewId,
+    doc: &Document,
+    view: &mut View,
+    bar: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Review>> {
+    let palette = ui.theme.palette;
+    let small = ui.theme.font(12.0);
+    ui.fill(bar, palette.raised.fade(0.7))?;
+    ui.fill(
+        Rect::new(bar.x, bar.bottom() - 1.0, bar.width, 1.0),
+        palette.border,
+    )?;
+    let icon = Rect::new(bar.x + 10.0, bar.y + (bar.height - 14.0) / 2.0, 14.0, 14.0);
+    crate::icons::draw(ui, "agent", icon, palette.accent)?;
+    let n = doc.agent.len();
+    let label = if n == 1 {
+        texts.tr("1 change by the agent").to_owned()
+    } else {
+        format!("{n} {}", texts.tr("changes by the agent"))
+    };
+    let mut ask = None;
+    let mut x = bar.right() - 6.0;
+    let mut button =
+        |ui: &mut Ui<'_, Id>, label: &str, part: u16, primary: bool| -> AureaResult<bool> {
+            let w = ui.text_width(label, &small) + 20.0;
+            x -= w + 4.0;
+            let at = Rect::new(x, bar.y + 4.0, w, bar.height - 8.0);
+            let b = Button::new(label);
+            let b = if primary { b.primary() } else { b.quiet() };
+            Ok(b.show(ui, Id::AgentMark(id, u16::MAX - part), at)?.clicked)
+        };
+    if button(ui, texts.tr("Keep all"), 0, true)? {
+        ask = Some(Review::KeepAll);
+    }
+    if button(ui, texts.tr("Undo all"), 1, false)? {
+        ask = Some(Review::UndoAll);
+    }
+    let caret = view.sel.head;
+    let mut starts: Vec<usize> = doc.agent.iter().map(|m| m.range.start).collect();
+    starts.sort_unstable();
+    let next = starts
+        .iter()
+        .find(|&&s| s > caret)
+        .or(starts.first())
+        .copied();
+    let prev = starts
+        .iter()
+        .rev()
+        .find(|&&s| s < caret)
+        .or(starts.last())
+        .copied();
+    if button(ui, "↓", 2, false)?
+        && let Some(at) = next
+    {
+        view.sel = cursor::Selection::caret(at);
+        view.extra.clear();
+        view.reveal = true;
+    }
+    if button(ui, "↑", 3, false)?
+        && let Some(at) = prev
+    {
+        view.sel = cursor::Selection::caret(at);
+        view.extra.clear();
+        view.reveal = true;
+    }
+    let words = Rect::new(
+        icon.right() + 8.0,
+        bar.y,
+        (x - icon.right() - 12.0).max(0.0),
+        bar.height,
+    );
+    ui.text_clipped(&label, words, &small, palette.text, Align::Start)?;
+    Ok(ask)
 }
 
 /// what a click on the breadcrumb asks for.
@@ -1235,8 +1331,40 @@ pub fn show(
         }
         Load::Ready => {}
     }
+    // the agent's changes waiting to be looked over: a bar to go through them
+    let rect = if doc.agent.is_empty() {
+        rect
+    } else {
+        let (bar, rest) = rect.split_top(REVIEW_BAR, 0.0);
+        shown.review = review_bar(ui, id, doc, view, bar, texts)?;
+        rest
+    };
     let text = doc.buffer.text();
     let lines = text.line_count();
+    // each change by lines: first, last, only a deletion, lines added, lines gone
+    let agent_lines: Vec<(usize, usize, bool, usize, usize)> = doc
+        .agent
+        .iter()
+        .map(|m| {
+            let a = text.line_of(m.range.start).unwrap_or(0);
+            let gone = m.range.is_empty();
+            let b = if gone {
+                a
+            } else {
+                text.line_of(m.range.end.saturating_sub(1).max(m.range.start))
+                    .unwrap_or(a)
+            };
+            (
+                a,
+                b,
+                gone,
+                if gone { 0 } else { b - a + 1 },
+                m.old.lines().count(),
+            )
+        })
+        .collect();
+    let mut review = None;
+    let old_shown = view.old_shown.filter(|k| *k < doc.agent.len());
     let digits = lines.to_string().len().max(3);
     // numbers, then fold arrows, then the problem mark
     let gutter = ui.text_width(&"0".repeat(digits), &font) + 34.0;
@@ -1674,6 +1802,23 @@ pub fn show(
                         let row = Rect::new(area.x, y, area.width, line_h);
                         ui.fill(row, palette.raised.fade(0.45))?;
                     }
+                    // the agent's new lines tinted, a red rule where lines went
+                    for (a, b, gone, _, _) in &agent_lines {
+                        if *gone {
+                            if line == *a && first_piece {
+                                ui.fill(
+                                    Rect::new(area.x, y, area.width, 2.0),
+                                    palette.danger.fade(0.7),
+                                )?;
+                            }
+                        } else if (*a..=*b).contains(&line) {
+                            ui.fill(
+                                Rect::new(area.x, y, area.width, line_h),
+                                palette.success.fade(0.12),
+                            )?;
+                            ui.fill(Rect::new(area.x, y, 3.0, line_h), palette.success.fade(0.8))?;
+                        }
+                    }
                     // indent guides; a blank line keeps the ones above it
                     // guides follow a line's indent, on its first row only
                     let levels = if first_piece {
@@ -1815,6 +1960,92 @@ pub fn show(
                         let dots = Rect::new(body.x + drawn_w + 6.0, y + 3.0, 26.0, line_h - 6.0);
                         ui.round(dots, 4.0, palette.raised)?;
                         ui.text("⋯", dots, &font, palette.dim, Align::Center)?;
+                    }
+                }
+                // a card on each change's first row: what changed, keep, undo;
+                // the old text under the change while asked
+                let small = ui.theme.font(11.5);
+                for (k, (a, b, _, adds, dels)) in agent_lines.iter().enumerate() {
+                    let Some(i) = visible.iter().position(|v| v.0 == *a && v.2) else {
+                        continue;
+                    };
+                    let y = row_y(i);
+                    let card_w = 176.0_f32.min(area.width);
+                    let card =
+                        Rect::new(area.right() - card_w - 6.0, y + 1.0, card_w, line_h - 2.0);
+                    ui.round(card, 6.0, palette.raised)?;
+                    let (undo, rest) = card.split_right(54.0, 2.0);
+                    let (keep, counts) = rest.split_right(50.0, 2.0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let part = (k as u16).saturating_mul(3);
+                    let show = ui.interact(Id::AgentMark(id, part), 0, counts, Sense::Click, true);
+                    if show.hovered {
+                        ui.set_cursor(CursorIcon::Pointer);
+                    }
+                    let open = old_shown == Some(k);
+                    let label = format!("{} −{dels} +{adds}", if open { "▾" } else { "▸" });
+                    ui.text(&label, counts, &small, palette.dim, Align::Center)?;
+                    if show.clicked {
+                        review = Some(Review::Show(k));
+                    }
+                    if Button::new(texts.tr("Keep"))
+                        .quiet()
+                        .show(ui, Id::AgentMark(id, part + 1), keep)?
+                        .clicked
+                    {
+                        review = Some(Review::Keep(k));
+                    }
+                    if Button::new(texts.tr("Undo"))
+                        .quiet()
+                        .show(ui, Id::AgentMark(id, part + 2), undo)?
+                        .clicked
+                    {
+                        review = Some(Review::Undo(k));
+                    }
+                    if open {
+                        let old: Vec<&str> = doc.agent[k].old.lines().take(40).collect();
+                        let below = visible
+                            .iter()
+                            .rposition(|v| v.0 == *b && v.3)
+                            .map_or(y + line_h, |j| row_y(j) + line_h);
+                        #[allow(clippy::cast_precision_loss)]
+                        let h = (old.len().max(1) as f32) * line_h + 8.0;
+                        let boxed =
+                            Rect::new(area.x + 6.0, below + 2.0, (area.width - 12.0).max(0.0), h);
+                        ui.round(boxed, 6.0, palette.background)?;
+                        ui.round(boxed, 6.0, palette.danger.fade(0.12))?;
+                        ui.border(boxed, 6.0, 1.0, palette.danger.fade(0.4))?;
+                        if old.is_empty() {
+                            let row = Rect::new(
+                                boxed.x + 10.0,
+                                boxed.y + 4.0,
+                                boxed.width - 20.0,
+                                line_h,
+                            );
+                            ui.text(
+                                texts.tr("(nothing was here)"),
+                                row,
+                                &small,
+                                palette.dim,
+                                Align::Start,
+                            )?;
+                        }
+                        for (j, l) in old.iter().enumerate() {
+                            #[allow(clippy::cast_precision_loss)]
+                            let row = Rect::new(
+                                body_x,
+                                boxed.y + 4.0 + j as f32 * line_h,
+                                boxed.right() - body_x,
+                                line_h,
+                            );
+                            ui.text_clipped(
+                                &l.replace('\t', tab),
+                                row,
+                                &font,
+                                palette.dim,
+                                Align::Start,
+                            )?;
+                        }
                     }
                 }
 
@@ -2003,6 +2234,7 @@ pub fn show(
     view.wrap = cache;
     multi::merge(view);
     view.preedit = preedit;
+    shown.review = review.or(shown.review);
     Ok(shown)
 }
 
