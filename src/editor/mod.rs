@@ -600,22 +600,54 @@ pub fn tidy_for_save(docs: &mut Documents, view: ViewId, trim: bool, final_newli
         return false;
     }
     doc.buffer.break_join();
-    // the caret stays where it was, or as near as the text allows
+    // the caret stays on its text: moved along the edits, on a char edge
     let keep = docs.view(view).map(|v| (v.sel, v.extra.clone()));
+    let spans: Vec<(Range<usize>, usize)> =
+        edits.iter().map(|(r, t)| (r.clone(), t.len())).collect();
     let done = docs.edit(view, edits, false);
     if let (true, Some((sel, extra))) = (done, keep)
         && let Some((doc, v)) = docs.editable(view)
     {
-        let len = doc.buffer.len();
-        let clamp = move |s: Selection| Selection {
-            anchor: s.anchor.min(len),
-            head: s.head.min(len),
+        let text = doc.buffer.text();
+        let len = text.len();
+        let edge = |mut at: usize| {
+            at = at.min(len);
+            while at > 0 && text.slice(at..at).is_err() {
+                at -= 1;
+            }
+            at
         };
-        v.extra = extra.into_iter().map(clamp).collect();
-        v.sel = clamp(sel);
+        let along = |at: usize| edge(moved_along(at, &spans));
+        let map = |s: Selection| Selection {
+            anchor: along(s.anchor),
+            head: along(s.head),
+        };
+        v.extra = extra.into_iter().map(map).collect();
+        v.sel = map(sel);
         multi::merge(v);
     }
     done
+}
+
+/// where offset `at` goes after `spans` (each a range replaced by text of
+/// that many bytes, in order, not overlapping): edits before it shift it,
+/// one around it keeps it inside the new text.
+fn moved_along(at: usize, spans: &[(Range<usize>, usize)]) -> usize {
+    let mut shift: isize = 0;
+    let mut sorted: Vec<&(Range<usize>, usize)> = spans.iter().collect();
+    sorted.sort_by_key(|(r, _)| r.start);
+    for (range, new_len) in sorted {
+        if range.end <= at {
+            shift += *new_len as isize - range.len() as isize;
+        } else if range.start < at {
+            // inside a replaced stretch: as far in as the new text goes
+            let inside = (at - range.start).min(*new_len);
+            return (range.start as isize + shift) as usize + inside;
+        } else {
+            break;
+        }
+    }
+    (at as isize + shift).max(0) as usize
 }
 
 /// a fold command the app asks for.
@@ -2011,6 +2043,17 @@ fn severity_colour(palette: &Palette, severity: Severity) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offsets_move_along_edits() {
+        // "a  " then a line break and "가나": the two spaces go; 나 moves from 7 to 5
+        let spans = vec![(1..3, 0)];
+        assert_eq!(moved_along(7, &spans), 5);
+        assert_eq!(moved_along(1, &spans), 1);
+        assert_eq!(moved_along(2, &spans), 1, "inside: to the new text's end");
+        assert_eq!(moved_along(0, &[(5..5, 1)]), 0);
+        assert_eq!(moved_along(9, &[(5..5, 1), (1..2, 0)]), 9);
+    }
     use crate::editor::cursor::Motion;
     use std::path::Path;
 
