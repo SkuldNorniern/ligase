@@ -379,3 +379,5 @@
 "Connect" = "연결"
 "Known hosts" = "아는 호스트"
 "No matches" = "결과 없음"
+"Match case" = "대소문자 구분"
+"Whole word" = "단어 단위"

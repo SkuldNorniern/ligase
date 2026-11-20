@@ -27,14 +27,14 @@ pub enum Mode {
     Rename,
 }
 
-/// every match of `query` in `text`, smart case, at most `MAX_HITS`.
+/// every match of `query` in `text` with `opts`, at most `MAX_HITS`.
 /// runs on the worker.
-pub fn find_all(text: &TextSnapshot, query: &str) -> Vec<Range<usize>> {
+pub fn find_all(text: &TextSnapshot, query: &str, opts: crate::search::Opts) -> Vec<Range<usize>> {
     let mut hits = Vec::new();
     if query.is_empty() {
         return hits;
     }
-    let matcher = crate::search::matcher(query);
+    let matcher = crate::search::matcher_with(query, opts);
     // one walk over the text: a lookup per line costs about 15x more
     for (start, s) in text.lines() {
         let range = start..start + s.len();
@@ -269,10 +269,25 @@ mod tests {
     #[test]
     fn finds_every_match_smart_case() {
         let t = TextBuffer::from_text("Foo foo\r\nxfoo\n가foo").snapshot();
-        assert_eq!(find_all(&t, "foo"), vec![0..3, 4..7, 10..13, 17..20]);
-        assert_eq!(find_all(&t, "Foo"), vec![0..3]);
-        assert!(find_all(&t, "").is_empty());
-        assert!(find_all(&t, "zz").is_empty());
+        let smart = crate::search::Opts::default();
+        assert_eq!(find_all(&t, "foo", smart), vec![0..3, 4..7, 10..13, 17..20]);
+        assert_eq!(find_all(&t, "Foo", smart), vec![0..3]);
+        assert!(find_all(&t, "", smart).is_empty());
+        assert!(find_all(&t, "zz", smart).is_empty());
+        let case = crate::search::Opts {
+            case: true,
+            whole: false,
+        };
+        assert_eq!(find_all(&t, "foo", case), vec![4..7, 10..13, 17..20]);
+        let whole = crate::search::Opts {
+            case: false,
+            whole: true,
+        };
+        assert_eq!(
+            find_all(&t, "foo", whole),
+            vec![0..3, 4..7],
+            "xfoo and 가foo touch a word"
+        );
     }
 
     #[test]

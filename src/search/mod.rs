@@ -60,9 +60,12 @@ pub struct Finder {
     /// what replace all puts in place of each hit.
     pub replace: String,
     pub hits: Vec<Hit>,
-    /// the query the hits were found with; none for hits from elsewhere
-    /// (references), which replace must never take as text to change.
-    pub searched: Option<String>,
+    /// match case and whole word, for the next search.
+    pub opts: Opts,
+    /// the query and options the hits were found with; none for hits from
+    /// elsewhere (references), which replace must never take as text to
+    /// change.
+    pub searched: Option<(String, Opts)>,
     /// for each hit, the walk order of its file, so readers finishing out
     /// of turn still list in order.
     order: Vec<usize>,
@@ -82,11 +85,15 @@ impl Finder {
     /// from, while the box still says it and the cap didn't cut the search
     /// short. none otherwise, so a changed box or a reference list never
     /// gets replaced.
-    pub fn replaceable(&self) -> Option<&str> {
-        let searched = self.searched.as_deref()?;
-        let whole = matches!(self.done, Some((_, false)));
-        (whole && !self.hits.is_empty() && !self.searching() && searched == self.query)
-            .then_some(searched)
+    pub fn replaceable(&self) -> Option<(&str, Opts)> {
+        let (searched, opts) = self.searched.as_ref()?;
+        let complete = matches!(self.done, Some((_, false)));
+        (complete
+            && !self.hits.is_empty()
+            && !self.searching()
+            && *searched == self.query
+            && *opts == self.opts)
+            .then_some((searched.as_str(), *opts))
     }
 
     /// shows `hits` found some other way (a language server's references)
@@ -114,7 +121,7 @@ impl Finder {
         self.hits.clear();
         self.order.clear();
         self.done = None;
-        self.searched = (!self.query.is_empty()).then(|| self.query.clone());
+        self.searched = (!self.query.is_empty()).then(|| (self.query.clone(), self.opts));
         self.selected = None;
         self.scroll = 0.0;
         if self.query.is_empty() {
@@ -125,6 +132,7 @@ impl Finder {
         let quit = Arc::clone(&stop);
         let root = root.to_path_buf();
         let query = self.query.clone();
+        let opts = self.opts;
         let started = std::thread::Builder::new()
             .name("ligase-search".into())
             .spawn(move || {
@@ -133,7 +141,7 @@ impl Finder {
                         request_canvas_redraw(id);
                     }
                 };
-                let (files, capped) = walk(&root, &query, &quit, &mut |n, hits| {
+                let (files, capped) = walk(&root, &query, opts, &quit, &mut |n, hits| {
                     let _ = tx.send(Found::Hits(n, hits));
                     wake();
                 });
@@ -163,6 +171,45 @@ impl Finder {
         if finished.is_some() {
             self.done = finished;
             self.running = None;
+        }
+    }
+}
+
+/// how a query matches: smart case unless `case`, anywhere unless `whole`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Opts {
+    /// capitals count even in a query with none.
+    pub case: bool,
+    /// only where neither side touches a letter, digit or `_`.
+    pub whole: bool,
+}
+
+/// a word character, for whole-word matches.
+fn wordy(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// the first match of `query` in a line with `opts`: (byte start, byte
+/// length), on char edges.
+pub fn matcher_with(query: &str, opts: Opts) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
+    let smart = matcher(query);
+    move |line: &str| {
+        let mut from = 0;
+        loop {
+            let rest = line.get(from..)?;
+            let (at, len) = if opts.case {
+                rest.find(query).map(|at| (at, query.len()))?
+            } else {
+                smart(rest)?
+            };
+            let (start, end) = (from + at, from + at + len);
+            let before = line[..start].chars().next_back().is_some_and(wordy);
+            let after = line[end..].chars().next().is_some_and(wordy);
+            if !opts.whole || (!before && !after) {
+                return Some((start, len));
+            }
+            // past this one's first char and look again
+            from = start + line[start..].chars().next().map_or(1, char::len_utf8);
         }
     }
 }
@@ -285,6 +332,7 @@ const BATCH: usize = 64;
 fn walk(
     root: &Path,
     query: &str,
+    opts: Opts,
     stop: &AtomicBool,
     send: &mut (dyn FnMut(usize, Vec<Hit>) + Send),
 ) -> (usize, bool) {
@@ -309,7 +357,7 @@ fn walk(
                             continue;
                         };
                         read.fetch_add(1, Ordering::Relaxed);
-                        let mut hits: Vec<Hit> = matches(&text, query)
+                        let mut hits: Vec<Hit> = matches(&text, query, opts)
                             .into_iter()
                             .map(|(line, column, len, body)| Hit {
                                 path: path.clone(),
@@ -360,7 +408,7 @@ pub fn grep(root: &Path, query: &str, max: usize) -> Vec<Hit> {
     let stop = AtomicBool::new(false);
     let found: Mutex<Vec<(usize, Vec<Hit>)>> = Mutex::default();
     let count = AtomicUsize::new(0);
-    walk(root, query, &stop, &mut |n, hits| {
+    walk(root, query, Opts::default(), &stop, &mut |n, hits| {
         let total = count.fetch_add(hits.len(), Ordering::Relaxed) + hits.len();
         if let Ok(mut f) = found.lock() {
             f.push((n, hits));
@@ -409,11 +457,13 @@ fn preview(body: &str) -> String {
 /// length, the line without its ending), smart case like [`matcher`]. an
 /// ascii query is found in the whole text at once, in a copy lowered once
 /// for any case, not a line at a time.
-fn matches<'t>(text: &'t str, query: &str) -> Vec<(usize, usize, usize, &'t str)> {
+fn matches<'t>(text: &'t str, query: &str, opts: Opts) -> Vec<(usize, usize, usize, &'t str)> {
     let mut out = Vec::new();
     let fold = !query.chars().any(char::is_uppercase);
-    if query.is_empty() || (fold && !query.is_ascii()) {
-        let find = matcher(query);
+    // an option on: line by line, the plain way; the fast way is for the
+    // smart case search most are
+    if query.is_empty() || opts != Opts::default() || (fold && !query.is_ascii()) {
+        let find = matcher_with(query, opts);
         for (line, body) in text.lines().enumerate() {
             if let Some((column, len)) = find(body) {
                 out.push((line, column, len, body));
@@ -492,9 +542,15 @@ mod tests {
         std::fs::write(dir.join("d.txt"), "가 needle\r\n").unwrap();
         let mut hits = Vec::new();
         let mut batches = Vec::new();
-        let (files, capped) = walk(&dir, "needle", &AtomicBool::new(false), &mut |n, h| {
-            batches.push((n, h));
-        });
+        let (files, capped) = walk(
+            &dir,
+            "needle",
+            Opts::default(),
+            &AtomicBool::new(false),
+            &mut |n, h| {
+                batches.push((n, h));
+            },
+        );
         // readers finish in any order; the walk order puts them back
         batches.sort_by_key(|b| b.0);
         hits.extend(batches.into_iter().flat_map(|b| b.1));
@@ -540,7 +596,11 @@ mod tests {
                     .enumerate()
                     .filter_map(|(i, body)| find(body).map(|(c, l)| (i, c, l, body)))
                     .collect();
-                assert_eq!(matches(&text, query), want, "{text:?} {query:?}");
+                assert_eq!(
+                    matches(&text, query, Opts::default()),
+                    want,
+                    "{text:?} {query:?}"
+                );
             }
         }
     }
@@ -611,10 +671,13 @@ mod tests {
         assert_eq!(f.replaceable(), None);
         // a finished search, then the box changed
         f.query = "old".to_owned();
-        f.searched = Some("old".to_owned());
+        f.searched = Some(("old".to_owned(), Opts::default()));
         f.hits = vec![hit];
         f.done = Some((1, false));
-        assert_eq!(f.replaceable(), Some("old"));
+        assert_eq!(f.replaceable(), Some(("old", Opts::default())));
+        f.opts.whole = true;
+        assert_eq!(f.replaceable(), None, "the options moved on");
+        f.opts.whole = false;
         f.query = "older".to_owned();
         assert_eq!(f.replaceable(), None, "the box moved on");
         f.query = "old".to_owned();
@@ -625,9 +688,13 @@ mod tests {
     #[test]
     fn stop_ends_walk() {
         let mut hits = Vec::new();
-        let (files, _) = walk(Path::new("."), "x", &AtomicBool::new(true), &mut |_, h| {
-            hits.extend(h)
-        });
+        let (files, _) = walk(
+            Path::new("."),
+            "x",
+            Opts::default(),
+            &AtomicBool::new(true),
+            &mut |_, h| hits.extend(h),
+        );
         assert_eq!(files, 0);
         assert!(hits.is_empty());
     }

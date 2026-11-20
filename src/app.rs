@@ -77,6 +77,8 @@ pub enum Id {
     AgentField(u16),
     /// the language server list in settings, by row and part.
     ServerField(u16),
+    /// find in files' match case and whole word.
+    SearchOption(u16),
     /// the remote panel's tool buttons.
     RemoteTool(u16),
     RemoteSearch,
@@ -657,7 +659,7 @@ pub struct App {
     /// server edits for files still being read, put in once they are.
     waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
     /// replace all waiting on files to load: the query and what replaces it.
-    waiting_replace: Vec<(DocumentId, String, String)>,
+    waiting_replace: Vec<(DocumentId, String, String, crate::search::Opts)>,
     sheet: settings::view::Sheet,
     extensions: Extensions,
     /// what each extension view keeps, by its number.
@@ -3342,7 +3344,7 @@ impl App {
         let text = doc.buffer.snapshot();
         let (d, r, q) = key;
         let job = move || {
-            let hits = find::find_all(&text, &q);
+            let hits = find::find_all(&text, &q, crate::search::Opts::default());
             Done::Found(d, r, q, hits)
         };
         self.jobs.run(job);
@@ -3680,7 +3682,7 @@ impl App {
     /// saving, never a silent write. the matches are found again in the text
     /// as it is, so a file changed since the search is still right.
     fn replace_all(&mut self) {
-        let Some(query) = self.finder.replaceable().map(str::to_owned) else {
+        let Some((query, opts)) = self.finder.replaceable().map(|(q, o)| (q.to_owned(), o)) else {
             let why = if matches!(self.finder.done, Some((_, true))) {
                 "Too many matches to replace all; narrow the search first"
             } else {
@@ -3704,7 +3706,7 @@ impl App {
             let view = self.open_file(&path);
             if let Some(doc) = self.docs.view(view).map(|v| v.doc) {
                 self.waiting_replace
-                    .push((doc, query.clone(), with.clone()));
+                    .push((doc, query.clone(), with.clone(), opts));
                 self.replace_waiting(doc);
             }
         }
@@ -3726,7 +3728,7 @@ impl App {
             .cloned()
             .collect();
         self.waiting_replace.retain(|w| w.0 != doc);
-        for (_, query, with) in waiting {
+        for (_, query, with, opts) in waiting {
             let Some(view) = self
                 .docs
                 .doc(doc)
@@ -3738,7 +3740,7 @@ impl App {
             let Some(text) = self.docs.doc(doc).map(|d| d.buffer.snapshot()) else {
                 continue;
             };
-            let ranges: Vec<(Range<usize>, String)> = editor::find::find_all(&text, &query)
+            let ranges: Vec<(Range<usize>, String)> = editor::find::find_all(&text, &query, opts)
                 .into_iter()
                 .map(|r| (r, with.clone()))
                 .collect();
@@ -6860,7 +6862,7 @@ mod tests {
             preview: String::new(),
         };
         app.finder.hits = vec![hit(&a, 0), hit(&a, 1), hit(&b, 0)];
-        app.finder.searched = Some("old".to_owned());
+        app.finder.searched = Some(("old".to_owned(), search::Opts::default()));
         app.finder.done = Some((2, false));
         app.replace_all();
         // the files load on the worker; take what it sends until both are in

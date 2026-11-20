@@ -5,7 +5,7 @@ use aurea::render::{Color, Font, Rect};
 use aurea::ui::{Align, Button, ListView, TextField, Ui};
 use aurea::{AureaResult, KeyCode};
 
-use super::{Finder, Hit, matcher};
+use super::{Finder, Hit, matcher_with};
 use crate::app::Id;
 use crate::icons;
 use crate::lang::Texts;
@@ -84,6 +84,35 @@ pub fn show(
     let (note, list) = rest.split_top(NOTE, 2.0);
 
     let mut ask = None;
+    // match case and whole word sit at the field's right; a flip searches again
+    let (toggles, field) = field.split_right(56.0, 4.0);
+    for (i, (label, tip)) in [("Aa", "Match case"), ("ab", "Whole word")]
+        .into_iter()
+        .enumerate()
+    {
+        let b = Rect::new(toggles.x + i as f32 * 28.0, toggles.y, 26.0, toggles.height);
+        let on = if i == 0 {
+            finder.opts.case
+        } else {
+            finder.opts.whole
+        };
+        let n = u16::try_from(i).unwrap_or(0);
+        let pressed = Button::new(label)
+            .quiet()
+            .selected(on)
+            .show(ui, Id::SearchOption(n), b)?;
+        ui.tooltip(&pressed, texts.tr(tip));
+        if pressed.clicked {
+            if i == 0 {
+                finder.opts.case = !finder.opts.case;
+            } else {
+                finder.opts.whole = !finder.opts.whole;
+            }
+            if !finder.query.is_empty() {
+                ask = Some(Ask::Search);
+            }
+        }
+    }
     let typed = TextField::new(&mut finder.query)
         .placeholder(texts.tr("Search in files"))
         .max_chars(500)
@@ -129,7 +158,8 @@ pub fn show(
     let hits = &finder.hits;
     let groups = group(hits);
     let lines = lines(&groups);
-    let find = matcher(&finder.query);
+    let opts = finder.searched.as_ref().map_or(finder.opts, |(_, o)| *o);
+    let find = matcher_with(&finder.query, opts);
     // line numbers share one column, as wide as the widest
     let widest = hits.iter().map(|h| h.line + 1).max().unwrap_or(1);
     let number_w = ui.text_width(&widest.to_string(), &small);
