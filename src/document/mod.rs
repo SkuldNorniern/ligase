@@ -64,6 +64,58 @@ pub struct Document {
     pub untitled: bool,
     /// the file at HEAD and the lines changed since.
     pub git: crate::git::State,
+    /// changes the agent made that wait to be kept or undone.
+    pub agent: Vec<AgentMark>,
+}
+
+/// one change the agent made: where its text is now, and what it replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMark {
+    pub range: Range<usize>,
+    pub old: String,
+}
+
+/// `text` with every mark's change put back, the marks in text order and
+/// apart. what the file was before the agent's changes still waiting.
+pub fn before_agent(text: &str, marks: &[AgentMark]) -> Option<String> {
+    let mut out = text.to_owned();
+    let mut sorted: Vec<&AgentMark> = marks.iter().collect();
+    sorted.sort_by_key(|m| std::cmp::Reverse(m.range.start));
+    let mut floor = usize::MAX;
+    for m in sorted {
+        if m.range.end > floor
+            || m.range.end > out.len()
+            || !out.is_char_boundary(m.range.start)
+            || !out.is_char_boundary(m.range.end)
+        {
+            return None;
+        }
+        out.replace_range(m.range.clone(), &m.old);
+        floor = m.range.start;
+    }
+    Some(out)
+}
+
+/// the marks for `now` against `base`, by whole lines.
+pub fn agent_marks(base: &str, now: &str) -> Vec<AgentMark> {
+    let starts = |s: &str| {
+        let mut v = vec![0];
+        v.extend(s.match_indices('\n').map(|(i, _)| i + 1));
+        if *v.last().unwrap_or(&0) != s.len() {
+            v.push(s.len());
+        }
+        v
+    };
+    let (sa, sb) = (starts(base), starts(now));
+    let at = |v: &[usize], line: usize| v.get(line).copied().unwrap_or(*v.last().unwrap_or(&0));
+    crate::git::line_changes(base, now)
+        .into_iter()
+        .take(500)
+        .map(|(a, b)| AgentMark {
+            range: at(&sb, b.start)..at(&sb, b.end),
+            old: base[at(&sa, a.start)..at(&sa, a.end)].to_owned(),
+        })
+        .collect()
 }
 
 /// what a file on disk looked like, to notice outside changes.
@@ -124,6 +176,8 @@ impl Document {
 #[derive(Clone, Debug)]
 pub struct View {
     pub doc: DocumentId,
+    /// the agent change whose old text shows under it.
+    pub old_shown: Option<usize>,
     /// scroll from the top, in px.
     pub scroll: f32,
     /// scroll from the left, in px.
@@ -225,6 +279,7 @@ impl Documents {
                 asked: None,
                 diags: Vec::new(),
                 busy: Vec::new(),
+                agent: Vec::new(),
                 recent: VecDeque::new(),
                 disk: None,
                 conflict: false,
@@ -337,6 +392,7 @@ impl Documents {
                 page: 20,
                 goto: None,
                 snippet: None,
+                old_shown: None,
             },
         );
         id
@@ -344,6 +400,12 @@ impl Documents {
 
     pub fn doc(&self, id: DocumentId) -> Option<&Document> {
         self.docs.get(&id)
+    }
+
+    /// the agent's waiting changes in `id`, to set or take from.
+    pub fn agent_marks(&mut self, id: DocumentId) -> Option<&mut Vec<AgentMark>> {
+        self.changes += 1;
+        self.docs.get_mut(&id).map(|d| &mut d.agent)
     }
 
     /// a loaded document and one of its views, for edits. none while the
@@ -413,6 +475,9 @@ impl Documents {
             }
             for (range, _) in &mut d.busy {
                 *range = map_range(set, range.clone());
+            }
+            for mark in &mut d.agent {
+                mark.range = map_range(set, mark.range.clone());
             }
             d.recent.push_back(set.clone());
             if d.recent.len() > RECENT {
@@ -889,6 +954,36 @@ pub fn write_atomic(path: &Path, text: &TextSnapshot) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_marks_put_back_give_the_file_before() {
+        let base = "fn a() {}\nfn b() {}\nfn c() {}\nlast\n";
+        let now = "fn a() {}\nfn b2() {\n    x\n}\nfn c() {}\n";
+        let marks = agent_marks(base, now);
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        // the changed function, then the line that went
+        assert_eq!(&now[marks[0].range.clone()], "fn b2() {\n    x\n}\n");
+        assert_eq!(marks[0].old, "fn b() {}\n");
+        assert!(marks[1].range.is_empty());
+        assert_eq!(marks[1].old, "last\n");
+        assert_eq!(before_agent(now, &marks).as_deref(), Some(base));
+        // a kept change is part of the file before the next ones
+        assert_eq!(
+            before_agent(now, &marks[1..]).as_deref(),
+            Some("fn a() {}\nfn b2() {\n    x\n}\nfn c() {}\nlast\n")
+        );
+    }
+
+    #[test]
+    fn marks_that_overlap_or_run_past_are_refused() {
+        let m = |r: std::ops::Range<usize>| AgentMark {
+            range: r,
+            old: String::new(),
+        };
+        assert!(before_agent("abcdef", &[m(0..4), m(2..5)]).is_none());
+        assert!(before_agent("abc", &[m(1..9)]).is_none());
+        assert!(before_agent("가", &[m(1..2)]).is_none(), "mid char");
+    }
 
     #[test]
     fn untitled_files_get_free_names_and_a_real_path_later() {

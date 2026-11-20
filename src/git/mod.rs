@@ -704,6 +704,46 @@ pub fn unified(base: &str, now: &str, context: usize) -> Vec<DiffLine> {
     out
 }
 
+/// where `now` differs from `base`, line by line: the lines each side
+/// has there, as (lines of `base`, lines of `now`).
+pub fn line_changes(base: &str, now: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let (a, b) = (line_hashes(base), line_hashes(now));
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (mid_a, mid_b) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+    let ops = edits(mid_a, mid_b, MAX_EDITS).unwrap_or_else(|| {
+        let mut ops = vec![Op::Delete; mid_a.len()];
+        ops.extend(std::iter::repeat_n(Op::Insert, mid_b.len()));
+        ops
+    });
+    let mut out = Vec::new();
+    let (mut la, mut lb) = (head, head);
+    let (mut sa, mut sb) = (head, head);
+    for op in ops {
+        match op {
+            Op::Keep => {
+                if la > sa || lb > sb {
+                    out.push((sa..la, sb..lb));
+                }
+                la += 1;
+                lb += 1;
+                (sa, sb) = (la, lb);
+            }
+            Op::Insert => lb += 1,
+            Op::Delete => la += 1,
+        }
+    }
+    if la > sa || lb > sb {
+        out.push((sa..la, sb..lb));
+    }
+    out
+}
+
 /// the lines of `now` that differ from `base`.
 pub fn hunks(base: &str, now: &str) -> Vec<Hunk> {
     let (a, b) = (line_hashes(base), line_hashes(now));
@@ -758,6 +798,15 @@ pub fn hunks(base: &str, now: &str) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_changes_name_both_sides() {
+        let base = "a\nb\nc\nd\n";
+        let now = "a\nB\nc\nd\ne\n";
+        assert_eq!(line_changes(base, now), vec![(1..2, 1..2), (4..4, 4..5)]);
+        assert_eq!(line_changes("a\nb\n", "a\n"), vec![(1..2, 1..1)]);
+        assert!(line_changes("same\n", "same\n").is_empty());
+    }
 
     #[test]
     fn no_git_is_started_outside_a_repository() {
