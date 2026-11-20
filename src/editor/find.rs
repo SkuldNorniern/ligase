@@ -150,7 +150,11 @@ pub fn show(
     };
     let palette = ui.theme.palette;
     let rows = if mode == Mode::Replace { 2.0 } else { 1.0 };
-    let width = WIDTH.min(editor.width - 24.0).max(160.0);
+    // wide enough for the buttons, unless the editor itself is narrower
+    let width = WIDTH
+        .min(editor.width - 24.0)
+        .max(230.0_f32.min(editor.width - 8.0))
+        .max(120.0);
     let height = rows * ROW + (rows + 1.0) * PAD;
     // slides down from under the tab bar as it opens
     let shown = ui.animate_from(Id::FindBar, 0, Channel::Custom(0), 0.0, 1.0, 16.0);
@@ -201,7 +205,9 @@ pub fn show(
     let (toggle, top) = top.split_right(ROW, 2.0);
     let (down, top) = top.split_right(ROW, 2.0);
     let (up, top) = top.split_right(ROW, 2.0);
-    let (note, field) = top.split_right(72.0, 4.0);
+    // the count gives way first when there is no room for the field
+    let note_w = if top.width >= 72.0 + 100.0 { 72.0 } else { 0.0 };
+    let (note, field) = top.split_right(note_w, 4.0);
     let toggled = Button::new("↔")
         .quiet()
         .selected(mode == Mode::Replace)
@@ -215,7 +221,9 @@ pub fn show(
     if small(ui, "↑", 3, up)?.clicked {
         ask = Some(Ask::Prev);
     }
-    ui.text(count, note, &font, palette.dim, Align::Center)?;
+    if note.width > 0.0 {
+        ui.text_clipped(count, note, &font, palette.dim, Align::Center)?;
+    }
     let typed = TextField::new(&mut bar.query)
         .placeholder(texts.tr("find"))
         .max_chars(500)
