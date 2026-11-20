@@ -252,7 +252,11 @@ fn parse_detail(out: &str) -> Option<Detail> {
         files: Vec::new(),
     };
     // then letter, path pairs; a rename gives two paths, the new one last
-    let mut fields = rest.split('\0').map(str::trim).filter(|s| !s.is_empty());
+    // only the line breaks between records go: a path keeps its own spaces
+    let mut fields = rest
+        .split('\0')
+        .map(|s| s.trim_start_matches(['\n', '\r']))
+        .filter(|s| !s.is_empty());
     while let Some(status) = fields.next() {
         let Some(letter) = status.chars().next().filter(char::is_ascii_uppercase) else {
             continue;
