@@ -1181,6 +1181,17 @@ impl App {
         }
     }
 
+    /// starts ligase again with `arg`, a folder or `--new-window`, on the
+    /// procs worker: starting a program waits.
+    fn new_window(&mut self, arg: std::ffi::OsString) {
+        let failed = self.texts.tr("Couldn't open a new window").to_owned();
+        self.procs.run(move || {
+            let spawned = std::env::current_exe()
+                .and_then(|exe| std::process::Command::new(exe).arg(&arg).spawn());
+            Done::Note(spawned.err().map(|e| format!("{failed}: {e}")))
+        });
+    }
+
     /// the terminal panel in sight with the keyboard in it.
     fn show_terminal(&mut self) {
         if !self.shows(Panel::Terminal) {
@@ -1295,22 +1306,14 @@ impl App {
                         .and_then(|v| self.docs.doc_of(v))
                         .filter(|d| d.load == document::Load::Ready)
                         .map(|d| d.buffer.snapshot());
-                    match open {
-                        Some(snap) => {
-                            let text = String::from(&snap);
-                            if let Some(chat) = &self.chat {
-                                chat.respond(
-                                    &id,
-                                    Ok(serde_json::json!({"content": agent::lines_of(&text, line, limit)})),
-                                );
-                            }
-                        }
-                        None => {
-                            self.jobs.run(move || {
-                                Done::AgentRead(id, document::read_text(&path), line, limit)
-                            });
-                        }
-                    }
+                    // the snapshot is cheap; the copy is made on the worker
+                    self.jobs.run(move || {
+                        let text = match open {
+                            Some(snap) => Ok(String::from(&snap)),
+                            None => document::read_text(&path),
+                        };
+                        Done::AgentRead(id, text, line, limit)
+                    });
                 }
                 agent::Need::Write { id, path, text } => self.agent_write(id, path, text),
                 agent::Need::Terminal(args) => self.agent_login(args),
@@ -1480,14 +1483,7 @@ impl App {
                 return;
             }
             Command::NewWindow => {
-                let spawned = std::env::current_exe()
-                    .and_then(|exe| std::process::Command::new(exe).arg(NEW_WINDOW).spawn());
-                if let Err(e) = spawned {
-                    self.say(format!(
-                        "{}: {e}",
-                        self.texts.tr("Couldn't open a new window")
-                    ));
-                }
+                self.new_window(std::ffi::OsString::from(NEW_WINDOW));
                 return;
             }
             Command::Undo | Command::Redo => {
@@ -4150,14 +4146,7 @@ impl App {
                             self.open_at_start(path, None);
                             continue;
                         }
-                        let spawned = std::env::current_exe()
-                            .and_then(|exe| std::process::Command::new(exe).arg(&path).spawn());
-                        if let Err(e) = spawned {
-                            self.say(format!(
-                                "{}: {e}",
-                                self.texts.tr("Couldn't open a new window")
-                            ));
-                        }
+                        self.new_window(path.into_os_string());
                     }
                 }
                 Done::Diff(doc, revision, rows) => {
