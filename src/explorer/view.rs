@@ -18,7 +18,14 @@ pub struct Shown {
     pub click: Option<Click>,
     /// a right click: where, and the row under it if any.
     pub menu: Option<(Point, Option<usize>)>,
+    /// a file being dragged out, by name, while it is.
+    pub dragging: Option<String>,
+    /// a file let go away from the tree, and where.
+    pub dropped: Option<(std::path::PathBuf, Point)>,
 }
+
+/// how far a press moves before it is a drag.
+const DRAG_FROM: f32 = 6.0;
 
 /// the char a letter or digit key types, for jumping by name.
 fn letter(key: KeyCode) -> Option<char> {
@@ -175,7 +182,56 @@ pub fn show(
             jumped = true;
         }
     }
-    let acted = (selected != before && !keyed && !jumped) || response.activated;
+    // a file row pressed and pulled away is a drag; let go outside the
+    // tree, it lands where the pointer is
+    let mut dragging = None;
+    let mut dropped = None;
+    let held = ui.held_at(Id::Explorer, 0).is_some();
+    let mut released_drag = false;
+    match (ui.held_at(Id::Explorer, 0), ui.pointer()) {
+        (Some(from), Some(at)) => {
+            if explorer.drag.is_none() {
+                let row = ((from.y - rect.y + scroll) / ROW).floor();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let row = (row >= 0.0).then_some(row as usize);
+                explorer.drag = row
+                    .and_then(|r| explorer.row(r))
+                    .filter(|r| !r.dir)
+                    .map(|r| (r.path.to_path_buf(), false));
+            }
+            if let Some((path, started)) = &mut explorer.drag {
+                *started |= (at.x - from.x).hypot(at.y - from.y) > DRAG_FROM;
+                if *started {
+                    dragging = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                }
+            }
+        }
+        _ => {
+            if let Some((path, true)) = explorer.drag.take() {
+                released_drag = true;
+                if let Some(at) = ui.pointer()
+                    && !rect.contains(at)
+                {
+                    dropped = Some((path, at));
+                }
+            }
+            explorer.drag = None;
+        }
+    }
+    let mut acted = (selected != before && !keyed && !jumped) || response.activated;
+    // a press picks the row now and opens it on release, so pulling it
+    // away to a pane doesn't open it here first
+    if acted && held && !response.activated {
+        explorer.click_later = selected;
+        acted = false;
+    } else if !held
+        && let Some(row) = explorer.click_later.take()
+        && !released_drag
+        && dropped.is_none()
+    {
+        selected = Some(row);
+        acted = true;
+    }
     let menu = ui
         .secondary_at(Id::Explorer, 1)
         .or_else(|| ui.secondary_at(Id::Explorer, 0))
@@ -192,9 +248,11 @@ pub fn show(
         });
     Ok(Shown {
         click: selected
-            .filter(|_| acted)
+            .filter(|_| acted && dropped.is_none() && dragging.is_none())
             .and_then(|row| explorer.click(row)),
         menu,
+        dragging,
+        dropped,
     })
 }
 

@@ -4316,6 +4316,29 @@ impl App {
         }
     }
 
+    /// a file from the explorer let go at `at`: it opens in the editor
+    /// group there, or beside it when let go near an edge.
+    fn drop_file(&mut self, path: &Path, at: aurea::render::Point) {
+        let Some((target, side, _)) = self.bench.drop_target(at) else {
+            return;
+        };
+        let panel = if self.open_picture(path) {
+            self.pictures
+                .iter()
+                .find(|(_, p)| p.path == path)
+                .map(|(n, _)| Panel::Picture(*n))
+        } else {
+            let view = self.open_file(path);
+            self.ui.focus(Id::Editor(view), 1);
+            self.last_editor = Some(view);
+            Some(Panel::Editor(view))
+        };
+        if let Some(pane) = panel.and_then(|p| self.bench.panels.find(p)) {
+            self.bench.place(pane, target, side);
+            self.layout_dirty = true;
+        }
+    }
+
     /// a picture file opens in a picture tab, the one already open for it if
     /// any. false for files that aren't pictures.
     fn open_picture(&mut self, path: &Path) -> bool {
@@ -5451,6 +5474,9 @@ impl App {
         let mut explorer_menu: Option<(aurea::render::Point, Option<(PathBuf, bool)>)> = None;
         let mut editor_menu: Option<(aurea::render::Point, ViewId)> = None;
         let mut crumb: Option<(editor::Crumb, ViewId)> = None;
+        // a file dragged from the explorer: its name while held, where it fell
+        let file_drag: std::cell::RefCell<Option<String>> = std::cell::RefCell::default();
+        let mut file_drop: Option<(PathBuf, aurea::render::Point)> = None;
         let mut review: Option<(editor::Review, ViewId)> = None;
         let mut remote_asked: Option<crate::remote::browse::Ask> = None;
         let mut read_ask: Option<(ViewId, crate::preview::Ask)> = None;
@@ -5546,6 +5572,10 @@ impl App {
                 Some(Panel::Explorer) => {
                     let shown = explorer::view::show(ui, explorer, rect, active_file.as_deref())?;
                     clicks.extend(shown.click);
+                    *file_drag.borrow_mut() = shown.dragging;
+                    if let Some(d) = shown.dropped {
+                        file_drop = Some(d);
+                    }
                     if let Some((at, row)) = shown.menu {
                         explorer_menu = Some((at, row.and_then(|r| explorer.row_path(r))));
                     }
@@ -5769,6 +5799,29 @@ impl App {
                 })
                 .show(&mut ui, Id::Dock, dock_at)?;
             changed = response.changed;
+            // a file pulled from the explorer: where it would land, and its
+            // name by the pointer
+            let dragged = file_drag.borrow().clone();
+            if let (Some(name), Some(at)) = (&dragged, ui.pointer()) {
+                let palette = ui.theme.palette;
+                if let Some((_, side, content)) = workbench::drop_zone(dock, panels, at) {
+                    let zone = side.preview(content).inset(4.0);
+                    ui.round(zone, 8.0, palette.accent.fade(0.14))?;
+                    ui.border(zone, 8.0, 1.5, palette.accent.fade(0.6))?;
+                }
+                let small = ui.theme.font(12.0);
+                let w = ui.text_width(name, &small) + 20.0;
+                // right of the pointer, or left of it near the window's edge
+                let x = if at.x + 12.0 + w > area.right() {
+                    at.x - 12.0 - w
+                } else {
+                    at.x + 12.0
+                };
+                let chip = Rect::new(x, at.y + 8.0, w, 24.0);
+                ui.round(chip, 12.0, palette.raised)?;
+                ui.border(chip, 12.0, 1.0, palette.border)?;
+                ui.text(name, chip, &small, palette.text, Align::Center)?;
+            }
             // at the edge: a few pixels there call the rail out, it stays
             // while the pointer is on it, and slides over the work
             if settings.rail_show == RailShow::Edge {
@@ -6107,6 +6160,9 @@ impl App {
         }
         if let Some((r, view)) = review {
             self.review(view, r);
+        }
+        if let Some((path, at)) = file_drop {
+            self.drop_file(&path, at);
         }
         if let Some((c, view)) = crumb {
             self.last_editor = Some(view);

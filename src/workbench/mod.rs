@@ -92,6 +92,24 @@ impl Workbench {
         )
     }
 
+    /// the editor area group under `at`, and the side of it `at` is on:
+    /// where something let go there would land.
+    pub fn drop_target(
+        &self,
+        at: aurea::render::Point,
+    ) -> Option<(PaneId, DockSide, aurea::render::Rect)> {
+        drop_zone(&self.dock, &self.panels, at)
+    }
+
+    /// puts `pane` beside `target`, on `side` of it or in with it.
+    pub fn place(&mut self, pane: PaneId, target: PaneId, side: DockSide) {
+        // the welcome tab it was let go on goes once a file opens
+        if pane != target && self.dock.tree.contains(target) {
+            self.tree().move_to(pane, target, side);
+        }
+        self.tree().activate(pane);
+    }
+
     /// shows `view` as a tab in the editor area, replacing the welcome tab.
     pub fn show_editor(&mut self, view: ViewId) -> PaneId {
         self.show_in_editor_area(Panel::Editor(view))
@@ -542,6 +560,22 @@ impl Workbench {
 
 /// the side bar's panels get their panes up front; they never sit in the
 /// dock, so nothing else makes them.
+/// the editor area group of `dock` under `at`, the side of it `at` is on,
+/// and its content rect.
+pub fn drop_zone(
+    dock: &Dock<PaneId>,
+    panels: &Panels,
+    at: aurea::render::Point,
+) -> Option<(PaneId, DockSide, aurea::render::Rect)> {
+    let layout = dock.layout();
+    let group = layout.group_at(at)?;
+    let pane = *layout.panels.get(group.tabs.start + group.active)?;
+    if !panels.get(pane).is_some_and(Panel::is_editor_area) {
+        return None;
+    }
+    Some((pane, DockSide::at(group.content, at), group.content))
+}
+
 fn side_panes(panels: &mut Panels) {
     for panel in [
         Panel::Explorer,

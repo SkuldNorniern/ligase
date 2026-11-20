@@ -52,6 +52,12 @@ pub struct Explorer {
     pub selected: Option<usize>,
     /// letters typed to jump to a row, and when the last one came.
     pub typed: (String, Option<std::time::Instant>),
+    /// a file row pressed, and whether the press has moved far enough to
+    /// be a drag.
+    pub drag: Option<(PathBuf, bool)>,
+    /// a row picked by a press still held: it opens on release, unless the
+    /// press became a drag.
+    pub click_later: Option<usize>,
 }
 
 impl Explorer {
@@ -86,6 +92,8 @@ impl Explorer {
             scroll: 0.0,
             selected: None,
             typed: (String::new(), None),
+            drag: None,
+            click_later: None,
         };
         explorer.rebuild();
         explorer
