@@ -318,20 +318,34 @@ impl Shell {
 
     /// sends typed bytes to the shell.
     pub fn write(&mut self, bytes: &str) {
-        match &self.term {
-            Some(term) => {
+        match (&self.term, &self.state) {
+            (Some(term), State::Running) => {
                 let _ = term.write_str(bytes);
             }
-            // a few lines at most; past that typing ahead is a mistake
-            None if self.early.len() < 4096 => self.early.push_str(bytes),
-            None => {}
+            // starting (again): it waits, a few lines at most; past that
+            // typing ahead is a mistake
+            (_, State::NotStarted | State::Starting) if self.early.len() < 4096 => {
+                self.early.push_str(bytes);
+            }
+            // ended or failed: nothing reads it
+            _ => {}
         }
     }
 
     /// pastes text, in bracketed-paste markers when the shell wants them.
+    /// an ended shell takes nothing; a paste past the cap is cut on a char
+    /// edge.
     pub fn paste(&self, text: &str) {
+        const MAX_PASTE: usize = 1024 * 1024;
+        if self.state != State::Running {
+            return;
+        }
+        let mut end = text.len().min(MAX_PASTE);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         if let Some(term) = &self.term {
-            let _ = term.paste_str(text);
+            let _ = term.paste_str(&text[..end]);
         }
     }
 
