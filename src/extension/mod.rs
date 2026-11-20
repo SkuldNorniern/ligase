@@ -227,13 +227,26 @@ pub fn lines(m: &Manifest) -> Vec<Vec<String>> {
     m.servers.iter().map(manifest::Server::line).collect()
 }
 
+/// `file` (parts split by `/`) under the package folder `dir`, checked to
+/// stay there once links are followed: a link inside a package can't hand
+/// out a file from elsewhere.
+fn in_package(dir: &Path, file: &str) -> Result<PathBuf, String> {
+    let path = file
+        .split('/')
+        .fold(dir.to_path_buf(), |p, part| p.join(part));
+    let real = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let home = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    if !real.starts_with(&home) {
+        return Err(format!("{file} leads out of the package"));
+    }
+    Ok(real)
+}
+
 /// an abbreviation table: `"key" = "text"` pairs. keys are 1-32 chars, no
 /// spaces and no leader; texts 1-32 chars, no control chars. a bad pair is
 /// skipped and said, the rest load.
 fn abbreviations(dir: &Path, file: &str, leader: char) -> Result<(Pairs, Vec<String>), String> {
-    let path = file
-        .split('/')
-        .fold(dir.to_path_buf(), |p, part| p.join(part));
+    let path = in_package(dir, file)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_ABBREV_FILE {
         return Err(format!("over {} KiB", MAX_ABBREV_FILE / 1024));
@@ -274,9 +287,7 @@ fn editor_key_max() -> usize {
 /// a grammar file from a package: read with a size cap, parsed under a
 /// guard so a spec that trips the parser only loses itself.
 fn grammar(dir: &Path, file: &str) -> Result<Grammar, String> {
-    let path = file
-        .split('/')
-        .fold(dir.to_path_buf(), |p, part| p.join(part));
+    let path = in_package(dir, file)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_GRAMMAR {
         return Err(format!("over {} KiB", MAX_GRAMMAR / 1024));
