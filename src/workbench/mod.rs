@@ -439,7 +439,12 @@ impl Workbench {
             });
             Some(index)
         };
-        let plan = DockPlan::from_text(file.get("layout")?.as_str()?, slot)?;
+        // a layout file is ours, but read it as untrusted: a size cap first
+        let text = file
+            .get("layout")?
+            .as_str()
+            .filter(|t| t.len() <= 64 * 1024)?;
+        let plan = DockPlan::from_text(text, slot)?;
 
         let mut panels = Panels::default();
         side_panes(&mut panels);
