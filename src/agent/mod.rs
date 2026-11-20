@@ -461,6 +461,10 @@ impl Chat {
         self.session = None;
         self.pending.clear();
         self.permission = None;
+        // a message waiting on the session does not go out on a later start
+        // by itself, and a stop asked for has nothing left to stop
+        self.queued = None;
+        self.stopping = false;
     }
 
     fn note(&mut self, text: String, bad: bool) {
@@ -1249,6 +1253,19 @@ pub fn lines_of(text: &str, line: Option<usize>, limit: Option<usize>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_start_forgets_the_waiting_message() {
+        let mut c = chat();
+        c.state = State::Starting;
+        c.input = "fix it".to_owned();
+        c.send();
+        assert!(c.queued.is_some());
+        c.started(Err("no program".to_owned()));
+        assert!(c.queued.is_none() && !c.stopping);
+        c.input = "again".to_owned();
+        assert!(c.send(), "send works after a failed start");
+    }
 
     #[test]
     fn a_kept_conversation_reads_back() {

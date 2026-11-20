@@ -480,7 +480,7 @@ enum Done {
     ),
     Shell(u32, Result<vanta::Terminal, String>),
     /// the agent's acp program started, or why not.
-    AgentUp(Result<agent::acp::Pipe, String>),
+    AgentUp(u64, Result<agent::acp::Pipe, String>),
     /// a file read for the agent: its id, the text, and the lines asked.
     AgentRead(
         serde_json::Value,
@@ -617,6 +617,9 @@ pub struct App {
     shells: terminal::Shells,
     /// the agent conversation, made the first time the panel is used.
     chat: Option<agent::Chat>,
+    /// counts agent starts; a start that comes back under an older count
+    /// belongs to a chat that is gone.
+    agent_start: u64,
     /// the remote path a delete is waiting on the person for.
     remote_delete: Option<String>,
     /// quick open lists the remote folder's files, not the workspace's.
@@ -796,6 +799,7 @@ impl App {
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
             chat: None,
+            agent_start: 0,
             remote_delete: None,
             remote_quick: false,
             remote_pick: crate::remote::browse::Picker::default(),
@@ -1325,6 +1329,8 @@ impl App {
             |p| (p.base_url, p.context as usize, p.name),
         );
         let canvas = self.canvas;
+        self.agent_start += 1;
+        let start = self.agent_start;
         let job = move || {
             let wake = move || {
                 if let Some(id) = canvas {
@@ -1347,7 +1353,7 @@ impl App {
                     agent::acp::Pipe::spawn(&program, &args, &root, wake)
                 })
             };
-            Done::AgentUp(pipe)
+            Done::AgentUp(start, pipe)
         };
         if !self.procs.run(job)
             && let Some(chat) = &mut self.chat
@@ -4714,9 +4720,24 @@ impl App {
                         }
                     }
                 }
-                Done::AgentUp(pipe) => {
-                    if let Some(chat) = &mut self.chat {
-                        chat.started(pipe);
+                Done::AgentUp(start, pipe) => {
+                    let current = start == self.agent_start
+                        && self
+                            .chat
+                            .as_ref()
+                            .is_some_and(|c| c.state == agent::State::Starting);
+                    match (current, &mut self.chat) {
+                        (true, Some(chat)) => chat.started(pipe),
+                        // another agent was picked or it was stopped meanwhile:
+                        // this one's program closes off the ui thread
+                        _ => {
+                            if let Ok(pipe) = pipe {
+                                self.jobs.run(move || {
+                                    drop(pipe);
+                                    Done::Note(None)
+                                });
+                            }
+                        }
                     }
                 }
                 Done::AgentRead(id, text, line, limit) => {
