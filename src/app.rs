@@ -578,6 +578,8 @@ pub struct App {
     chat: Option<agent::Chat>,
     /// the editor and documents' stamp the symbol list was filled at.
     symbols_seen: Option<(Option<ViewId>, u64)>,
+    /// agent writes into open files, answered when their save is done.
+    agent_saves: Vec<(DocumentId, serde_json::Value)>,
     finder: Finder,
     problems: Problems,
     lsp: Lsp,
@@ -739,6 +741,7 @@ impl App {
             shells: terminal::Shells::default(),
             chat: None,
             symbols_seen: None,
+            agent_saves: Vec::new(),
             finder: Finder::default(),
             problems: Problems::default(),
             lsp: Lsp::default(),
@@ -1338,19 +1341,30 @@ impl App {
                 .map(|d| String::from(&d.buffer.snapshot()));
             if let Some(now) = now {
                 let (range, middle) = smallest_edit(&now, &text);
-                let done = range.is_empty() && middle.is_empty()
-                    || self.docs.edit(view, vec![(range, middle)], false);
-                if done {
-                    self.save_with(view, false);
+                let same = range.is_empty() && middle.is_empty();
+                let doc = self.docs.view(view).map(|v| v.doc);
+                let dirty = self
+                    .docs
+                    .doc_of(view)
+                    .is_some_and(document::Document::is_dirty);
+                if same && !dirty {
+                    // already on disk as asked
+                    if let Some(chat) = &self.chat {
+                        chat.respond(&id, Ok(serde_json::Value::Null));
+                    }
+                    return;
                 }
-                if let Some(chat) = &self.chat {
-                    let result = if done {
-                        Ok(serde_json::Value::Null)
-                    } else {
-                        Err("the open file took no edit".to_owned())
-                    };
-                    chat.respond(&id, result);
+                if !same && !self.docs.edit(view, vec![(range, middle)], false) {
+                    if let Some(chat) = &self.chat {
+                        chat.respond(&id, Err("the open file took no edit".to_owned()));
+                    }
+                    return;
                 }
+                // answered by after_save, once the disk says how it went
+                if let Some(doc) = doc {
+                    self.agent_saves.push((doc, id));
+                }
+                self.save_with(view, false);
                 return;
             }
         }
@@ -2743,6 +2757,24 @@ impl App {
 
     /// a save came back: a close that waited on it goes ahead.
     fn after_save(&mut self, doc: DocumentId, ok: bool) {
+        // the agent hears about its writes only now, from the disk's answer
+        let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.agent_saves)
+            .into_iter()
+            .partition(|(d, _)| *d == doc);
+        self.agent_saves = rest;
+        if let Some(chat) = &self.chat {
+            for (_, id) in waiting {
+                let result = if ok {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Err(
+                        "the file was not saved: it changed on disk or could not be written"
+                            .to_owned(),
+                    )
+                };
+                chat.respond(&id, result);
+            }
+        }
         if !ok {
             // a failed save keeps everything open, here and no folder after
             self.close_after_save = false;
@@ -3339,6 +3371,8 @@ impl App {
                 "{}: the file worker is not running",
                 self.texts.tr("Save failed")
             ));
+            // a close or an agent waiting on this save hears it failed
+            self.after_save(doc, false);
         }
     }
 
