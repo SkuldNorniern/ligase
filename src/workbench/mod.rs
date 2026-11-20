@@ -350,8 +350,9 @@ impl Workbench {
         }
     }
 
-    /// the layout as a session file. editors save their file path.
-    pub fn save(&self, docs: &Documents) -> String {
+    /// the layout as a session file. editors and pictures save their file
+    /// path; `picture` gives a picture tab's.
+    pub fn save(&self, docs: &Documents, picture: impl Fn(u32) -> Option<PathBuf>) -> String {
         let mut editors: Vec<String> = Vec::new();
         let names: Vec<(PaneId, String)> = self
             .panels
@@ -380,10 +381,17 @@ impl Workbench {
                     }
                     // a diff left in the layout stands for the editor area
                     // left out below: extension views come back from their package
-                    Panel::Diff(_)
-                    | Panel::Picture(_)
-                    | Panel::SideView(_)
-                    | Panel::BottomView(_) => "welcome".to_owned(),
+                    Panel::Picture(n) => {
+                        editors.push(
+                            picture(n)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                        );
+                        format!("editor{}", editors.len() - 1)
+                    }
+                    Panel::Diff(_) | Panel::SideView(_) | Panel::BottomView(_) => {
+                        "welcome".to_owned()
+                    }
                 };
                 (id, name)
             })
@@ -455,7 +463,7 @@ impl Workbench {
     /// reads a session file back. `open` makes a view for an editor's path,
     /// or none when the file can't come back; that tab is dropped. none for a
     /// broken or old file, so the caller keeps the default layout.
-    pub fn restore(text: &str, mut open: impl FnMut(&Path) -> Option<ViewId>) -> Option<Workbench> {
+    pub fn restore(text: &str, mut open: impl FnMut(&Path) -> Option<Panel>) -> Option<Workbench> {
         let file: toml::Table = text.parse().ok()?;
         if file.get("version")?.as_integer()? != LAYOUT_VERSION {
             return None;
@@ -503,7 +511,7 @@ impl Workbench {
                     "welcome" => Panel::Welcome,
                     other => {
                         let index: usize = other.strip_prefix("editor")?.parse().ok()?;
-                        Panel::Editor(open(editors.get(index)?)?)
+                        open(editors.get(index)?)?
                     }
                 };
                 Some(panels.pane(panel))
@@ -836,13 +844,16 @@ mod tests {
         bench.toggle(Panel::Terminal);
         bench.show(Panel::Git);
         bench.side.width = 333.0;
-        let saved = bench.save(&docs);
+        let saved = bench.save(&docs, |_| None);
 
         let mut opened = Vec::new();
         let mut fresh = Documents::default();
         let back = Workbench::restore(&saved, |path| {
             opened.push(path.to_path_buf());
-            Some(open_file(&mut fresh, &path.display().to_string()))
+            Some(Panel::Editor(open_file(
+                &mut fresh,
+                &path.display().to_string(),
+            )))
         })
         .expect("restores");
         assert_eq!(opened.len(), 2);
@@ -850,7 +861,10 @@ mod tests {
         assert_eq!(back.side, bench.side);
         assert!(!in_tree(&back, Panel::Terminal));
         assert!(!in_tree(&back, Panel::Welcome));
-        assert_eq!(back.save(&fresh).lines().count(), saved.lines().count());
+        assert_eq!(
+            back.save(&fresh, |_| None).lines().count(),
+            saved.lines().count()
+        );
     }
 
     #[test]
@@ -858,7 +872,7 @@ mod tests {
         let mut docs = Documents::default();
         let mut bench = Workbench::default();
         bench.show_editor(open_file(&mut docs, "gone.rs"));
-        let saved = bench.save(&docs);
+        let saved = bench.save(&docs, |_| None);
         let back = Workbench::restore(&saved, |_| None).expect("restores");
         assert!(in_tree(&back, Panel::Welcome));
         assert!(back.shows(Panel::Explorer));

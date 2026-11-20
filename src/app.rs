@@ -3854,7 +3854,14 @@ impl App {
             .restored
             .then(|| self.session.clone())
             .flatten()
-            .map(|path| (path, self.bench.save(&self.docs)));
+            .map(|path| {
+                (
+                    path,
+                    self.bench.save(&self.docs, |n| {
+                        self.pictures.get(&n).map(|p| p.path.clone())
+                    }),
+                )
+            });
         if record.is_none() && session.is_none() {
             self.close_now = true;
             return;
@@ -3880,7 +3887,9 @@ impl App {
         let Some(path) = self.session.clone() else {
             return false;
         };
-        let text = self.bench.save(&self.docs);
+        let text = self.bench.save(&self.docs, |n| {
+            self.pictures.get(&n).map(|p| p.path.clone())
+        });
         self.layout_dirty = false;
         self.jobs
             .run(move || Done::Saved(workbench::write_session(&path, &text)))
@@ -5311,10 +5320,17 @@ impl App {
         let Some(text) = text else { return };
         let mut made: Vec<ViewId> = Vec::new();
         let mut fresh: Vec<(DocumentId, PathBuf)> = Vec::new();
+        let mut pictures: Vec<(u32, PathBuf)> = Vec::new();
+        let mut next = self.next_picture;
         let docs = &mut self.docs;
         let bench = Workbench::restore(&text, |path| {
             if path.as_os_str().is_empty() {
                 return None;
+            }
+            if viewer::is_picture(path) {
+                next += 1;
+                pictures.push((next, path.to_path_buf()));
+                return Some(Panel::Picture(next));
             }
             let (doc, new) = docs.open(path);
             let view = docs.add_view(doc);
@@ -5322,13 +5338,21 @@ impl App {
             if new {
                 fresh.push((doc, path.to_path_buf()));
             }
-            Some(view)
+            Some(Panel::Editor(view))
         });
         match bench {
             Some(bench) => {
                 self.bench = bench;
                 for (doc, path) in fresh {
                     self.load(doc, &path);
+                }
+                self.next_picture = next;
+                for (n, path) in pictures {
+                    self.pictures.insert(n, viewer::Picture::new(path.clone()));
+                    self.jobs.run(move || {
+                        let (bytes, look) = viewer::load(&path);
+                        Done::Picture(n, bytes, look)
+                    });
                 }
             }
             None => {
