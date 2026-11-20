@@ -764,6 +764,12 @@ b",
         assert_eq!(sent(KeyCode::Backspace, alt).as_deref(), Some("\x1b\x7f"));
         assert_eq!(sent(KeyCode::Left, ctrl).as_deref(), Some("\x1b[1;5D"));
         assert_eq!(sent(KeyCode::Tab, shift).as_deref(), Some("\x1b[Z"));
+        assert_eq!(sent(KeyCode::Backspace, ctrl).as_deref(), Some("\x08"));
+        assert_eq!(sent(KeyCode::Delete, ctrl).as_deref(), Some("\x1b[3;5~"));
+        assert_eq!(sent(KeyCode::F1, none).as_deref(), Some("\x1bOP"));
+        assert_eq!(sent(KeyCode::F12, shift).as_deref(), Some("\x1b[24;2~"));
+        assert_eq!(sent(KeyCode::Space, ctrl).as_deref(), Some("\0"));
+        assert_eq!(sent(KeyCode::Insert, none).as_deref(), Some("\x1b[2~"));
         let typed = WindowEvent::TextInput {
             text: "ls\u{3}".into(),
         };
