@@ -71,7 +71,7 @@ pub fn parse(text: &str) -> Table {
             if quoted {
                 rec.cell.push('\n');
             } else {
-                rec.end_row(line);
+                rec.end_line(line);
             }
             continue;
         }
@@ -147,7 +147,7 @@ struct Records {
     cell: String,
     /// the line the row being read starts on.
     start: usize,
-    /// something was read on this row; a blank line is no row.
+    /// something was read on this row.
     open: bool,
 }
 
@@ -160,7 +160,19 @@ impl Records {
         self.open = true;
     }
 
-    /// ends the row at a line break; `next` is the line the next row starts on.
+    /// a line break: a blank line is an empty row, as the big file reader
+    /// counts it, so row numbers agree on either side of its size.
+    fn end_line(&mut self, next: usize) {
+        if !self.open && self.out.len() < MAX_ROWS {
+            self.out.push((self.start, Vec::new()));
+            self.start = next;
+            return;
+        }
+        self.end_row(next);
+    }
+
+    /// ends the row; `next` is the line the next row starts on. at the
+    /// end of the text nothing read means no row.
     fn end_row(&mut self, next: usize) {
         if self.open {
             self.end_field();
@@ -780,7 +792,10 @@ mod tests {
     fn crlf_and_blank_lines() {
         let t = parse("a,b\r\n1,2\r\n\r\n3,4");
         assert_eq!(t.head, ["a", "b"]);
-        assert_eq!(rows(&t), [vec!["1", "2"], vec!["3", "4"]]);
+        // the blank line is an empty row, as in the big file reader
+        assert_eq!(rows(&t), [vec!["1", "2"], vec![], vec!["3", "4"]]);
+        let t = parse("a\n1\n");
+        assert_eq!(rows(&t), [vec!["1"]], "a last line break adds nothing");
     }
 
     #[test]
@@ -800,7 +815,8 @@ mod tests {
     fn empty_input_is_empty() {
         let t = parse("");
         assert_eq!(t, Table::default());
-        assert_eq!(parse("\n\n").rows.len(), 0);
+        // two blank lines: a blank head and one blank row, as the big reader has it
+        assert_eq!(parse("\n\n").rows.len(), 1);
     }
 
     #[test]
