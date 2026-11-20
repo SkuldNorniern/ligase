@@ -414,6 +414,8 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     let terminal = add(&mut view, "Terminal", Command::ToggleTerminal)?;
     let problems = add(&mut view, "Problems", Command::ToggleProblems)?;
     let git = add(&mut view, "Source Control", Command::ToggleGit)?;
+    let agent = add(&mut view, "Agent", Command::ToggleAgent)?;
+    add(&mut view, "Ask Agent About This", Command::AskAgent)?;
     add(&mut view, "Split Editor", Command::SplitEditor)?;
     view.add_separator()?;
     add(&mut view, "Zoom In", Command::ZoomIn)?;
@@ -427,8 +429,9 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
             (Panel::Terminal, terminal),
             (Panel::Problems, problems),
             (Panel::Git, git),
+            (Panel::Agent, agent),
         ],
-        shown: vec![false, false, false, false],
+        shown: vec![false, false, false, false, false],
     })
 }
 

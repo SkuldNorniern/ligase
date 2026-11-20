@@ -230,9 +230,17 @@ pub fn show(
     )?;
     let icon = Rect::new(head.x + PAD, head.y + (HEAD - 16.0) / 2.0, 16.0, 16.0);
     crate::icons::draw(ui, "agent", icon, palette.accent)?;
-    let name = Rect::new(icon.right() + 8.0, head.y, 200.0, HEAD);
-    ui.text(chat.agent.name(), name, &bold, palette.text, Align::Start)?;
-    let name_w = ui.text_width(chat.agent.name(), &bold);
+    // the name, its first word when narrow, none when narrower still
+    let room = head.right() - PAD - 56.0 - 8.0 - (icon.right() + 8.0);
+    let full = chat.agent.name();
+    let short = full.split(' ').next().unwrap_or(full);
+    let shown = [full, short]
+        .into_iter()
+        .find(|n| ui.text_width(n, &bold) <= room)
+        .unwrap_or("");
+    let name = Rect::new(icon.right() + 8.0, head.y, room.max(0.0), HEAD);
+    ui.text(shown, name, &bold, palette.text, Align::Start)?;
+    let name_w = ui.text_width(shown, &bold);
     let (state, tone) = match &chat.state {
         State::Off => (texts.tr("not started"), palette.faint),
         State::Starting => (texts.tr("starting…"), palette.dim),
@@ -241,11 +249,17 @@ pub fn show(
         State::Working => (texts.tr("working…"), palette.accent),
         State::Failed(_) => (texts.tr("stopped"), palette.danger),
     };
-    let dot = Rect::new(name.x + name_w + 12.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
-    ui.round(dot, 3.0, tone)?;
-    let state_at = Rect::new(dot.right() + 6.0, head.y, 140.0, HEAD);
-    ui.text(state, state_at, &small, palette.dim, Align::Start)?;
-    let new = Rect::new(head.right() - PAD - 64.0, head.y + 6.0, 64.0, HEAD - 12.0);
+    let new = Rect::new(head.right() - PAD - 56.0, head.y + 6.0, 56.0, HEAD - 12.0);
+    // the state's dot always; its word only where it fits before the button
+    let dot = Rect::new(name.x + name_w + 10.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
+    if dot.right() < new.x - 4.0 {
+        ui.round(dot, 3.0, tone)?;
+        let room = new.x - 8.0 - (dot.right() + 6.0);
+        if ui.text_width(state, &small) <= room {
+            let state_at = Rect::new(dot.right() + 6.0, head.y, room, HEAD);
+            ui.text(state, state_at, &small, palette.dim, Align::Start)?;
+        }
+    }
     if Button::new(texts.tr("New"))
         .quiet()
         .show(ui, Id::AgentButton(0), new)?
@@ -260,7 +274,9 @@ pub fn show(
     } else {
         CHIP + 8.0
     };
-    let (talk, foot) = rest.split_bottom(INPUT + refs_h + 44.0, 0.0);
+    // split_bottom gives the bottom part first
+    let (foot, talk) = rest.split_bottom(INPUT + refs_h + 44.0 + PAD, 0.0);
+    ui.fill(Rect::new(foot.x, foot.y, foot.width, 1.0), palette.border)?;
     let foot = foot.inset(PAD);
     let mut y = foot.y;
     if !chat.refs.is_empty() {
@@ -295,9 +311,10 @@ pub fn show(
         y += CHIP + 8.0;
     }
     let field = Rect::new(foot.x, y, foot.width, INPUT);
+    let asking = format!("{} {}…", texts.tr("Ask"), chat.agent.name());
     let hint = match chat.state {
-        State::Working => texts.tr("The agent is working; Stop to break in"),
-        _ => texts.tr("Ask the agent. Enter sends, Ctrl+Shift+A adds the editor's lines"),
+        State::Working => texts.tr("Working… Stop to break in"),
+        _ => asking.as_str(),
     };
     let typed = TextArea::new(&mut chat.input)
         .placeholder(hint)
@@ -308,6 +325,12 @@ pub fn show(
     }
     let buttons = Rect::new(foot.x, field.bottom() + 8.0, foot.width, 28.0);
     let go = Rect::new(buttons.right() - 76.0, buttons.y, 76.0, 28.0);
+    // the keys, quietly, where there is room left of the button
+    let keys = texts.tr("Enter to send · Ctrl+Shift+J adds lines");
+    let keys_at = Rect::new(buttons.x, buttons.y, go.x - buttons.x - 8.0, 28.0);
+    if ui.text_width(keys, &small) <= keys_at.width {
+        ui.text(keys, keys_at, &small, palette.faint, Align::Start)?;
+    }
     if chat.state == State::Working {
         if Button::new(texts.tr("Stop"))
             .show(ui, Id::AgentButton(1), go)?
@@ -328,7 +351,7 @@ pub fn show(
     let talk = if let Some(p) = &chat.permission {
         let lines = hover::wrap(ui, &p.title, &font, talk.width - 2.0 * PAD - 20.0);
         let card_h = 30.0 + lines.len().min(4) as f32 * TEXT_ROW + 40.0;
-        let (above, card) = talk.split_bottom(card_h + PAD, 0.0);
+        let (card, above) = talk.split_bottom(card_h + PAD, 0.0);
         let card = Rect::new(card.x + PAD, card.y, card.width - 2.0 * PAD, card_h);
         ui.round(card, 8.0, palette.raised)?;
         ui.fill(
@@ -421,7 +444,7 @@ pub fn show(
             }
         }
         if chat.state == State::Off {
-            let b = Rect::new(mid.x, cy, 160.0, 28.0);
+            let b = Rect::new(mid.x, cy, 160.0_f32.min(mid.width), 28.0);
             if Button::new(texts.tr("Start"))
                 .primary()
                 .show(ui, Id::AgentButton(5), b)?
@@ -435,7 +458,7 @@ pub fn show(
                 line(ui, &l, cy, &mono, palette.danger)?;
                 cy += 17.0;
             }
-            let b = Rect::new(mid.x, cy + 8.0, 160.0, 28.0);
+            let b = Rect::new(mid.x, cy + 8.0, 160.0_f32.min(mid.width), 28.0);
             if Button::new(texts.tr("Start again"))
                 .show(ui, Id::AgentButton(4), b)?
                 .clicked
