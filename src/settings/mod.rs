@@ -110,6 +110,10 @@ pub struct Settings {
     /// language servers set here, `[servers.<language>]`: new ones, or the
     /// built-in and package ones changed or turned off.
     pub servers: Vec<ServerRule>,
+    /// model servers for the custom agent, `[models."<name>"]`.
+    pub models: Vec<ModelProfile>,
+    /// the profile the custom agent uses; the first when none or gone.
+    pub model_profile: Option<String>,
     /// spaces and tabs at line ends go when saving.
     pub trim_trailing_whitespace: bool,
     /// a saved file ends in a line break.
@@ -157,6 +161,8 @@ impl Default for Settings {
             openai_model: None,
             openai_context: 32_000.0,
             servers: Vec::new(),
+            models: Vec::new(),
+            model_profile: None,
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
@@ -201,9 +207,14 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # terminal_size = 13
 # agent = "claude"          # "claude", "codex", "gemini" or "opencode"
 # agent_command = ""        # a program and args that speak acp, in place of the agent's own
-# openai_base_url = "https://api.openai.com/v1"  # any openai-compatible server, for agent = "openai"
-# openai_model = ""         # the model it asks; the key lives in the agent-key file
-# openai_context = 32000    # the model's context in tokens; older talk is summarized past 3/4
+# model_profile = ""        # which [models."..."] the custom agent uses
+
+# a model server for agent = "custom"; as many as you like. keys live in
+# agent-keys.toml beside this file, never here.
+# [models."openai"]
+# base_url = "https://api.openai.com/v1"
+# model = "gpt-4.1"
+# context = 32000
 
 # a language server, new or in place of the one ligase knows:
 # [servers.rust]
@@ -236,6 +247,13 @@ pub fn parse(text: &str) -> (Option<Settings>, Vec<String>) {
         }
     };
     for (key, value) in &table {
+        if key == "models" {
+            match value.as_table() {
+                Some(models) => out.models = model_profiles(models, &mut problems),
+                None => problems.push("models must be a table".to_owned()),
+            }
+            continue;
+        }
         if key == "servers" {
             match value.as_table() {
                 Some(servers) => out.servers = server_rules(servers, &mut problems),
@@ -248,7 +266,98 @@ pub fn parse(text: &str) -> (Option<Settings>, Vec<String>) {
             problems.push(format!("{key} = {value}"));
         }
     }
+    // the one server set before profiles came: a profile of its own
+    if out.models.is_empty()
+        && let Some(model) = out.openai_model.clone()
+    {
+        out.models.push(ModelProfile {
+            name: "default".to_owned(),
+            base_url: out.openai_base_url.clone(),
+            model,
+            context: out.openai_context,
+        });
+    }
     (Some(out), problems)
+}
+
+/// a model server the custom agent can use: any openai-compatible api.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelProfile {
+    /// what it is called in lists; also its key's name in the keys file.
+    pub name: String,
+    /// up to and without `/chat/completions`.
+    pub base_url: String,
+    pub model: String,
+    /// the model's context in tokens; auto compact starts at three quarters.
+    pub context: f32,
+}
+
+impl Settings {
+    /// the profile the custom agent uses: the named one, else the first.
+    pub fn active_model(&self) -> Option<&ModelProfile> {
+        let named = self.model_profile.as_deref();
+        named
+            .and_then(|n| self.models.iter().find(|m| m.name == n))
+            .or_else(|| self.models.first())
+    }
+}
+
+/// a profile name a table may use: short, no control characters.
+pub fn model_name_ok(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.len() <= 60
+        && !name.chars().any(char::is_control)
+        && !name.contains('"')
+}
+
+fn model_profiles(table: &toml::Table, problems: &mut Vec<String>) -> Vec<ModelProfile> {
+    let mut out = Vec::new();
+    for (name, value) in table.iter().take(MAX_SERVERS) {
+        let Some(t) = value.as_table().filter(|_| model_name_ok(name)) else {
+            problems.push(format!("models.{name}"));
+            continue;
+        };
+        let text = |key: &str| {
+            t.get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| s.len() <= MAX_TEXT)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let base_url = text("base_url").trim_end_matches('/').to_owned();
+        let model = text("model");
+        let web = base_url.starts_with("http://") || base_url.starts_with("https://");
+        if !web || model.is_empty() {
+            problems.push(format!("models.{name}: needs base_url and model"));
+            continue;
+        }
+        let context = t
+            .get("context")
+            .and_then(|v| v.as_integer().map(|i| i as f64).or_else(|| v.as_float()))
+            .filter(|n| (2_000.0..=2_000_000.0).contains(n))
+            .map_or(32_000.0, |n| n as f32);
+        out.push(ModelProfile {
+            name: name.clone(),
+            base_url,
+            model,
+            context,
+        });
+    }
+    out
+}
+
+/// `text` with the model profile `name` put in, or taken out when none.
+pub fn with_model(text: &str, name: &str, profile: Option<&ModelProfile>) -> String {
+    let body = profile.map(|p| {
+        format!(
+            "base_url = {}\nmodel = {}\ncontext = {}\n",
+            quote(&p.base_url),
+            quote(&p.model),
+            number_literal(p.context)
+        )
+    });
+    with_table(text, "models", name, body.as_deref())
 }
 
 /// a language server from the settings file.
@@ -336,10 +445,39 @@ fn server_rules(table: &toml::Table, problems: &mut Vec<String>) -> Vec<ServerRu
 /// `text` with `language`'s server table put in, or taken out when `rule`
 /// is none. the rest of the file stays as it was written.
 pub fn with_server(text: &str, language: &str, rule: Option<&ServerRule>) -> String {
-    // quoted: `c++`, `c#` or a `.` are no bare toml keys, and one written
-    // bare would stop the whole file from reading
-    let header = format!("[servers.{}]", quote(language));
-    let bare = format!("[servers.{language}]");
+    let body = rule.map(|rule| {
+        let list = |items: &[String]| {
+            let quoted: Vec<String> = items.iter().map(|i| quote(i)).collect();
+            format!("[{}]", quoted.join(", "))
+        };
+        let mut b = String::new();
+        if !rule.command.is_empty() {
+            b.push_str(&format!("command = {}\n", quote(&rule.command)));
+        }
+        if !rule.args.is_empty() {
+            b.push_str(&format!("args = {}\n", list(&rule.args)));
+        }
+        if !rule.roots.is_empty() {
+            b.push_str(&format!("roots = {}\n", list(&rule.roots)));
+        }
+        if !rule.files.is_empty() {
+            b.push_str(&format!("files = {}\n", list(&rule.files)));
+        }
+        if rule.disabled {
+            b.push_str("disabled = true\n");
+        }
+        b
+    });
+    with_table(text, "servers", language, body.as_deref())
+}
+
+/// `text` with the table `[<group>."<name>"]` holding `body`, or taken out
+/// when none. the rest of the file stays as it was written.
+fn with_table(text: &str, group: &str, name: &str, body: Option<&str>) -> String {
+    // quoted: `c++`, `c#`, a `.` or a space are no bare toml keys, and one
+    // written bare would stop the whole file from reading
+    let header = format!("[{group}.{}]", quote(name));
+    let bare = format!("[{group}.{name}]");
     let mut out = String::new();
     let mut skipping = false;
     for line in text.lines() {
@@ -352,32 +490,14 @@ pub fn with_server(text: &str, language: &str, rule: Option<&ServerRule>) -> Str
             out.push('\n');
         }
     }
-    let Some(rule) = rule else { return out };
-    let list = |items: &[String]| {
-        let quoted: Vec<String> = items.iter().map(|i| quote(i)).collect();
-        format!("[{}]", quoted.join(", "))
-    };
+    let Some(body) = body else { return out };
     while out.ends_with("\n\n") {
         out.pop();
     }
     out.push('\n');
     out.push_str(&header);
     out.push('\n');
-    if !rule.command.is_empty() {
-        out.push_str(&format!("command = {}\n", quote(&rule.command)));
-    }
-    if !rule.args.is_empty() {
-        out.push_str(&format!("args = {}\n", list(&rule.args)));
-    }
-    if !rule.roots.is_empty() {
-        out.push_str(&format!("roots = {}\n", list(&rule.roots)));
-    }
-    if !rule.files.is_empty() {
-        out.push_str(&format!("files = {}\n", list(&rule.files)));
-    }
-    if rule.disabled {
-        out.push_str("disabled = true\n");
-    }
+    out.push_str(body);
     out
 }
 
@@ -461,8 +581,16 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some(c) => out.agent_command = Some(c.trim().to_owned()),
             None => return false,
         },
-        "agent" => match word(value, &["claude", "codex", "gemini", "opencode", "openai"])
-            .and_then(crate::agent::Agent::from_word)
+        "model_profile" => match value.as_str().map(str::trim).filter(|s| s.len() <= 60) {
+            Some("") => out.model_profile = None,
+            Some(name) => out.model_profile = Some(name.to_owned()),
+            None => return false,
+        },
+        "agent" => match word(
+            value,
+            &["claude", "codex", "gemini", "opencode", "custom", "openai"],
+        )
+        .and_then(crate::agent::Agent::from_word)
         {
             Some(agent) => out.agent = agent,
             None => return false,
@@ -659,32 +787,7 @@ pub const FIELDS: &[Field] = &[
         label: "Coding Agent",
         about: "The agent the agent panel talks to. It signs in on its own.",
         group: "Agent",
-        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "openai"]),
-    },
-    Field {
-        key: "openai_base_url",
-        label: "Model Server",
-        about: "An OpenAI-compatible server for the built-in agent (agent = openai).",
-        group: "Agent",
-        kind: FieldKind::Text,
-    },
-    Field {
-        key: "openai_model",
-        label: "Model",
-        about: "The model the built-in agent asks.",
-        group: "Agent",
-        kind: FieldKind::Text,
-    },
-    Field {
-        key: "openai_context",
-        label: "Model Context",
-        about: "The model's context in tokens. Older talk is summarized past three quarters of it.",
-        group: "Agent",
-        kind: FieldKind::Number {
-            min: 2_000.0,
-            max: 2_000_000.0,
-            step: 1_000.0,
-        },
+        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "custom"]),
     },
     Field {
         key: "agent_command",
@@ -845,6 +948,7 @@ pub fn current(s: &Settings, key: &str) -> Option<String> {
         }),
         "terminal_size" => number_literal(s.terminal_size),
         "agent" => quote(s.agent.word()),
+        "model_profile" => quote(s.model_profile.as_deref().unwrap_or("")),
         "agent_command" => quote(s.agent_command.as_deref().unwrap_or("")),
         "openai_base_url" => quote(&s.openai_base_url),
         "openai_model" => quote(s.openai_model.as_deref().unwrap_or("")),
@@ -1045,6 +1149,55 @@ command = \"x\"
     }
 
     #[test]
+    fn model_profiles_read_write_and_take_over_the_old_keys() {
+        let text = "agent = \"custom\"\nmodel_profile = \"local\"\n";
+        let p = ModelProfile {
+            name: "local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen".into(),
+            context: 8000.0,
+        };
+        let text = with_model(text, "local", Some(&p));
+        let q = ModelProfile {
+            name: "open ai".into(),
+            base_url: "https://api.openai.com/v1/".into(),
+            model: "gpt".into(),
+            context: 32000.0,
+        };
+        let text = with_model(&text, "open ai", Some(&q));
+        let (s, problems) = parse(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        let s = s.unwrap();
+        assert_eq!(s.agent, crate::agent::Agent::OpenAi);
+        assert_eq!(s.models.len(), 2);
+        assert_eq!(s.active_model().unwrap(), &p);
+        assert_eq!(
+            s.models
+                .iter()
+                .find(|m| m.name == "open ai")
+                .unwrap()
+                .base_url,
+            "https://api.openai.com/v1"
+        );
+        let s = parse(&with_model(&text, "local", None)).0.unwrap();
+        assert_eq!(
+            s.active_model().unwrap().name,
+            "open ai",
+            "the named one gone: the first"
+        );
+        // before profiles: one server in plain keys, and agent = "openai"
+        let old = "agent = \"openai\"\nopenai_base_url = \"http://localhost:1234/v1\"\nopenai_model = \"m\"\n";
+        let s = parse(old).0.unwrap();
+        assert_eq!(s.agent, crate::agent::Agent::OpenAi);
+        assert_eq!(s.active_model().unwrap().name, "default");
+        assert_eq!(s.active_model().unwrap().model, "m");
+        // a profile without a model or a web url is named, not taken
+        let (s, problems) = parse("[models.bad]\nbase_url = \"ftp://x\"\nmodel = \"m\"\n");
+        assert!(s.unwrap().models.is_empty());
+        assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
     fn starter_file_is_all_defaults() {
         let (s, problems) = parse(STARTER);
         assert_eq!(s, Some(Settings::default()));
@@ -1123,9 +1276,6 @@ command = \"x\"
             "terminal_size",
             "agent",
             "agent_command",
-            "openai_base_url",
-            "openai_model",
-            "openai_context",
             "trim_trailing_whitespace",
             "final_newline",
             "save_on_focus_loss",

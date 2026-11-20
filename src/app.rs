@@ -77,6 +77,8 @@ pub enum Id {
     AgentField(u16),
     /// the language server list in settings, by row and part.
     ServerField(u16),
+    /// the model profile list in settings, by row and part.
+    ModelField(u16),
     /// find in files' match case and whole word.
     SearchOption(u16),
     /// the remote panel's tool buttons.
@@ -486,6 +488,8 @@ enum Done {
     AgentWrote(serde_json::Value, Result<(), String>, PathBuf),
     /// the agent's sign in command, to type into a terminal.
     AgentLogin(Result<String, String>),
+    /// the model profiles with a saved key.
+    Keyed(Vec<String>),
     /// the ssh link came up on a folder, with its entries; or why not.
     RemoteReady(Result<(crate::remote::Session, String, Vec<crate::remote::Entry>), String>),
     /// a remote folder's entries.
@@ -698,6 +702,8 @@ pub struct App {
     settings_writes: Vec<(&'static str, Option<String>)>,
     /// server tables to write: the language, and its table or none.
     server_writes: Vec<(String, Option<settings::ServerRule>)>,
+    /// model profile tables to write: the name, and its table or none.
+    model_writes: Vec<(String, Option<settings::ModelProfile>)>,
     settings_writing: bool,
     /// files of tabs closed lately, newest last, for reopen.
     closed: Vec<PathBuf>,
@@ -835,6 +841,7 @@ impl App {
             feeds: HashMap::new(),
             settings_writes: Vec::new(),
             server_writes: Vec::new(),
+            model_writes: Vec::new(),
             settings_writing: false,
             dark: true,
             edit_opts: editor::EditOpts::default(),
@@ -1284,14 +1291,20 @@ impl App {
             return;
         }
         chat.state = agent::State::Starting;
-        let model = self.settings.openai_model.clone().unwrap_or_default();
-        if agent == agent::Agent::OpenAi && !model.is_empty() {
-            chat.title = model.clone();
+        let profile = self.settings.active_model().cloned();
+        let model = profile
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_default();
+        if agent == agent::Agent::OpenAi
+            && let Some(p) = &profile
+        {
+            chat.title = format!("{} · {}", p.name, p.model);
         }
         let custom = self.settings.agent_command.clone().unwrap_or_default();
-        let (base, context) = (
-            self.settings.openai_base_url.clone(),
-            self.settings.openai_context as usize,
+        let (base, context, name) = profile.map_or_else(
+            || (String::new(), 32_000, String::new()),
+            |p| (p.base_url, p.context as usize, p.name),
         );
         let canvas = self.canvas;
         let job = move || {
@@ -1305,7 +1318,7 @@ impl App {
                 let config = agent::native::Config {
                     base,
                     model,
-                    key: agent::native::read_key(),
+                    key: agent::native::read_key(&name),
                     context,
                 };
                 agent::acp::Pipe::in_process(move |lines, out| {
@@ -1559,60 +1572,160 @@ impl App {
         }
     }
 
-    /// opens the built-in agent's setup card with what is set now; the key
-    /// field starts empty, a saved key is never shown back.
+    /// opens the custom agent's profiles on the active one; the key field
+    /// starts empty, a saved key is never shown back. which profiles have a
+    /// key is read on the worker.
     fn open_setup(&mut self) {
-        let setup = agent::Setup {
-            base: self.settings.openai_base_url.clone(),
-            model: self.settings.openai_model.clone().unwrap_or_default(),
-            key: String::new(),
+        let mut setup = agent::Setup {
+            profiles: self
+                .settings
+                .models
+                .iter()
+                .map(|m| m.name.clone())
+                .collect(),
+            ..agent::Setup::default()
         };
+        if let Some(p) = self.settings.active_model() {
+            setup.editing = Some(p.name.clone());
+            fill_setup(&mut setup, p);
+        } else {
+            setup.context = "32000".to_owned();
+        }
         if let Some(chat) = &mut self.chat {
             chat.setup = Some(setup);
         }
+        self.procs.run(|| Done::Keyed(agent::native::keyed()));
         self.ui.focus(Id::AgentField(1), 0);
     }
 
-    /// keeps the setup: server and model in settings, the key in its own
-    /// file, then the built-in agent starts on them.
+    /// the profile at `i` into the card, or an empty one past the last.
+    fn pick_profile(&mut self, i: usize) {
+        let profile = self.settings.models.get(i).cloned();
+        let Some(setup) = self.chat.as_mut().and_then(|c| c.setup.as_mut()) else {
+            return;
+        };
+        setup.key.clear();
+        match profile {
+            Some(p) => {
+                setup.editing = Some(p.name.clone());
+                fill_setup(setup, &p);
+            }
+            None => {
+                setup.editing = None;
+                setup.name.clear();
+                setup.base.clear();
+                setup.model.clear();
+                setup.context = "32000".to_owned();
+            }
+        }
+    }
+
+    /// keeps the profile: its table in settings, made the one in use, its
+    /// key in the keys file; then the custom agent starts on it.
     fn save_setup(&mut self) {
         let Some(setup) = self.chat.as_mut().and_then(|c| c.setup.take()) else {
             return;
         };
+        let name = setup.name.trim().to_owned();
         let base = setup.base.trim().trim_end_matches('/').to_owned();
         let model = setup.model.trim().to_owned();
-        if !(base.starts_with("http://") || base.starts_with("https://")) || model.is_empty() {
-            self.say(
-                self.texts
-                    .tr("The server must start with http:// or https://, and a model is needed")
-                    .to_owned(),
-            );
+        let context = setup
+            .context
+            .trim()
+            .parse::<f32>()
+            .unwrap_or(32_000.0)
+            .clamp(2_000.0, 2_000_000.0);
+        let web = base.starts_with("http://") || base.starts_with("https://");
+        let taken = setup.editing.as_deref() != Some(name.as_str())
+            && self.settings.models.iter().any(|m| m.name == name);
+        let why = if !settings::model_name_ok(&name) {
+            Some("Give the profile a name")
+        } else if taken {
+            Some("A profile has that name already")
+        } else if !web || model.is_empty() {
+            Some("The server must start with http:// or https://, and a model is needed")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.say(self.texts.tr(why).to_owned());
             if let Some(chat) = &mut self.chat {
                 chat.setup = Some(setup);
             }
             return;
         }
+        let profile = settings::ModelProfile {
+            name: name.clone(),
+            base_url: base,
+            model,
+            context,
+        };
+        // a rename takes the old table and key with it
+        let old = setup.editing.clone().filter(|o| *o != name);
+        if let Some(old) = &old {
+            self.model_writes.push((old.clone(), None));
+            self.settings.models.retain(|m| m.name != *old);
+        }
+        match self.settings.models.iter_mut().find(|m| m.name == name) {
+            Some(m) => *m = profile.clone(),
+            None => self.settings.models.push(profile.clone()),
+        }
         self.settings.agent = agent::Agent::OpenAi;
-        self.settings.openai_base_url = base.clone();
-        self.settings.openai_model = Some(model.clone());
+        self.settings.model_profile = Some(name.clone());
+        self.model_writes.push((name.clone(), Some(profile)));
         self.settings_writes
-            .push(("agent", Some(settings::quote("openai"))));
+            .push(("agent", Some(settings::quote("custom"))));
         self.settings_writes
-            .push(("openai_base_url", Some(settings::quote(&base))));
-        self.settings_writes
-            .push(("openai_model", Some(settings::quote(&model))));
+            .push(("model_profile", Some(settings::quote(&name))));
         self.write_settings();
         let key = setup.key.trim().to_owned();
-        if !key.is_empty() {
+        if !key.is_empty() || old.is_some() {
             // on the procs worker, so the start after it sees the key
             self.procs.run(move || {
-                let saved = agent::native::key_path()
-                    .ok_or_else(|| "no config folder".to_owned())
-                    .and_then(|path| save_key(&path, &key));
-                Done::Note(saved.err().map(|e| format!("the key was not saved: {e}")))
+                let mut said = None;
+                if let Some(old) = &old {
+                    let moved = (!key.is_empty())
+                        .then(|| key.clone())
+                        .or_else(|| agent::native::read_key(old));
+                    let _ = agent::native::set_key(old, None);
+                    if let Some(k) = moved {
+                        said = agent::native::set_key(&name, Some(&k)).err();
+                    }
+                } else {
+                    said = agent::native::set_key(&name, Some(&key)).err();
+                }
+                Done::Note(said.map(|e| format!("the key was not saved: {e}")))
             });
         }
         self.start_agent(true);
+    }
+
+    /// deletes the profile being edited, and its key.
+    fn delete_profile(&mut self) {
+        let Some(name) = self
+            .chat
+            .as_ref()
+            .and_then(|c| c.setup.as_ref())
+            .and_then(|s| s.editing.clone())
+        else {
+            return;
+        };
+        self.settings.models.retain(|m| m.name != name);
+        self.model_writes.push((name.clone(), None));
+        if self.settings.model_profile.as_deref() == Some(name.as_str()) {
+            self.settings.model_profile = None;
+            self.settings_writes.push(("model_profile", None));
+        }
+        self.write_settings();
+        let gone = name.clone();
+        self.procs.run(move || {
+            Done::Note(
+                agent::native::set_key(&gone, None)
+                    .err()
+                    .map(|e| format!("the key stays: {e}")),
+            )
+        });
+        self.open_setup();
     }
 
     /// what the agent panel asked for.
@@ -1651,7 +1764,7 @@ impl App {
             }
             Ask::SetupOpen => {}
             Ask::SetupPreset(i) => {
-                if let (Some(setup), Some((_, base, model, _))) = (
+                if let (Some(setup), Some((name, base, model, _))) = (
                     self.chat.as_mut().and_then(|c| c.setup.as_mut()),
                     agent::native::PRESETS.get(i),
                 ) {
@@ -1661,8 +1774,13 @@ impl App {
                     if setup.model.trim().is_empty() || preset_model {
                         setup.model = (*model).to_owned();
                     }
+                    if setup.name.trim().is_empty() {
+                        setup.name = name.to_lowercase().replace(' ', "-");
+                    }
                 }
             }
+            Ask::SetupPick(i) => self.pick_profile(i),
+            Ask::SetupDelete => self.delete_profile(),
             Ask::SetupCancel => {
                 if let Some(chat) = &mut self.chat {
                     chat.setup = None;
@@ -4491,6 +4609,11 @@ impl App {
                         self.scan(dir.to_path_buf());
                     }
                 }
+                Done::Keyed(names) => {
+                    if let Some(setup) = self.chat.as_mut().and_then(|c| c.setup.as_mut()) {
+                        setup.saved_keys = names;
+                    }
+                }
                 Done::AgentLogin(line) => match line {
                     Ok(line) => {
                         if self.shells.add().is_some() {
@@ -5220,6 +5343,49 @@ impl App {
             Some(settings::view::Ask::Set(key, literal)) => {
                 self.settings_writes.push((key, literal));
                 self.write_settings();
+            }
+            Some(settings::view::Ask::UseModel(name)) => {
+                self.settings.model_profile = Some(name.clone());
+                self.settings_writes
+                    .push(("model_profile", Some(settings::quote(&name))));
+                self.write_settings();
+                if self
+                    .chat
+                    .as_ref()
+                    .is_some_and(|c| c.agent == agent::Agent::OpenAi)
+                {
+                    self.start_agent(true);
+                }
+            }
+            Some(settings::view::Ask::EditModel(name)) => {
+                // the card lives in the agent panel
+                self.sheet.close();
+                if self.chat.is_none() {
+                    let root = self.explorer.root().to_path_buf();
+                    self.chat = Some(agent::Chat::new(agent::Agent::OpenAi, root));
+                }
+                self.bench.show(Panel::Agent);
+                self.open_setup();
+                let i = name
+                    .and_then(|n| self.settings.models.iter().position(|m| m.name == n))
+                    .unwrap_or(self.settings.models.len());
+                self.pick_profile(i);
+            }
+            Some(settings::view::Ask::DeleteModel(name)) => {
+                self.settings.models.retain(|m| m.name != name);
+                self.model_writes.push((name.clone(), None));
+                if self.settings.model_profile.as_deref() == Some(name.as_str()) {
+                    self.settings.model_profile = None;
+                    self.settings_writes.push(("model_profile", None));
+                }
+                self.write_settings();
+                self.procs.run(move || {
+                    Done::Note(
+                        agent::native::set_key(&name, None)
+                            .err()
+                            .map(|e| format!("the key stays: {e}")),
+                    )
+                });
             }
             Some(settings::view::Ask::Server(language, rule)) => {
                 self.server_writes.push((language, rule));
@@ -6332,21 +6498,25 @@ impl App {
     /// so none is lost between a read and a write.
     fn write_settings(&mut self) {
         if self.settings_writing
-            || (self.settings_writes.is_empty() && self.server_writes.is_empty())
+            || (self.settings_writes.is_empty()
+                && self.server_writes.is_empty()
+                && self.model_writes.is_empty())
         {
             return;
         }
         let Some(path) = settings::path() else {
             self.settings_writes.clear();
             self.server_writes.clear();
+            self.model_writes.clear();
             self.say(self.texts.tr("No settings folder").to_owned());
             return;
         };
         let edits = std::mem::take(&mut self.settings_writes);
         let servers = std::mem::take(&mut self.server_writes);
+        let models = std::mem::take(&mut self.model_writes);
         self.settings_writing = true;
         self.jobs
-            .run(move || Done::SettingsWrote(write_settings(&path, &edits, &servers)));
+            .run(move || Done::SettingsWrote(write_settings(&path, &edits, &servers, &models)));
     }
 
     /// the rail's buttons: side bar panels on top; the panels under the
@@ -6599,6 +6769,7 @@ fn write_settings(
     path: &Path,
     edits: &[(&str, Option<String>)],
     servers: &[(String, Option<settings::ServerRule>)],
+    models: &[(String, Option<settings::ModelProfile>)],
 ) -> Result<String, String> {
     let mut text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -6610,6 +6781,9 @@ fn write_settings(
     }
     for (language, rule) in servers {
         text = settings::with_server(&text, language, rule.as_ref());
+    }
+    for (name, profile) in models {
+        text = settings::with_model(&text, name, profile.as_ref());
     }
     workbench::write_session(path, &text)?;
     Ok(text)
@@ -7009,20 +7183,12 @@ fn parent_of(path: &str) -> String {
     }
 }
 
-/// writes the agent key to its own file, readable only by its owner where
-/// the system allows saying so.
-fn save_key(path: &Path, key: &str) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, format!("{key}\n")).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+/// a saved profile's values into the setup card; the key stays empty.
+fn fill_setup(setup: &mut agent::Setup, p: &settings::ModelProfile) {
+    setup.name = p.name.clone();
+    setup.base = p.base_url.clone();
+    setup.model = p.model.clone();
+    setup.context = format!("{}", p.context as i64);
 }
 
 /// the one edit that turns `now` into `want`: the middle between what both

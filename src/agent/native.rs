@@ -87,22 +87,82 @@ pub fn is_local(base: &str) -> bool {
     rest.starts_with("localhost") || rest.starts_with("127.0.0.1") || rest.starts_with("[::1]")
 }
 
-/// the key: `LIGASE_AGENT_KEY`, then `OPENAI_API_KEY`, then the key file in
-/// the config folder. reads the disk: worker only.
-pub fn read_key() -> Option<String> {
-    let env = |name| std::env::var(name).ok().filter(|k| !k.trim().is_empty());
-    env("LIGASE_AGENT_KEY")
-        .or_else(|| env("OPENAI_API_KEY"))
-        .or_else(|| {
-            let text = std::fs::read_to_string(key_path()?).ok()?;
-            let key = text.trim().to_owned();
-            (!key.is_empty() && key.len() < 1024).then_some(key)
-        })
+/// longest key kept.
+const MAX_KEY: usize = 1024;
+
+/// the keys file beside the settings: `"profile" = "key"` lines, one per
+/// model profile. never in the settings file, which people share.
+pub fn keys_path() -> Option<PathBuf> {
+    aurea::config_dir("ligase").map(|d| d.join("agent-keys.toml"))
 }
 
-/// the key file, beside the settings.
-pub fn key_path() -> Option<PathBuf> {
-    aurea::config_dir("ligase").map(|d| d.join("agent-key"))
+/// the keys file read; empty when missing or not toml. worker only.
+fn read_keys() -> toml::Table {
+    keys_path().map(|p| keys_in(&p)).unwrap_or_default()
+}
+
+fn keys_in(path: &Path) -> toml::Table {
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|t| t.len() < 256 * 1024)
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .unwrap_or_default()
+}
+
+/// `profile`'s key: `LIGASE_AGENT_KEY` first, then the keys file, then
+/// `OPENAI_API_KEY`. reads the disk: worker only.
+pub fn read_key(profile: &str) -> Option<String> {
+    let env = |name| std::env::var(name).ok().filter(|k| !k.trim().is_empty());
+    env("LIGASE_AGENT_KEY")
+        .or_else(|| {
+            read_keys()
+                .get(profile)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|k| !k.is_empty() && k.len() < MAX_KEY)
+                .map(str::to_owned)
+        })
+        .or_else(|| env("OPENAI_API_KEY"))
+}
+
+/// the profiles with a key in the file, to say so without showing it.
+/// worker only.
+pub fn keyed() -> Vec<String> {
+    read_keys().keys().cloned().collect()
+}
+
+/// puts `profile`'s key in the file, or takes it out; the others stay.
+/// readable only by its owner where the system allows saying so. worker
+/// only.
+pub fn set_key(profile: &str, key: Option<&str>) -> Result<(), String> {
+    set_key_in(&keys_path().ok_or("no config folder")?, profile, key)
+}
+
+fn set_key_in(path: &Path, profile: &str, key: Option<&str>) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let mut keys = keys_in(&path);
+    match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) if k.len() < MAX_KEY => {
+            keys.insert(profile.to_owned(), toml::Value::String(k.to_owned()));
+        }
+        Some(_) => return Err("the key is too long".to_owned()),
+        None => {
+            keys.remove(profile);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let text = toml::to_string(&keys).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 /// what the in-process agent shares between its threads.
@@ -945,6 +1005,21 @@ mod tests {
         );
         assert_eq!(file_uri("https://x"), None);
         assert_eq!(file_uri("file:///w/a.rs#Lx-9"), None);
+    }
+
+    #[test]
+    fn keys_are_kept_apart_by_profile() {
+        let path = std::env::temp_dir().join(format!("ligase-keys-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        set_key_in(&path, "work", Some(" sk-1 ")).unwrap();
+        set_key_in(&path, "my \"home\" box", Some("sk-2")).unwrap();
+        let keys = keys_in(&path);
+        assert_eq!(keys["work"].as_str(), Some("sk-1"), "trimmed");
+        assert_eq!(keys["my \"home\" box"].as_str(), Some("sk-2"));
+        set_key_in(&path, "work", None).unwrap();
+        assert!(!keys_in(&path).contains_key("work"));
+        assert!(set_key_in(&path, "x", Some(&"k".repeat(2000))).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

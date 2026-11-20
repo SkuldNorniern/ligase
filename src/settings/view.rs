@@ -17,7 +17,7 @@ use super::{FIELDS, Field, FieldKind, RailPlace, Settings, current, quote};
 use crate::app::Id;
 use crate::lang::Texts;
 
-const GROUPS: [&str; 8] = [
+const GROUPS: [&str; 9] = [
     "All",
     "Look",
     "Editor",
@@ -25,6 +25,7 @@ const GROUPS: [&str; 8] = [
     "Layout",
     "Terminal",
     "Agent",
+    "Models",
     "Language Servers",
 ];
 /// a row with an inline control.
@@ -65,6 +66,11 @@ pub enum Ask {
     OpenFile,
     /// write `language`'s server table, or take it out.
     Server(String, Option<crate::settings::ServerRule>),
+    /// the custom agent uses this profile from now on.
+    UseModel(String),
+    /// edit this profile in the agent panel; none for a new one.
+    EditModel(Option<String>),
+    DeleteModel(String),
     Close,
 }
 
@@ -113,11 +119,14 @@ impl Sheet {
     }
 
     /// the rows the search and the chip let through.
-    fn shown(&self, texts: &Texts) -> Vec<&'static Field> {
+    fn shown(&self, texts: &Texts, settings: &Settings) -> Vec<&'static Field> {
         let query = self.query.trim().to_lowercase();
         let group = GROUPS.get(self.group).copied().unwrap_or("All");
+        let custom = settings.agent == crate::agent::Agent::OpenAi;
         FIELDS
             .iter()
+            // a program for an outside agent means nothing to the custom one
+            .filter(|f| !(custom && f.key == "agent_command"))
             .filter(|f| group == "All" || f.group == group)
             .filter(|f| {
                 query.is_empty()
@@ -333,7 +342,15 @@ pub fn show(
     // group chips, one lit
     let chip_font = ui.theme.font(12.0);
     let mut cx = chips.x;
+    let custom = settings.agent == crate::agent::Agent::OpenAi;
+    if !custom && GROUPS.get(sheet.group).copied() == Some("Models") {
+        sheet.group = 0;
+    }
     for (i, group) in GROUPS.iter().enumerate() {
+        // model servers only mean something for the custom agent
+        if *group == "Models" && !custom {
+            continue;
+        }
         let label = texts.tr(group);
         let w = ui.text_width(label, &chip_font) + 22.0;
         let at = Rect::new(cx, chips.y, w, chips.height);
@@ -366,7 +383,10 @@ pub fn show(
     if GROUPS.get(sheet.group).copied() == Some("Language Servers") {
         return Ok(servers_list(ui, sheet, list, texts)?.or(ask));
     }
-    let rows = sheet.shown(texts);
+    if GROUPS.get(sheet.group).copied() == Some("Models") {
+        return Ok(models_list(ui, sheet, settings, list, texts)?.or(ask));
+    }
+    let rows = sheet.shown(texts, settings);
     if rows.is_empty() {
         let small = ui.theme.font(13.0);
         ui.text(
@@ -590,6 +610,113 @@ fn servers_list(
         let _ = &font;
         Ok(asked)
     })?;
+    Ok(asked)
+}
+
+/// the custom agent's model profiles: the one in use marked, each with
+/// use, edit and delete; editing happens in the agent panel's card.
+fn models_list(
+    ui: &mut Ui<'_, Id>,
+    sheet: &mut Sheet,
+    settings: &Settings,
+    list: Rect,
+    texts: &Texts,
+) -> AureaResult<Option<Ask>> {
+    let colours = ui.theme.palette;
+    let small = ui.theme.font(12.0);
+    let bold = ui.theme.bold(13.0);
+    const ROW_H: f32 = 64.0;
+    let models = &settings.models;
+    let active = settings.active_model().map(|m| m.name.clone());
+    let content = models.len() as f32 * (ROW_H + 8.0) + 100.0;
+    sheet.scroll = sheet.scroll.min((content - list.height).max(0.0));
+    let (_, asked) = ScrollArea::new(&mut sheet.scroll, content).show(
+        ui,
+        Id::SettingsList,
+        list,
+        |ui, content, _| {
+            let mut asked = None;
+            let mut y = content.y;
+            let about = texts.tr(
+                "Model servers the custom agent can use. Keys are kept apart from these settings.",
+            );
+            ui.text_clipped(
+                about,
+                Rect::new(content.x + INSET, y, content.width - 2.0 * INSET, 20.0),
+                &small,
+                colours.dim,
+                Align::Start,
+            )?;
+            y += 30.0;
+            for (i, m) in models.iter().enumerate() {
+                let card = Rect::new(content.x, y, content.width, ROW_H);
+                y += ROW_H + 8.0;
+                ui.round(card, 10.0, colours.raised)?;
+                let inner = card.inset_xy(14.0, 10.0);
+                let n = u16::try_from(i).unwrap_or(u16::MAX / 4) * 4;
+                let on = active.as_deref() == Some(m.name.as_str());
+                if on {
+                    ui.round(
+                        Rect::new(inner.x, inner.y + 6.0, 7.0, 7.0),
+                        3.5,
+                        colours.success,
+                    )?;
+                }
+                let x = inner.x + if on { 14.0 } else { 0.0 };
+                // the buttons first, so the words know their room
+                let mut bx = inner.right();
+                let mut button = |ui: &mut Ui<'_, Id>,
+                                  label: &str,
+                                  part: u16,
+                                  primary: bool|
+                 -> AureaResult<bool> {
+                    let w = ui.text_width(label, &small) + 24.0;
+                    bx -= w;
+                    let r = Rect::new(bx, inner.y + (inner.height - 26.0) / 2.0, w, 26.0);
+                    bx -= 6.0;
+                    let b = if primary {
+                        Button::new(label).primary()
+                    } else {
+                        Button::new(label).quiet()
+                    };
+                    Ok(r.x > x + 60.0 && b.show(ui, Id::ModelField(n + part), r)?.clicked)
+                };
+                if button(ui, texts.tr("Delete"), 0, false)? {
+                    asked = Some(Ask::DeleteModel(m.name.clone()));
+                }
+                if button(ui, texts.tr("Edit"), 1, false)? {
+                    asked = Some(Ask::EditModel(Some(m.name.clone())));
+                }
+                if !on && button(ui, texts.tr("Use"), 2, true)? {
+                    asked = Some(Ask::UseModel(m.name.clone()));
+                }
+                let words = (bx - x - 8.0).max(0.0);
+                ui.text_clipped(
+                    &m.name,
+                    Rect::new(x, inner.y, words, 20.0),
+                    &bold,
+                    colours.text,
+                    Align::Start,
+                )?;
+                let line = format!("{} · {}", m.model, m.base_url);
+                ui.text_clipped(
+                    &line,
+                    Rect::new(inner.x, inner.y + 24.0, words + (x - inner.x), 18.0),
+                    &small,
+                    colours.dim,
+                    Align::Start,
+                )?;
+            }
+            let add = Rect::new(content.x, y + 4.0, 170.0_f32.min(content.width), 30.0);
+            if Button::new(texts.tr("Add model server"))
+                .show(ui, Id::ModelField(u16::MAX), add)?
+                .clicked
+            {
+                asked = Some(Ask::EditModel(None));
+            }
+            Ok(asked)
+        },
+    )?;
     Ok(asked)
 }
 

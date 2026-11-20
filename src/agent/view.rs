@@ -45,8 +45,11 @@ pub enum Ask {
     Unref(usize),
     /// the built-in agent's setup card: open, a preset, save, close.
     SetupOpen,
+    /// a profile to edit, by place; one past the last for a new one.
+    SetupPick(usize),
     SetupPreset(usize),
     SetupSave,
+    SetupDelete,
     SetupCancel,
 }
 
@@ -708,8 +711,9 @@ pub fn show(
     Ok(ask)
 }
 
-/// the built-in agent's setup: a preset to start from, the server, the
-/// model, the key. the key field never shows a saved key.
+/// the custom agent's model profiles: one to pick at the top, then the
+/// picked one's server, model, context and key. the key field never shows
+/// a saved key; it only says there is one.
 fn setup_card(
     ui: &mut Ui<'_, Id>,
     chat: &mut Chat,
@@ -729,14 +733,14 @@ fn setup_card(
     let area = rect.inset(PAD);
     let mut y = area.y + 4.0;
     ui.text(
-        texts.tr("Set up a model"),
+        texts.tr("Model servers"),
         Rect::new(area.x, y, area.width, 22.0),
         &bold,
         palette.text,
         Align::Start,
     )?;
     y += 26.0;
-    let about = texts.tr("Any OpenAI-compatible server. The key stays in a file in Ligase's config folder; local servers need none.");
+    let about = texts.tr("Any OpenAI-compatible server, as many as you like. Keys stay in a file in Ligase's config folder; local servers need none.");
     for line in hover::wrap(ui, about, &small, area.width) {
         ui.text(
             &line,
@@ -748,42 +752,58 @@ fn setup_card(
         y += 17.0;
     }
     y += 10.0;
-    // presets as chips, wrapping
-    let mut x = area.x;
-    for (i, (name, base, ..)) in super::native::PRESETS.iter().enumerate() {
-        let w = ui.text_width(name, &small) + 20.0;
-        if x > area.x && x + w > area.right() {
-            x = area.x;
-            y += CHIP + 6.0;
+    // chips that wrap: the profiles, then a new one; presets further down
+    let chips = |ui: &mut Ui<'_, Id>,
+                 y: &mut f32,
+                 items: &[(String, bool)],
+                 base: u16|
+     -> AureaResult<Option<usize>> {
+        let mut x = area.x;
+        let mut picked = None;
+        for (i, (name, lit)) in items.iter().enumerate() {
+            let w = ui.text_width(name, &small) + 20.0;
+            if x > area.x && x + w > area.right() {
+                x = area.x;
+                *y += CHIP + 6.0;
+            }
+            let chip = Rect::new(x, *y, w.min(area.width), CHIP);
+            let n = base.saturating_add(u16::try_from(i).unwrap_or(u16::MAX - base));
+            let input = ui.interact(Id::AgentButton(n), 0, chip, Sense::Click, true);
+            let fill = if *lit {
+                palette.accent.fade(0.25)
+            } else if input.hovered {
+                palette.hover
+            } else {
+                palette.raised
+            };
+            ui.round(chip, 11.0, fill)?;
+            ui.text_clipped(
+                name,
+                chip.inset_xy(8.0, 0.0),
+                &small,
+                if *lit { palette.text } else { palette.dim },
+                Align::Center,
+            )?;
+            if input.hovered {
+                ui.set_cursor(CursorIcon::Pointer);
+            }
+            if input.clicked {
+                picked = Some(i);
+            }
+            x += w + 6.0;
         }
-        let chip = Rect::new(x, y, w.min(area.width), CHIP);
-        let n = u16::try_from(60 + i).unwrap_or(u16::MAX);
-        let input = ui.interact(Id::AgentButton(n), 0, chip, Sense::Click, true);
-        let lit = setup.base == *base;
-        let fill = if lit {
-            palette.accent.fade(0.25)
-        } else if input.hovered {
-            palette.hover
-        } else {
-            palette.raised
-        };
-        ui.round(chip, 11.0, fill)?;
-        ui.text(
-            name,
-            chip,
-            &small,
-            if lit { palette.text } else { palette.dim },
-            Align::Center,
-        )?;
-        if input.hovered {
-            ui.set_cursor(CursorIcon::Pointer);
-        }
-        if input.clicked {
-            ask = Some(Ask::SetupPreset(i));
-        }
-        x += w + 6.0;
+        *y += CHIP + 12.0;
+        Ok(picked)
+    };
+    let mut profiles: Vec<(String, bool)> = setup
+        .profiles
+        .iter()
+        .map(|p| (p.clone(), setup.editing.as_deref() == Some(p.as_str())))
+        .collect();
+    profiles.push((texts.tr("+ New").to_owned(), setup.editing.is_none()));
+    if let Some(i) = chips(ui, &mut y, &profiles, 60)? {
+        ask = Some(Ask::SetupPick(i));
     }
-    y += CHIP + 14.0;
     let field = |ui: &mut Ui<'_, Id>, label: &str, y: f32| -> AureaResult<Rect> {
         ui.text(
             label,
@@ -794,28 +814,86 @@ fn setup_card(
         )?;
         Ok(Rect::new(area.x, y + 20.0, area.width, 30.0))
     };
+    let at = field(ui, texts.tr("Name"), y)?;
+    TextField::new(&mut setup.name)
+        .placeholder("openai, local, work…")
+        .max_chars(60)
+        .show(ui, Id::AgentField(3), at)?;
+    y = at.bottom() + 10.0;
+    ui.text(
+        texts.tr("Start from"),
+        Rect::new(area.x, y, area.width, 18.0),
+        &small,
+        palette.dim,
+        Align::Start,
+    )?;
+    y += 20.0;
+    let presets: Vec<(String, bool)> = super::native::PRESETS
+        .iter()
+        .map(|(name, base, ..)| ((*name).to_owned(), setup.base == *base))
+        .collect();
+    if let Some(i) = chips(ui, &mut y, &presets, 80)? {
+        ask = Some(Ask::SetupPreset(i));
+    }
     let at = field(ui, texts.tr("Server URL"), y)?;
     TextField::new(&mut setup.base)
         .placeholder("https://api.openai.com/v1")
         .max_chars(500)
         .show(ui, Id::AgentField(0), at)?;
     y = at.bottom() + 10.0;
-    let at = field(ui, texts.tr("Model"), y)?;
+    // model and context side by side when there is room
+    let wide = area.width >= 300.0;
+    let model_w = if wide { area.width - 110.0 } else { area.width };
+    ui.text(
+        texts.tr("Model"),
+        Rect::new(area.x, y, model_w, 18.0),
+        &small,
+        palette.dim,
+        Align::Start,
+    )?;
+    let model_at = Rect::new(area.x, y + 20.0, model_w, 30.0);
     TextField::new(&mut setup.model)
         .placeholder("gpt-4.1")
         .max_chars(200)
-        .show(ui, Id::AgentField(1), at)?;
-    y = at.bottom() + 10.0;
+        .show(ui, Id::AgentField(1), model_at)?;
+    let context_at = if wide {
+        let x = area.x + model_w + 10.0;
+        ui.text(
+            texts.tr("Context"),
+            Rect::new(x, y, 100.0, 18.0),
+            &small,
+            palette.dim,
+            Align::Start,
+        )?;
+        y = model_at.bottom() + 10.0;
+        Rect::new(x, model_at.y, 100.0, 30.0)
+    } else {
+        let at = field(ui, texts.tr("Context"), model_at.bottom() + 10.0)?;
+        y = at.bottom() + 10.0;
+        at
+    };
+    TextField::new(&mut setup.context)
+        .placeholder("32000")
+        .max_chars(8)
+        .show(ui, Id::AgentField(4), context_at)?;
     let at = field(ui, texts.tr("API key"), y)?;
+    let saved = setup.saved_keys.iter().any(|k| *k == setup.name.trim());
+    let hint = if saved {
+        texts.tr("a key is saved; empty keeps it")
+    } else {
+        texts.tr("sk-…, empty for local servers")
+    };
     let typed = TextField::new(&mut setup.key)
-        .placeholder(texts.tr("empty keeps the saved key"))
+        .placeholder(hint)
         .password(true)
         .max_chars(1000)
         .show(ui, Id::AgentField(2), at)?;
     y = at.bottom() + 16.0;
-    let ready = !setup.base.trim().is_empty() && !setup.model.trim().is_empty();
-    let save = Rect::new(area.x, y, 140.0_f32.min(area.width), 30.0);
-    if (Button::new(texts.tr("Save and start"))
+    let ready = !setup.name.trim().is_empty()
+        && !setup.base.trim().is_empty()
+        && !setup.model.trim().is_empty();
+    let save = Rect::new(area.x, y, 130.0_f32.min(area.width), 30.0);
+    if (Button::new(texts.tr("Save and use"))
         .primary()
         .enabled(ready)
         .show(ui, Id::AgentButton(7), save)?
@@ -825,7 +903,20 @@ fn setup_card(
     {
         ask = Some(Ask::SetupSave);
     }
-    let cancel = Rect::new(save.right() + 8.0, y, 90.0, 30.0);
+    let mut x = save.right() + 8.0;
+    if setup.editing.is_some() {
+        let delete = Rect::new(x, y, 80.0, 30.0);
+        if delete.right() <= area.right()
+            && Button::new(texts.tr("Delete"))
+                .quiet()
+                .show(ui, Id::AgentButton(9), delete)?
+                .clicked
+        {
+            ask = Some(Ask::SetupDelete);
+        }
+        x = delete.right() + 8.0;
+    }
+    let cancel = Rect::new(x, y, 80.0, 30.0);
     if cancel.right() <= area.right()
         && Button::new(texts.tr("Cancel"))
             .quiet()

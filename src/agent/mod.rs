@@ -42,11 +42,15 @@ impl Agent {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
-            Self::OpenAi => "openai",
+            Self::OpenAi => "custom",
         }
     }
 
     pub fn from_word(word: &str) -> Option<Self> {
+        // `openai` was its name before profiles
+        if word == "openai" {
+            return Some(Self::OpenAi);
+        }
         Self::ALL.into_iter().find(|a| a.word() == word)
     }
 
@@ -56,7 +60,7 @@ impl Agent {
             Self::Codex => "Codex",
             Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
-            Self::OpenAi => "Model",
+            Self::OpenAi => "Custom",
         }
     }
 
@@ -312,10 +316,20 @@ enum Pending {
 /// the built-in agent's setup card, filled in by the person.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Setup {
+    /// the profile's name, as typed.
+    pub name: String,
     pub base: String,
     pub model: String,
+    /// the context in tokens, as typed.
+    pub context: String,
     /// typed here only; never shown back. empty keeps the key there is.
     pub key: String,
+    /// the profile being edited, by its saved name; none for a new one.
+    pub editing: Option<String>,
+    /// every saved profile's name, for the chips.
+    pub profiles: Vec<String>,
+    /// profiles with a key in the keys file.
+    pub saved_keys: Vec<String>,
 }
 
 /// one agent conversation and its pipe.
