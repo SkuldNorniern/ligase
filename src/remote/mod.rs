@@ -1,8 +1,5 @@
 //! one shell on another machine over ssh, kept open, asked one command at a time.
 
-// used by the remote workspace, next
-#![allow(dead_code)]
-
 pub mod browse;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -36,7 +33,12 @@ pub struct Session {
     lines: Receiver<String>,
     counter: u64,
     broken: bool,
+    /// the tail of what ssh said on stderr, to tell why a link failed.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
 }
+
+/// env var that makes ligase answer ssh's password prompt and exit.
+pub const ASKPASS: &str = "LIGASE_ASKPASS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -46,34 +48,59 @@ pub struct Entry {
 
 impl Session {
     /// `ssh -T -- host sh` (no window on windows: CREATE_NO_WINDOW). host must pass crate::terminal::host_ok.
-    pub fn connect(host: &str) -> Result<Session, String> {
+    pub fn connect(host: &str, password: Option<&str>) -> Result<Session, String> {
         if !terminal::host_ok(host) {
             return Err(format!("not a host name: {host}"));
         }
-        // no prompts: nobody can answer them on a hidden link. keys or an
-        // agent log in; a password-only host fails fast instead of hanging
-        Session::spawn(
-            "ssh",
-            &[
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "--",
-                host,
-                "sh",
-            ],
-        )
+        // a host seen the first time is learned, as vs code's remote does;
+        // a changed key still fails. the link is pinged so a dead one is
+        // noticed within the minute
+        let mut args = vec![
+            "-T",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+        ];
+        let mut env: Vec<(&str, String)> = Vec::new();
+        match password {
+            // nobody can answer a prompt on a hidden link: keys or an agent
+            // log in, and a password-only host fails fast instead of hanging
+            None => args.extend(["-o", "BatchMode=yes"]),
+            // ssh asks ligase itself for the password, once
+            Some(secret) => {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                args.extend(["-o", "NumberOfPasswordPrompts=1"]);
+                env.push(("SSH_ASKPASS", exe.to_string_lossy().into_owned()));
+                env.push(("SSH_ASKPASS_REQUIRE", "force".to_owned()));
+                env.push((
+                    "DISPLAY",
+                    std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+                ));
+                env.push((ASKPASS, secret.to_owned()));
+            }
+        }
+        args.extend(["--", host, "sh"]);
+        Session::spawn_with("ssh", &args, &env)
     }
 
     /// any program speaking sh on stdin; for tests (e.g. "sh" from git for windows) and for connect.
+    #[cfg(test)]
     pub fn spawn(program: &str, args: &[&str]) -> Result<Session, String> {
+        Session::spawn_with(program, args, &[])
+    }
+
+    fn spawn_with(program: &str, args: &[&str], env: &[(&str, String)]) -> Result<Session, String> {
         let mut cmd = Command::new(program);
         cmd.args(args)
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -88,6 +115,31 @@ impl Session {
             let _ = child.wait();
             return Err(format!("no pipes to {program}"));
         };
+        // ssh's own words, the last 2 KiB of them
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(mut stderr) = child.stderr.take() {
+            let tail = std::sync::Arc::clone(&said);
+            let _ = thread::Builder::new()
+                .name("remote-stderr".into())
+                .spawn(move || {
+                    let mut chunk = [0u8; 1024];
+                    while let Ok(n) = stderr.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Ok(mut t) = tail.lock() {
+                            t.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                            if t.len() > 2048 {
+                                let mut cut = t.len() - 2048;
+                                while !t.is_char_boundary(cut) {
+                                    cut += 1;
+                                }
+                                t.drain(..cut);
+                            }
+                        }
+                    }
+                });
+        }
         let (tx, lines) = mpsc::sync_channel(QUEUE);
         let reader = thread::Builder::new()
             .name("remote-reader".into())
@@ -103,6 +155,7 @@ impl Session {
             lines,
             counter: 0,
             broken: false,
+            said,
         })
     }
 
@@ -125,8 +178,19 @@ impl Session {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = match self.lines.recv_timeout(left) {
                 Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => return Err(self.fail("timed out")),
-                Err(RecvTimeoutError::Disconnected) => return Err(self.fail("the link closed")),
+                Err(RecvTimeoutError::Timeout) => {
+                    let why = self.why("timed out");
+                    return Err(self.fail(&why));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // ssh may still be writing why; a moment for its last line
+                    let until = Instant::now() + Duration::from_millis(300);
+                    while Instant::now() < until && matches!(self.child.try_wait(), Ok(None)) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    let why = self.why("the link closed");
+                    return Err(self.fail(&why));
+                }
             };
             if !begun {
                 begun = line.trim_end_matches('\n') == mark.as_str();
@@ -354,6 +418,15 @@ impl Session {
             Ok(false) | Err(RecvTimeoutError::Disconnected) => Err(self.fail(LINK_DOWN)),
             Err(RecvTimeoutError::Timeout) => Err(self.fail("timed out sending")),
         }
+    }
+
+    /// ssh's last line on stderr when it said something, else `fallback`.
+    fn why(&self, fallback: &str) -> String {
+        let said = self.said.lock().map(|s| s.clone()).unwrap_or_default();
+        said.lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .map_or_else(|| fallback.to_owned(), |l| l.chars().take(300).collect())
     }
 
     /// marks the session broken and gives the message back.
@@ -664,8 +737,24 @@ Host box
 
     #[test]
     fn connect_checks_host() {
-        assert!(Session::connect("-oProxyCommand=x").is_err());
-        assert!(Session::connect("").is_err());
+        assert!(Session::connect("-oProxyCommand=x", None).is_err());
+        assert!(Session::connect("", Some("pw")).is_err());
+    }
+
+    #[test]
+    fn a_refused_link_says_why() {
+        // a stand-in for ssh: says no on stderr, then goes
+        let Ok(mut s) = Session::spawn(
+            "sh",
+            &[
+                "-c",
+                "echo 'me@box: Permission denied (publickey,password).' >&2; exit 255",
+            ],
+        ) else {
+            return;
+        };
+        let err = s.home().expect_err("no shell there");
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     /// a posix sh, or None (the tests then skip).

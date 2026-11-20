@@ -68,6 +68,15 @@ fn icon_set() -> Option<ImageSet> {
 }
 
 fn main() -> ExitCode {
+    // started by ssh as its password helper: say the password and go
+    if let Some(secret) = std::env::var_os(remote::ASKPASS) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(secret.to_string_lossy().as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

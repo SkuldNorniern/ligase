@@ -40,6 +40,11 @@ pub struct Node {
 /// the remote folder's panel state.
 pub struct Browser {
     pub host: String,
+    /// typed after a refused login; sent once, then cleared.
+    pub password: String,
+    /// the password the link was made with, kept in memory only so a
+    /// reconnect needs no typing. never written anywhere.
+    pub secret: Option<String>,
     /// the folder shown; known once the link is up.
     pub root: String,
     pub state: State,
@@ -153,6 +158,8 @@ impl Browser {
     pub fn new(host: String) -> Self {
         Self {
             host,
+            password: String::new(),
+            secret: None,
             root: String::new(),
             state: State::Connecting,
             rows: Vec::new(),
@@ -310,12 +317,35 @@ pub fn show(
         head.height,
     );
     ui.text_clipped(&label, text, &small, palette.dim, Align::Start)?;
-    if let State::Failed(_) = &browser.state {
-        let b = Rect::new(list.x, list.y + 6.0, 140.0_f32.min(list.width), 28.0);
-        if Button::new(texts.tr("Reconnect"))
+    if let State::Failed(why) = &browser.state {
+        // a host that wants a password: a field for it, ssh asks ligase
+        let refused = why.contains("Permission denied") || why.contains("password");
+        let mut y = list.y + 6.0;
+        let mut typed = false;
+        if refused {
+            let field = Rect::new(list.x, y, list.width.min(320.0), 28.0);
+            typed = TextField::new(&mut browser.password)
+                .password(true)
+                .placeholder(texts.tr("Password"))
+                .max_chars(1000)
+                .show(ui, Id::RemoteTool(7), field)?
+                .submitted;
+            y += 36.0;
+        }
+        let label = if refused {
+            texts.tr("Connect with password")
+        } else {
+            texts.tr("Reconnect")
+        };
+        let w = (ui.text_width(label, &small) + 32.0)
+            .max(140.0)
+            .min(list.width);
+        let b = Rect::new(list.x, y, w, 28.0);
+        if Button::new(label)
             .primary()
             .show(ui, Id::RemoteTool(5), b)?
             .clicked
+            || typed
         {
             asked = Some(Ask::Reconnect);
         }

@@ -5955,17 +5955,19 @@ impl App {
 
     /// connects to `target` (`user@host` or `user@host:/path`) on the
     /// worker and shows the remote panel.
-    fn open_remote(&mut self, target: &str) {
+    fn open_remote(&mut self, target: &str, password: Option<String>) {
         let (host, path) = crate::remote::browse::split_target(target);
         if !terminal::host_ok(&host) {
             self.say(self.texts.tr("Invalid host name").to_owned());
             return;
         }
-        self.remote = Some(crate::remote::browse::Browser::new(host.clone()));
+        let mut browser = crate::remote::browse::Browser::new(host.clone());
+        browser.secret.clone_from(&password);
+        self.remote = Some(browser);
         self.bench.show(Panel::Remote);
         self.procs.run(move || {
             let result = (|| {
-                let mut session = crate::remote::Session::connect(&host)?;
+                let mut session = crate::remote::Session::connect(&host, password.as_deref())?;
                 let root = match path {
                     Some(p) => p,
                     None => session.home()?,
@@ -5986,7 +5988,7 @@ impl App {
         match &ask {
             Ask::Connect(target) => {
                 let target = target.clone();
-                self.open_remote(&target);
+                self.open_remote(&target, None);
                 return;
             }
             Ask::Menu(at, node) => {
@@ -6010,13 +6012,20 @@ impl App {
                 return;
             }
             Ask::Reconnect => {
-                if let Some(b) = &self.remote {
+                if let Some(b) = &mut self.remote {
                     let target = if b.root.is_empty() {
                         b.host.clone()
                     } else {
                         format!("{}:{}", b.host, b.root)
                     };
-                    self.open_remote(&target);
+                    // a password typed now, else the one the link had
+                    let typed = std::mem::take(&mut b.password);
+                    let password = if typed.is_empty() {
+                        b.secret.clone()
+                    } else {
+                        Some(typed)
+                    };
+                    self.open_remote(&target, password);
                 }
                 return;
             }

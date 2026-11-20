@@ -405,3 +405,5 @@
 "Nothing saved yet" = "아직 저장된 것이 없습니다"
 "Couldn't open the conversation" = "대화를 열 수 없습니다"
 "Custom (set up a model server)" = "사용자 지정 (모델 서버 설정)"
+"Password" = "비밀번호"
+"Connect with password" = "비밀번호로 연결"
