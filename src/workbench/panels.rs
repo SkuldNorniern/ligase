@@ -30,12 +30,17 @@ pub enum Panel {
     Editor(ViewId),
     /// a file against HEAD.
     Diff(DocumentId),
+    /// a picture file, by its number in the app's picture list.
+    Picture(u32),
 }
 
 impl Panel {
     /// editors and the welcome tab make up the editor area.
     pub fn is_editor_area(self) -> bool {
-        matches!(self, Panel::Welcome | Panel::Editor(_) | Panel::Diff(_))
+        matches!(
+            self,
+            Panel::Welcome | Panel::Editor(_) | Panel::Diff(_) | Panel::Picture(_)
+        )
     }
 
     /// panels that live in the side bar, one at a time, never in the dock.

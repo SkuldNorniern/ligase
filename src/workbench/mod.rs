@@ -163,7 +163,7 @@ impl Workbench {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
             }
-            Some(Panel::Diff(_)) => {
+            Some(Panel::Diff(_) | Panel::Picture(_)) => {
                 let last = !self
                     .panels
                     .iter()
@@ -362,9 +362,10 @@ impl Workbench {
                     }
                     // a diff left in the layout stands for the editor area
                     // left out below: extension views come back from their package
-                    Panel::Diff(_) | Panel::SideView(_) | Panel::BottomView(_) => {
-                        "welcome".to_owned()
-                    }
+                    Panel::Diff(_)
+                    | Panel::Picture(_)
+                    | Panel::SideView(_)
+                    | Panel::BottomView(_) => "welcome".to_owned(),
                 };
                 (id, name)
             })

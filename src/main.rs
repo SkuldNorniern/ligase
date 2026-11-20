@@ -25,6 +25,7 @@ mod settings;
 mod syntax;
 mod terminal;
 mod trail;
+mod viewer;
 mod workbench;
 
 use std::cell::RefCell;

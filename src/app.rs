@@ -32,6 +32,7 @@ use crate::search::{self, Finder};
 use crate::settings::{self, RailPlace, RailShow, Settings, SidePlace, ThemeChoice};
 use crate::syntax::Syntax;
 use crate::terminal;
+use crate::viewer;
 use crate::workbench::panels::{PaneId, Panel};
 use crate::workbench::{self, Refused, Workbench, rail};
 
@@ -73,6 +74,9 @@ pub enum Id {
     AgentLink(u16),
     AgentInput,
     AgentList,
+    /// a picture tab, by its number; its tools by number too.
+    Picture(u32),
+    PictureTool(u32),
     /// the built-in agent's setup fields, by number.
     AgentField(u16),
     /// the language server list in settings, by row and part.
@@ -468,6 +472,8 @@ enum Done {
     Conflict(DocumentId, String, Option<document::Stamp>),
     Session(Option<String>),
     Saved(Result<(), String>),
+    /// a picture file read: its number, size in bytes, and what it shows.
+    Picture(u32, u64, Result<viewer::Look, String>),
     /// the saved agent conversations, newest first.
     History(Vec<agent::Past>),
     /// one saved conversation: its title and entries.
@@ -751,6 +757,9 @@ pub struct App {
     /// each diff tab's rows, the revision they are for, and whether a new
     /// diff is out.
     diffs: HashMap<DocumentId, (Option<Revision>, bool, Vec<crate::git::DiffLine>)>,
+    /// picture tabs by number, and the last number given.
+    pictures: HashMap<u32, viewer::Picture>,
+    next_picture: u32,
     diff_shown: HashMap<DocumentId, crate::git::diff::Shown>,
     /// stats the open files now and then, so outside edits show without a
     /// trip away from the window.
@@ -871,6 +880,8 @@ impl App {
             scm: crate::git::view::Scm::default(),
             branch_pick: None,
             diffs: HashMap::new(),
+            pictures: HashMap::new(),
+            next_picture: 0,
             diff_shown: HashMap::new(),
             watcher: document::watch::Watcher::default(),
             status_at: Instant::now(),
@@ -963,6 +974,9 @@ impl App {
     }
 
     fn open_line(&mut self, path: &Path, line: Option<usize>) {
+        if self.open_picture(path) {
+            return;
+        }
         let view = self.open_file(path);
         if let Some(line) = line
             && let Some(v) = self.docs.view_mut(view)
@@ -2092,7 +2106,9 @@ impl App {
                 return;
             }
             Command::ReopenClosed => {
-                if let Some(path) = self.closed.pop() {
+                if let Some(path) = self.closed.pop()
+                    && !self.open_picture(&path)
+                {
                     let view = self.open_file(&path);
                     self.ui.focus(Id::Editor(view), 1);
                     self.last_editor = Some(view);
@@ -2735,7 +2751,9 @@ impl App {
                 }
             }
             Act::Preview => {
-                if let Some(path) = path {
+                if let Some(path) = path
+                    && !self.open_picture(&path)
+                {
                     let view = self.open_file(&path);
                     self.ui.focus(Id::Editor(view), 1);
                     self.last_editor = Some(view);
@@ -2879,7 +2897,9 @@ impl App {
                 self.docs.mark_conflict(id);
             }
         }
-        if let Some(path) = done.open {
+        if let Some(path) = done.open
+            && !self.open_picture(&path)
+        {
             let view = self.open_file(&path);
             self.ui.focus(Id::Editor(view), 1);
             self.last_editor = Some(view);
@@ -3407,9 +3427,11 @@ impl App {
                     return;
                 }
                 let path = self.explorer.root().join(rel);
-                let view = self.open_file(&path);
-                self.ui.focus(Id::Editor(view), 1);
-                self.last_editor = Some(view);
+                if !self.open_picture(&path) {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                }
             }
             Kind::Commands => {
                 if let Some(&(_, _, command)) = COMMANDS.get(item) {
@@ -3862,9 +3884,11 @@ impl App {
             | Dialog::ConfirmTrust => {}
             Dialog::Open => {
                 for path in picked {
-                    let view = self.open_file(&path);
-                    self.ui.focus(Id::Editor(view), 1);
-                    self.last_editor = Some(view);
+                    if !self.open_picture(&path) {
+                        let view = self.open_file(&path);
+                        self.ui.focus(Id::Editor(view), 1);
+                        self.last_editor = Some(view);
+                    }
                 }
             }
             Dialog::OpenFolder => {
@@ -4150,6 +4174,34 @@ impl App {
         }
     }
 
+    /// a picture file opens in a picture tab, the one already open for it if
+    /// any. false for files that aren't pictures.
+    fn open_picture(&mut self, path: &Path) -> bool {
+        if !viewer::is_picture(path) {
+            return false;
+        }
+        let open = self
+            .pictures
+            .iter()
+            .find(|(_, p)| p.path == path)
+            .map(|(n, _)| *n);
+        let n = open.unwrap_or_else(|| {
+            self.next_picture += 1;
+            let n = self.next_picture;
+            self.pictures
+                .insert(n, viewer::Picture::new(path.to_path_buf()));
+            let at = path.to_path_buf();
+            self.jobs.run(move || {
+                let (bytes, look) = viewer::load(&at);
+                Done::Picture(n, bytes, look)
+            });
+            n
+        });
+        self.bench.show_in_editor_area(Panel::Picture(n));
+        self.layout_dirty = true;
+        true
+    }
+
     /// opens `view`'s file against HEAD, in a tab beside it.
     fn show_diff(&mut self, view: ViewId) {
         let Some(doc) = self.docs.view(view).map(|v| v.doc) else {
@@ -4183,6 +4235,17 @@ impl App {
             self.layout_dirty = true;
         }
         self.diffs.retain(|doc, _| open.contains(doc));
+        // a closed picture tab lets its pixels go
+        let shown: Vec<u32> = self
+            .bench
+            .panels
+            .iter()
+            .filter_map(|(_, p)| match p {
+                Panel::Picture(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        self.pictures.retain(|n, _| shown.contains(n));
         self.diff_shown.retain(|doc, _| open.contains(doc));
         for doc in open {
             let Some(d) = self.docs.doc(doc) else {
@@ -4232,9 +4295,11 @@ impl App {
                     .run(move || Done::CommitShown(crate::git::graph::detail(&top, &id)));
             }
             Ask::Open(path) => {
-                let view = self.open_file(&path);
-                self.ui.focus(Id::Editor(view), 1);
-                self.last_editor = Some(view);
+                if !self.open_picture(&path) {
+                    let view = self.open_file(&path);
+                    self.ui.focus(Id::Editor(view), 1);
+                    self.last_editor = Some(view);
+                }
             }
             Ask::Diff(path) => {
                 let view = self.open_file(&path);
@@ -4744,9 +4809,11 @@ impl App {
                         match line {
                             Some(line) => self.open_at_start(local, Some(line.saturating_sub(1))),
                             None => {
-                                let view = self.open_file(&local);
-                                self.ui.focus(Id::Editor(view), 1);
-                                self.last_editor = Some(view);
+                                if !self.open_picture(&local) {
+                                    let view = self.open_file(&local);
+                                    self.ui.focus(Id::Editor(view), 1);
+                                    self.last_editor = Some(view);
+                                }
                             }
                         }
                     }
@@ -4903,7 +4970,9 @@ impl App {
                 Done::Opened(paths) => {
                     for (path, dir) in paths {
                         if !dir {
-                            self.open_at_start(path, None);
+                            if !self.open_picture(&path) {
+                                self.open_at_start(path, None);
+                            }
                             continue;
                         }
                         self.new_window(path.into_os_string());
@@ -5004,9 +5073,11 @@ impl App {
                     self.write_settings();
                 }
                 Done::SettingsFile(Ok(path)) => {
-                    let view = self.open_file(&path);
-                    self.ui.focus(Id::Editor(view), 1);
-                    self.last_editor = Some(view);
+                    if !self.open_picture(&path) {
+                        let view = self.open_file(&path);
+                        self.ui.focus(Id::Editor(view), 1);
+                        self.last_editor = Some(view);
+                    }
                 }
                 Done::SettingsFile(Err(why)) => {
                     self.say(format!(
@@ -5036,6 +5107,15 @@ impl App {
                         "{}: {why}",
                         self.texts.tr("Couldn't open the conversation")
                     ));
+                }
+                Done::Picture(n, bytes, result) => {
+                    if let Some(pic) = self.pictures.get_mut(&n) {
+                        pic.bytes = bytes;
+                        pic.state = match result {
+                            Ok(look) => viewer::State::Ready(look),
+                            Err(why) => viewer::State::Failed(why),
+                        };
+                    }
                 }
                 Done::Saved(result) => {
                     if let Err(why) = result {
@@ -5119,6 +5199,11 @@ impl App {
                             .unwrap_or_default();
                         format!("{name} ({})", self.texts.tr("changes"))
                     }
+                    Panel::Picture(n) => self
+                        .pictures
+                        .get(&n)
+                        .map(viewer::Picture::name)
+                        .unwrap_or_default(),
                     Panel::Git => {
                         let label = self.texts.tr("Source Control");
                         match self.changes.as_ref().map(|s| s.changes.len()) {
@@ -5161,6 +5246,10 @@ impl App {
                         .unwrap_or("extensions"),
                     Panel::Search => "search",
                     Panel::Git | Panel::Diff(_) => "source-control",
+                    Panel::Picture(n) => {
+                        let pic = self.pictures.get(&n)?;
+                        crate::icons::for_path(&pic.path, false, false)
+                    }
                     Panel::Terminal => "shell",
                     Panel::Agent => "agent",
                     Panel::Problems | Panel::Welcome => return None,
@@ -5283,6 +5372,7 @@ impl App {
             let blame_now = &self.blame;
             let remote = &mut self.remote;
             let remote_pick = &mut self.remote_pick;
+            let pictures = &mut self.pictures;
             let previews = &mut self.previews;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
@@ -5424,6 +5514,10 @@ impl App {
                     view_done.push(extension::draw::show(ui, n, body, state, rect)?);
                     Ok(())
                 }
+                Some(Panel::Picture(n)) => match pictures.get_mut(&n) {
+                    Some(pic) => viewer::show(ui, n, pic, rect, texts),
+                    None => Ok(()),
+                },
                 Some(Panel::Diff(doc)) => {
                     let name = docs
                         .doc(doc)
@@ -5894,7 +5988,9 @@ impl App {
         for click in clicks {
             match click {
                 Click::Open(path) => {
-                    self.open_file(&path);
+                    if !self.open_picture(&path) {
+                        self.open_file(&path);
+                    }
                 }
                 Click::Scan(path) => self.scan(path),
                 Click::Toggled => {}
@@ -6682,9 +6778,11 @@ impl App {
             return;
         };
         let target = dir.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let opened = self.open_file(&target);
-        self.ui.focus(Id::Editor(opened), 1);
-        self.last_editor = Some(opened);
+        if !self.open_picture(&target) {
+            let opened = self.open_file(&target);
+            self.ui.focus(Id::Editor(opened), 1);
+            self.last_editor = Some(opened);
+        }
     }
 
     /// the server's answer for the pointer: under the problems, if any.
