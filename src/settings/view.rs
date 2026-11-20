@@ -282,7 +282,13 @@ pub fn show(
         Align::Start,
     )?;
     let (close, head_rest) = head_rest.split_right(34.0, 8.0);
-    let (file, search) = head_rest.split_right(150.0, 10.0);
+    // the file button gives way first on a narrow card
+    let file_w = if head_rest.width >= 150.0 + 140.0 {
+        150.0
+    } else {
+        0.0
+    };
+    let (file, search) = head_rest.split_right(file_w, 10.0);
     let typed = TextField::new(&mut sheet.query)
         .placeholder(texts.tr("search settings"))
         .max_chars(100)
@@ -293,10 +299,11 @@ pub fn show(
     if typed.changed {
         sheet.scroll = 0.0;
     }
-    if Button::new(texts.tr("Open Settings File"))
-        .quiet()
-        .show(ui, Id::SettingsFile, file)?
-        .clicked
+    if file.width > 0.0
+        && Button::new(texts.tr("Open Settings File"))
+            .quiet()
+            .show(ui, Id::SettingsFile, file)?
+            .clicked
     {
         ask = Some(Ask::OpenFile);
     }
@@ -453,7 +460,9 @@ fn row(
         return cards(ui, field, words, at, part, (picked, changed), texts);
     }
     let mut ask = None;
-    let (control, words) = at.inset_xy(0.0, 10.0).split_right(CONTROL, 16.0);
+    // the control keeps at most half a narrow card, the words the rest
+    let row = at.inset_xy(0.0, 10.0);
+    let (control, words) = row.split_right(CONTROL.min(row.width * 0.5), 16.0);
     let (dot, words) = words.split_left(14.0, 4.0);
     if changed && reset_dot(ui, dot.x, dot.y, part, texts)? {
         ask = Some(Ask::Set(field.key, None));

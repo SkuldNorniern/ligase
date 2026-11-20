@@ -5998,9 +5998,22 @@ fn welcome(
             ui.set_cursor(CursorIcon::Pointer);
         }
         let inner = row.inset_xy(10.0, 0.0);
-        ui.text(texts.tr(label), inner, &font, palette.text, Align::Start)?;
-        if let Some(chord) = keymap.chord_for(command) {
-            ui.text(&chord.label(), inner, &font, palette.dim, Align::End)?;
+        // the keys keep their place; the label gives way before them
+        let keys = keymap.chord_for(command).map(|c| c.label());
+        let keys_w = keys
+            .as_ref()
+            .map_or(0.0, |k| ui.text_width(k, &font) + 12.0);
+        let label_at = Rect::new(
+            inner.x,
+            inner.y,
+            (inner.width - keys_w).max(0.0),
+            inner.height,
+        );
+        ui.text_clipped(texts.tr(label), label_at, &font, palette.text, Align::Start)?;
+        if let Some(keys) = &keys
+            && keys_w < inner.width
+        {
+            ui.text(keys, inner, &font, palette.dim, Align::End)?;
         }
         if input.clicked {
             picked = Some(*command);
