@@ -1019,14 +1019,33 @@ fn command_tool(link: &Link, cwd: &Path, call: &Call, command: &str) -> Result<S
         cmd.creation_flags(0x0800_0000);
     }
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    // readers fill a shared buffer; a program left running in the
+    // background can hold the pipes open past the command, so they are
+    // never waited on for longer than a moment
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let fill = std::sync::Arc::clone(&buf);
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.by_ref().take(1024 * 1024).read_to_end(&mut buf);
+                let mut chunk = [0u8; 8 * 1024];
+                loop {
+                    let n = match p.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let Ok(mut b) = fill.lock() else { break };
+                    let room = (1024 * 1024usize).saturating_sub(b.len());
+                    b.extend_from_slice(&chunk[..n.min(room)]);
+                }
             }
-            buf
-        })
+            let _ = done.send(());
+        });
+        (buf, finished)
+    };
+    let take = |(buf, finished): (std::sync::Arc<Mutex<Vec<u8>>>, Receiver<()>)| {
+        let _ = finished.recv_timeout(Duration::from_secs(2));
+        buf.lock().map(|b| b.clone()).unwrap_or_default()
     };
     let out = drain(
         child
@@ -1056,8 +1075,8 @@ fn command_tool(link: &Link, cwd: &Path, call: &Call, command: &str) -> Result<S
             }
         }
     };
-    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
-    let e = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+    let mut text = String::from_utf8_lossy(&take(out)).into_owned();
+    let e = String::from_utf8_lossy(&take(err)).into_owned();
     if !e.trim().is_empty() {
         text.push_str("\n[stderr]\n");
         text.push_str(&e);
