@@ -250,7 +250,10 @@ impl Workbench {
     pub fn toggle_side(&mut self) {
         self.side.shown = match self.side.shown {
             Some(_) => None,
-            None => Some(self.side.last),
+            None => {
+                self.panels.pane(self.side.last);
+                Some(self.side.last)
+            }
         };
     }
 
@@ -268,6 +271,8 @@ impl Workbench {
     /// and problems under the editors, at their home spot if hidden.
     pub fn show(&mut self, panel: Panel) {
         if panel.is_side() {
+            // the side bar draws panes it knows; one never shown has none yet
+            self.panels.pane(panel);
             self.side.shown = Some(panel);
             self.side.last = panel;
             return;
@@ -542,6 +547,7 @@ fn side_panes(panels: &mut Panels) {
         Panel::Search,
         Panel::Git,
         Panel::Extensions,
+        Panel::Remote,
     ] {
         panels.pane(panel);
     }
@@ -634,6 +640,25 @@ pub fn write_session(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_side_panel_can_show() {
+        let mut bench = Workbench::default();
+        for panel in [
+            Panel::Explorer,
+            Panel::Search,
+            Panel::Git,
+            Panel::Extensions,
+            Panel::Remote,
+        ] {
+            bench.show(panel);
+            assert!(
+                bench.panels.find(panel).is_some(),
+                "{panel:?} has no pane to draw"
+            );
+            assert_eq!(bench.side.shown, Some(panel));
+        }
+    }
 
     #[test]
     fn recent_puts_the_open_folder_first_once() {
