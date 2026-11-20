@@ -175,6 +175,23 @@ struct Link {
     cancel: AtomicBool,
     /// commands allowed for the rest of the session.
     commands_ok: AtomicBool,
+    /// the mode the person picked: ask, auto, full or plan.
+    mode: Mutex<&'static str>,
+}
+
+/// the built-in agent's modes: id, name, what it lets through.
+const MODES: [(&str, &str); 4] = [
+    ("ask", "Ask first"),
+    ("auto", "Auto edits"),
+    ("full", "Full auto"),
+    ("plan", "Plan only"),
+];
+
+fn modes_json(current: &str) -> Value {
+    json!({
+        "currentModeId": current,
+        "availableModes": MODES.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+    })
 }
 
 impl Link {
@@ -229,6 +246,7 @@ pub fn serve(
         next: AtomicU64::new(1),
         cancel: AtomicBool::new(false),
         commands_ok: AtomicBool::new(false),
+        mode: Mutex::new("auto"),
     });
     let history: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![json!({
         "role": "system",
@@ -260,7 +278,24 @@ pub fn serve(
                                     .to_owned(),
                             }));
                         } else {
-                            reply(Ok(json!({"sessionId": SESSION})));
+                            let mode = link.mode.lock().map_or("auto", |m| *m);
+                            reply(Ok(json!({"sessionId": SESSION, "modes": modes_json(mode)})));
+                        }
+                    }
+                    "session/set_mode" => {
+                        let asked = message["params"]["modeId"].as_str().unwrap_or("");
+                        match MODES.iter().find(|(id, _)| *id == asked) {
+                            Some((id, _)) => {
+                                if let Ok(mut m) = link.mode.lock() {
+                                    *m = id;
+                                }
+                                reply(Ok(json!({})));
+                                link.update(json!({"sessionUpdate": "current_mode_update", "currentModeId": id}));
+                            }
+                            None => reply(Err(Fail {
+                                code: -32602,
+                                message: format!("no mode {asked}"),
+                            })),
                         }
                     }
                     "session/prompt" => {
@@ -704,7 +739,22 @@ fn run_tool(link: &Link, cwd: &Path, call: &Call) -> String {
         json!({"sessionUpdate": "tool_call", "toolCallId": call.id, "title": title,
         "kind": kind, "status": "in_progress", "locations": locations}),
     );
+    let mode = link.mode.lock().map_or("auto", |m| *m);
+    let changes = matches!(
+        call.name.as_str(),
+        "edit_file" | "write_file" | "run_command"
+    );
+    let edits = matches!(call.name.as_str(), "edit_file" | "write_file");
+    // plan only reads; ask first asks before an edit too
+    let refused = if mode == "plan" && changes {
+        Some("plan mode: only reading is allowed. say what you would change instead".to_owned())
+    } else if mode == "ask" && edits {
+        permit(link, call, &title).err()
+    } else {
+        None
+    };
     let (result, content) = match call.name.as_str() {
+        _ if refused.is_some() => (Err(refused.unwrap_or_default()), Value::Null),
         "read_file" => read_tool(link, place.as_deref(), &args),
         "edit_file" => edit_tool(link, place.as_deref(), &text("old_text"), &text("new_text")),
         "write_file" => write_tool(link, place.as_deref(), &text("content")),
@@ -886,13 +936,34 @@ fn search_tool(cwd: &Path, dir: Option<&Path>, query: &str) -> Result<String, St
         .join("\n"))
 }
 
+/// asks the person once about `call`; an error when they say no.
+fn permit(link: &Link, call: &Call, title: &str) -> Result<(), String> {
+    let answer = link.ask(
+        "session/request_permission",
+        json!({
+            "sessionId": SESSION,
+            "toolCall": {"toolCallId": call.id, "title": cut(title, 200)},
+            "options": [
+                {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "no", "name": "Don't", "kind": "reject_once"},
+            ],
+        }),
+        Duration::from_secs(60 * 60),
+    )?;
+    match answer["outcome"]["optionId"].as_str() {
+        Some("once") => Ok(()),
+        _ => Err("the person did not allow it".to_owned()),
+    }
+}
+
 /// runs `command` after the person allows it, with a time limit and its
 /// output capped.
 fn command_tool(link: &Link, cwd: &Path, call: &Call, command: &str) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("the command is empty".to_owned());
     }
-    if !link.commands_ok.load(Ordering::Relaxed) {
+    let full = link.mode.lock().is_ok_and(|m| *m == "full");
+    if !full && !link.commands_ok.load(Ordering::Relaxed) {
         let answer = link.ask(
             "session/request_permission",
             json!({
@@ -1188,6 +1259,50 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_only_reads() {
+        let (out, from) = channel();
+        let link = Link {
+            out,
+            wake: Box::new(|| {}),
+            waiting: Mutex::default(),
+            next: AtomicU64::new(1),
+            cancel: AtomicBool::new(false),
+            commands_ok: AtomicBool::new(true),
+            mode: Mutex::new("plan"),
+        };
+        let cwd = std::env::temp_dir().join(format!("ligase-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("dir");
+        std::fs::write(cwd.join("a.txt"), "old").expect("write");
+        let call = |name: &str, arguments: &str| Call {
+            id: "c".into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
+        let said = run_tool(
+            &link,
+            &cwd,
+            &call("write_file", r#"{"path": "a.txt", "content": "new"}"#),
+        );
+        assert!(said.contains("plan mode"), "{said}");
+        let said = run_tool(
+            &link,
+            &cwd,
+            &call("run_command", r#"{"command": "echo hi"}"#),
+        );
+        assert!(said.contains("plan mode"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).expect("read"),
+            "old"
+        );
+        // nothing was asked of the editor
+        assert!(
+            from.try_iter().all(|m| !matches!(m, Incoming::Request(..))),
+            "plan mode asks nothing"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
     fn compaction_keeps_the_newest_turn_whole() {
         // without a server, compact must not touch a short history
         let (out, _from) = channel();
@@ -1198,6 +1313,7 @@ mod tests {
             next: AtomicU64::new(1),
             cancel: AtomicBool::new(false),
             commands_ok: AtomicBool::new(false),
+            mode: Mutex::new("auto"),
         };
         let history = Mutex::new(vec![
             json!({"role": "system", "content": "s"}),
