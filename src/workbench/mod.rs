@@ -100,6 +100,11 @@ impl Workbench {
     /// shows `panel` as a tab in the editor area, replacing the welcome tab.
     pub fn show_in_editor_area(&mut self, panel: Panel) -> PaneId {
         let pane = self.panels.pane(panel);
+        // squeezed to a sliver by an old layout or a narrow window: it goes
+        // back to its home spot at its home size
+        if self.squeezed(pane) {
+            self.tree().remove(pane);
+        }
         if !self.dock.tree.contains(pane) {
             match self.editor_area() {
                 Some(beside) => {
@@ -221,11 +226,24 @@ impl Workbench {
             return;
         }
         let pane = self.panels.pane(panel);
-        if self.dock.tree.contains(pane) {
+        if self.dock.tree.contains(pane) && !self.squeezed(pane) {
             self.tree().remove(pane);
             return;
         }
         self.show(panel);
+    }
+
+    /// `pane` is alone in a group too small to use.
+    fn squeezed(&self, pane: PaneId) -> bool {
+        let layout = self.dock.layout();
+        self.dock.tree.group_of(&pane).is_some_and(|g| g.len() == 1)
+            && layout.groups.iter().any(|g| {
+                layout
+                    .panels
+                    .get(g.tabs.clone())
+                    .is_some_and(|p| p.contains(&pane))
+                    && (g.rect.width < 160.0 || g.rect.height < 80.0)
+            })
     }
 
     /// shows or hides the side bar, coming back with what it last showed.
