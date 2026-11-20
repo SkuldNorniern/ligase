@@ -42,6 +42,9 @@ pub struct Browser {
     pub host: String,
     /// typed after a refused login; sent once, then cleared.
     pub password: String,
+    /// the path bar, and the folder it was last filled from.
+    pub path_input: String,
+    path_for: String,
     /// the password the link was made with, kept in memory only so a
     /// reconnect needs no typing. never written anywhere.
     pub secret: Option<String>,
@@ -89,9 +92,20 @@ pub enum Ask {
     Disconnect,
     /// connect to `user@host:/path` from the picker.
     Connect(String),
+    /// make this far folder the one shown and worked in.
+    GoTo(String),
     /// a right click at this point, on this row (path, folder) or the
     /// empty space.
     Menu(aurea::render::Point, Option<(String, bool)>),
+}
+
+/// the folder `path` is in; `/` stays `/`.
+pub fn parent(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_owned(),
+        Some(i) => trimmed[..i].to_owned(),
+    }
 }
 
 /// `dir` and `name` as one far-side path.
@@ -159,6 +173,8 @@ impl Browser {
         Self {
             host,
             password: String::new(),
+            path_input: String::new(),
+            path_for: String::new(),
             secret: None,
             root: String::new(),
             state: State::Connecting,
@@ -352,6 +368,38 @@ pub fn show(
     }
     if !ready {
         return Ok(asked);
+    }
+    // the folder as a path to edit, and a step up from it
+    if browser.path_for != browser.root {
+        browser.path_for.clone_from(&browser.root);
+        browser.path_input.clone_from(&browser.root);
+    }
+    let (bar, list) = list.split_top(28.0, 6.0);
+    let up = Rect::new(bar.x, bar.y, 28.0, bar.height);
+    let field = Rect::new(
+        up.right() + 4.0,
+        bar.y,
+        (bar.width - 32.0).max(0.0),
+        bar.height,
+    );
+    let input = ui.interact(Id::RemoteTool(9), 0, up, Sense::Click, browser.root != "/");
+    if input.hovered {
+        ui.round(up, 6.0, palette.hover)?;
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    ui.text("↑", up, &font, palette.dim, Align::Center)?;
+    if input.clicked {
+        asked = Some(Ask::GoTo(parent(&browser.root)));
+    }
+    let typed = TextField::new(&mut browser.path_input)
+        .placeholder(texts.tr("Folder on the host"))
+        .max_chars(4096)
+        .show(ui, Id::RemoteTool(8), field)?;
+    if typed.submitted {
+        let path = browser.path_input.trim().to_owned();
+        if !path.is_empty() && path != browser.root {
+            asked = Some(Ask::GoTo(path));
+        }
     }
     let list = if browser.search_open {
         let (field, rest) = list.split_top(28.0, 6.0);
@@ -722,6 +770,14 @@ mod tests {
             .collect();
         assert_eq!(hosts, ["main", "build-box"]);
         std::fs::remove_dir_all(&dot).unwrap();
+    }
+
+    #[test]
+    fn parents_of_far_paths() {
+        assert_eq!(parent("/srv/app"), "/srv");
+        assert_eq!(parent("/srv/app/"), "/srv");
+        assert_eq!(parent("/srv"), "/");
+        assert_eq!(parent("/"), "/");
     }
 
     #[test]

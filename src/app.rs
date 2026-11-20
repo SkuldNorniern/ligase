@@ -513,6 +513,8 @@ enum Done {
     RemoteSent(String, Option<i64>),
     /// the remote root read again.
     RemoteRoot(Result<Vec<crate::remote::Entry>, String>),
+    /// the remote panel went to another folder: it and its entries.
+    RemoteMoved(Result<(String, Vec<crate::remote::Entry>), String>),
     /// a search over the remote folder came back.
     RemoteFound(Result<Vec<(String, usize, String)>, String>),
     /// recent targets and ~/.ssh/config hosts, for the picker.
@@ -2391,7 +2393,16 @@ impl App {
                 return;
             }
             Command::NewTerminal => {
-                if self.shells.add().is_none() {
+                // linked to a host, a new shell opens there, in its folder
+                let far = self.remote.as_ref().and_then(|b| {
+                    matches!(b.state, crate::remote::browse::State::Ready(_))
+                        .then(|| (b.host.clone(), b.root.clone()))
+                });
+                let added = match far {
+                    Some((host, root)) => self.shells.add_remote_at(&host, &root),
+                    None => self.shells.add(),
+                };
+                if added.is_none() {
                     self.say(self.texts.tr("Shell limit reached").to_owned());
                 }
                 if !self.shows(Panel::Terminal) {
@@ -2739,6 +2750,8 @@ impl App {
                     let _ = aurea::clipboard::set_clipboard_text(&path.display().to_string());
                 }
             }
+            // remote rows only
+            Act::OpenHere | Act::TerminalHere => {}
             Act::CloseOthers | Act::CloseAll => {
                 let keep = match target {
                     Target::Tab(pane) if act == Act::CloseOthers => Some(pane),
@@ -2793,7 +2806,7 @@ impl App {
                 self.say(self.texts.tr("Invalid name").to_owned());
                 return;
             };
-            let dir = parent_of(from);
+            let dir = crate::remote::browse::parent(from);
             let (from, to) = (from.clone(), crate::remote::browse::join(&dir, name));
             self.remote_change(dir, move |s| s.rename(&from, &to));
             return;
@@ -3230,7 +3243,9 @@ impl App {
             && let Some(path) = self.remote_delete.take()
         {
             if choice == MessageChoice::Ok {
-                self.remote_change(parent_of(&path), move |s| s.remove(&path));
+                self.remote_change(crate::remote::browse::parent(&path), move |s| {
+                    s.remove(&path)
+                });
             }
             return;
         }
@@ -4737,6 +4752,31 @@ impl App {
                     }
                     Err(why) => self.say(why),
                 },
+                Done::RemoteMoved(result) => match (result, &mut self.remote) {
+                    (Ok((path, entries)), Some(browser)) => {
+                        browser.root.clone_from(&path);
+                        browser.reset_root(&entries);
+                        let (host, secret) = (browser.host.clone(), browser.secret.clone());
+                        let target = format!("{host}:{path}");
+                        self.procs.run(move || {
+                            crate::remote::browse::remember(&target);
+                            Done::Note(None)
+                        });
+                        // its language servers start again in the new folder
+                        let mut side = self.lsp.local.far(lsp::Far::new(host, path, secret));
+                        for (local, far) in &self.remote_files {
+                            side.knows(local.clone(), far.clone());
+                        }
+                        if let Some(old) = self.lsp.remote.replace(side) {
+                            self.jobs.run(move || {
+                                drop(old);
+                                Done::Note(None)
+                            });
+                        }
+                    }
+                    (Err(why), _) => self.say(why),
+                    _ => {}
+                },
                 Done::RemoteRoot(result) => match (result, &mut self.remote) {
                     (Ok(entries), Some(browser)) => browser.reset_root(&entries),
                     (Err(why), _) => self.say(why),
@@ -6081,7 +6121,9 @@ impl App {
                     Some((path, dir)) => Target::Remote(path.clone(), *dir),
                     None => Target::RemoteRoot,
                 });
-                self.menu.ask(at, context_menu::remote(node.is_some()));
+                let folder = node.as_ref().is_some_and(|(_, dir)| *dir);
+                self.menu
+                    .ask(at, context_menu::remote(node.is_some(), folder));
                 return;
             }
             Ask::Disconnect => {
@@ -6139,6 +6181,31 @@ impl App {
         let root = browser.root.clone();
         match ask {
             Ask::Connect(_) | Ask::Disconnect | Ask::Reconnect | Ask::Terminal | Ask::Menu(..) => {}
+            Ask::GoTo(path) => {
+                // `~` and relative paths are the host's to read
+                let path = path.clone();
+                self.procs.run(move || {
+                    let result = link
+                        .lock()
+                        .map_err(|_| "the link broke".to_owned())
+                        .and_then(|mut s| {
+                            let path = if path.starts_with('/') {
+                                path
+                            } else {
+                                let home = s.home()?;
+                                let rest = path.trim_start_matches('~').trim_start_matches('/');
+                                if rest.is_empty() {
+                                    home
+                                } else {
+                                    format!("{}/{rest}", home.trim_end_matches('/'))
+                                }
+                            };
+                            let entries = s.list(&path)?;
+                            Ok((path, entries))
+                        });
+                    Done::RemoteMoved(result)
+                });
+            }
             Ask::Refresh => {
                 self.procs.run(move || {
                     let result = link
@@ -6194,7 +6261,7 @@ impl App {
         };
         let (folder, path) = match target {
             Target::Remote(path, true) => (path.clone(), Some(path)),
-            Target::Remote(path, false) => (parent_of(&path), Some(path)),
+            Target::Remote(path, false) => (crate::remote::browse::parent(&path), Some(path)),
             _ => (root.clone(), None),
         };
         // nothing outside the folder, and never the folder itself
@@ -6203,6 +6270,20 @@ impl App {
                 && !p.split('/').any(|part| part == "..")
         };
         match act {
+            Act::OpenHere => {
+                if let Some(path) = path {
+                    self.remote_ask(crate::remote::browse::Ask::GoTo(path));
+                }
+            }
+            Act::TerminalHere => {
+                if let Some(host) = self.remote.as_ref().map(|b| b.host.clone()) {
+                    let dir = path.unwrap_or(folder);
+                    if self.shells.add_remote_at(&host, &dir).is_none() {
+                        self.say(self.texts.tr("Shell limit reached").to_owned());
+                    }
+                    self.show_terminal();
+                }
+            }
             Act::NewFile | Act::NewFolder => {
                 let file = act == Act::NewFile;
                 let hint = if file {
@@ -7475,14 +7556,6 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
-}
-
-/// a far-side path's folder: `/srv/a/b` gives `/srv/a`, `/a` gives `/`.
-fn parent_of(path: &str) -> String {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some(("", _)) | None => "/".to_owned(),
-        Some((dir, _)) => dir.to_owned(),
-    }
 }
 
 /// a saved profile's values into the setup card; the key stays empty.

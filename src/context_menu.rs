@@ -21,6 +21,10 @@ pub enum Act {
     /// opens the file and shows its preview.
     Preview,
     CopyPath,
+    /// a remote folder becomes the one worked in.
+    OpenHere,
+    /// a shell on the host, in this folder.
+    TerminalHere,
     CloseOthers,
     CloseAll,
 }
@@ -121,11 +125,19 @@ pub fn explorer(on_entry: bool, previews: bool) -> Vec<Entry> {
 }
 
 /// rows for a right click in the remote tree.
-pub fn remote(on_entry: bool) -> Vec<Entry> {
-    let mut rows = vec![
+pub fn remote(on_entry: bool, folder: bool) -> Vec<Entry> {
+    let mut rows = Vec::new();
+    if folder {
+        rows.extend([
+            Entry::Item("Open as Workspace", Act::OpenHere),
+            Entry::Item("Open Terminal Here", Act::TerminalHere),
+            Entry::Line,
+        ]);
+    }
+    rows.extend([
         Entry::Item("New File", Act::NewFile),
         Entry::Item("New Folder", Act::NewFolder),
-    ];
+    ]);
     if on_entry {
         rows.extend([
             Entry::Line,

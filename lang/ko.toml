@@ -407,3 +407,6 @@
 "Custom (set up a model server)" = "사용자 지정 (모델 서버 설정)"
 "Password" = "비밀번호"
 "Connect with password" = "비밀번호로 연결"
+"Folder on the host" = "호스트의 폴더"
+"Open as Workspace" = "작업 폴더로 열기"
+"Open Terminal Here" = "여기서 터미널 열기"
