@@ -17,7 +17,9 @@ use super::{FIELDS, Field, FieldKind, RailPlace, Settings, current, quote};
 use crate::app::Id;
 use crate::lang::Texts;
 
-const GROUPS: [&str; 6] = ["All", "Look", "Editor", "Files", "Layout", "Terminal"];
+const GROUPS: [&str; 7] = [
+    "All", "Look", "Editor", "Files", "Layout", "Terminal", "Agent",
+];
 /// a row with an inline control.
 const ROW: f32 = 58.0;
 const CONTROL: f32 = 230.0;

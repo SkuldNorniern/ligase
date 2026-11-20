@@ -152,7 +152,8 @@ impl Workbench {
                 | Panel::SideView(_)
                 | Panel::BottomView(_)
                 | Panel::Terminal
-                | Panel::Problems,
+                | Panel::Problems
+                | Panel::Agent,
             ) => {
                 // hidden, not dropped; toggling brings it back
                 self.tree().remove(pane);
@@ -275,7 +276,12 @@ impl Workbench {
                     let Some(area) = self.editor_area() else {
                         return;
                     };
-                    self.tree().insert_sized(pane, area, DockSide::Bottom, 0.28);
+                    // the agent talks beside the code, the rest sit under it
+                    if panel == Panel::Agent {
+                        self.tree().insert_sized(pane, area, DockSide::Right, 0.34);
+                    } else {
+                        self.tree().insert_sized(pane, area, DockSide::Bottom, 0.28);
+                    }
                 }
             }
         }
@@ -319,6 +325,7 @@ impl Workbench {
                     Panel::Remote => "remote".to_owned(),
                     Panel::Terminal => "terminal".to_owned(),
                     Panel::Problems => "problems".to_owned(),
+                    Panel::Agent => "agent".to_owned(),
                     Panel::Welcome => "welcome".to_owned(),
                     Panel::Editor(view) => {
                         // a file never saved has no path to come back to
@@ -445,6 +452,7 @@ impl Workbench {
                     "explorer" | "search" | "git" | "extensions" => return None,
                     "terminal" => Panel::Terminal,
                     "problems" => Panel::Problems,
+                    "agent" => Panel::Agent,
                     "welcome" => Panel::Welcome,
                     other => {
                         let index: usize = other.strip_prefix("editor")?.parse().ok()?;

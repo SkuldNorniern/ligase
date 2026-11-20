@@ -116,7 +116,7 @@ pub(crate) fn plain(text: &str) -> String {
 }
 
 /// words of `text` in lines no wider than `width`.
-fn wrap(ui: &mut Ui<'_, Id>, text: &str, font: &Font, width: f32) -> Vec<String> {
+pub(crate) fn wrap(ui: &mut Ui<'_, Id>, text: &str, font: &Font, width: f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {

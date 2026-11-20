@@ -97,8 +97,10 @@ pub struct Settings {
     /// brackets and quotes typed in pairs.
     pub auto_pairs: bool,
     pub terminal_size: f32,
-    /// the coding agent a new agent terminal starts.
-    pub agent: crate::terminal::agent::Agent,
+    /// the coding agent the agent panel talks to.
+    pub agent: crate::agent::Agent,
+    /// a command that speaks acp in place of the agent's own; empty for none.
+    pub agent_command: Option<String>,
     /// spaces and tabs at line ends go when saving.
     pub trim_trailing_whitespace: bool,
     /// a saved file ends in a line break.
@@ -140,7 +142,8 @@ impl Default for Settings {
             word_highlight: true,
             auto_pairs: true,
             terminal_size: 13.0,
-            agent: crate::terminal::agent::Agent::Claude,
+            agent: crate::agent::Agent::Claude,
+            agent_command: None,
             trim_trailing_whitespace: false,
             final_newline: false,
             save_on_focus_loss: false,
@@ -183,7 +186,8 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # word_highlight = true
 # auto_pairs = true
 # terminal_size = 13
-# agent = "claude"          # "claude", "codex", "gemini", "opencode" or "aider"
+# agent = "claude"          # "claude", "codex", "gemini" or "opencode"
+# agent_command = ""        # a program and args that speak acp, in place of the agent's own
 # trim_trailing_whitespace = false
 # final_newline = false
 # save_on_focus_loss = false
@@ -274,8 +278,13 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some(_) => out.whitespace = Whitespace::All,
             None => return false,
         },
-        "agent" => match word(value, &["claude", "codex", "gemini", "opencode", "aider"])
-            .and_then(crate::terminal::agent::Agent::from_word)
+        "agent_command" => match value.as_str().filter(|s| s.len() <= 1000) {
+            Some(c) if c.trim().is_empty() => out.agent_command = None,
+            Some(c) => out.agent_command = Some(c.trim().to_owned()),
+            None => return false,
+        },
+        "agent" => match word(value, &["claude", "codex", "gemini", "opencode"])
+            .and_then(crate::agent::Agent::from_word)
         {
             Some(agent) => out.agent = agent,
             None => return false,
@@ -470,9 +479,16 @@ pub const FIELDS: &[Field] = &[
     Field {
         key: "agent",
         label: "Coding Agent",
-        about: "The agent a new agent terminal starts. It signs in on its own.",
-        group: "Terminal",
-        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "aider"]),
+        about: "The agent the agent panel talks to. It signs in on its own.",
+        group: "Agent",
+        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode"]),
+    },
+    Field {
+        key: "agent_command",
+        label: "Agent Command",
+        about: "A program and args that speak ACP, in place of the agent's own.",
+        group: "Agent",
+        kind: FieldKind::Text,
     },
     Field {
         key: "terminal_size",
@@ -626,6 +642,7 @@ pub fn current(s: &Settings, key: &str) -> Option<String> {
         }),
         "terminal_size" => number_literal(s.terminal_size),
         "agent" => quote(s.agent.word()),
+        "agent_command" => quote(s.agent_command.as_deref().unwrap_or("")),
         "rail" => quote(match s.rail {
             RailPlace::Left => "left",
             RailPlace::Right => "right",
@@ -803,6 +820,7 @@ mod tests {
             "auto_pairs",
             "terminal_size",
             "agent",
+            "agent_command",
             "trim_trailing_whitespace",
             "final_newline",
             "save_on_focus_loss",

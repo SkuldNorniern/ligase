@@ -2,6 +2,7 @@
 //!
 //! `ligase [folder]` opens the folder, or the current one.
 
+mod agent;
 mod app;
 mod completion;
 mod context_menu;

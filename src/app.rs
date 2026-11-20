@@ -14,6 +14,7 @@ use aurea::{AureaResult, Chord, CursorIcon, KeyCode, Keymap, WindowEvent};
 
 use resolvase::{Encoding, Point, Revision, SavePoint};
 
+use crate::agent;
 use crate::completion::{self, Popup};
 use crate::context_menu::{self, Act, ContextMenu};
 use crate::document::{self, DocumentId, Documents, ViewId};
@@ -64,6 +65,14 @@ pub enum Id {
     ScmGraph,
     /// a repository row in source control.
     ScmRepo(u16),
+    /// the agent panel's buttons, by number.
+    AgentButton(u16),
+    /// a file put before the agent message, by place.
+    AgentRef(u16),
+    /// a file link in the agent's conversation.
+    AgentLink(u16),
+    AgentInput,
+    AgentList,
     /// the branch pill and the sync buttons in source control.
     ScmBranch,
     ScmPull,
@@ -146,10 +155,12 @@ pub enum Command {
     TogglePreview,
     /// a shell on another machine, over ssh.
     NewRemoteShell,
-    /// a terminal tab running the coding agent from settings.
+    /// the agent panel, in sight or not.
+    ToggleAgent,
+    /// a new agent conversation, the old one let go.
     NewAgent,
-    /// points the agent at the file and lines in the editor: starts one
-    /// when none runs, types a mention into it and gives it the keyboard.
+    /// puts the file and lines in the editor before the next agent message
+    /// and gives the agent panel the keyboard.
     AskAgent,
     /// a folder on another machine in the side bar, over ssh.
     OpenRemoteFolder,
@@ -308,7 +319,8 @@ pub const COMMANDS: &[(&str, &str, Command)] = &[
         "New Remote Terminal (SSH)",
         Command::NewRemoteShell,
     ),
-    ("agent.new", "New Agent Terminal", Command::NewAgent),
+    ("view.agent", "Agent", Command::ToggleAgent),
+    ("agent.new", "New Agent Conversation", Command::NewAgent),
     ("agent.ask", "Ask Agent About This", Command::AskAgent),
     ("markdown.read", "Toggle Preview", Command::TogglePreview),
     ("view.problems", "Problems", Command::ToggleProblems),
@@ -445,6 +457,19 @@ enum Done {
         Result<Option<document::Stamp>, String>,
     ),
     Shell(u32, Result<vanta::Terminal, String>),
+    /// the agent's acp program started, or why not.
+    AgentUp(Result<agent::acp::Pipe, String>),
+    /// a file read for the agent: its id, the text, and the lines asked.
+    AgentRead(
+        serde_json::Value,
+        Result<String, String>,
+        Option<usize>,
+        Option<usize>,
+    ),
+    /// a file written for the agent.
+    AgentWrote(serde_json::Value, Result<(), String>, PathBuf),
+    /// the agent's sign in command, to type into a terminal.
+    AgentLogin(Result<String, String>),
     /// the ssh link came up on a folder, with its entries; or why not.
     RemoteReady(Result<(crate::remote::Session, String, Vec<crate::remote::Entry>), String>),
     /// a remote folder's entries.
@@ -549,6 +574,8 @@ pub struct App {
     procs: Jobs<Done>,
     syntax: Syntax,
     shells: terminal::Shells,
+    /// the agent conversation, made the first time the panel is used.
+    chat: Option<agent::Chat>,
     finder: Finder,
     problems: Problems,
     lsp: Lsp,
@@ -708,6 +735,7 @@ impl App {
             procs: Jobs::default(),
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
+            chat: None,
             finder: Finder::default(),
             problems: Problems::default(),
             lsp: Lsp::default(),
@@ -1132,7 +1160,6 @@ impl App {
     fn start_shell(&mut self) {
         let id = self.shells.current_id();
         let remote = self.shells.current().remote.clone();
-        let agent = self.shells.current().agent;
         self.shells.current_mut().state = terminal::State::Starting;
         let root = self.explorer.root().to_path_buf();
         let canvas = self.canvas;
@@ -1142,7 +1169,7 @@ impl App {
                     request_canvas_redraw(id);
                 }
             };
-            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), agent, wake))
+            Done::Shell(id, terminal::spawn(&root, remote.as_deref(), wake))
         };
         if !self.procs.run(job) {
             self.shells
@@ -1159,20 +1186,58 @@ impl App {
         self.ui.focus(Id::Terminal, 1);
     }
 
-    /// types a mention of `view`'s file, and its selected lines or the
-    /// caret's line, into the agent's tab; starts the agent when none runs.
-    fn ask_agent(&mut self, view: Option<ViewId>) {
+    /// starts the agent when it isn't running; `fresh` lets the old
+    /// conversation go first. the program starts on the procs worker.
+    fn start_agent(&mut self, fresh: bool) {
+        let root = self.explorer.root().to_path_buf();
         let agent = self.settings.agent;
-        let mention = view.and_then(|view| {
+        let same = self
+            .chat
+            .as_ref()
+            .is_some_and(|c| c.agent == agent && c.root() == root);
+        if fresh || !same {
+            // the old pipe's child is killed on drop, off the ui thread
+            if let Some(old) = self.chat.take() {
+                self.jobs.run(move || {
+                    drop(old);
+                    Done::Note(None)
+                });
+            }
+            self.chat = Some(agent::Chat::new(agent, root.clone()));
+        }
+        let Some(chat) = &mut self.chat else { return };
+        if chat.running() {
+            return;
+        }
+        chat.state = agent::State::Starting;
+        let custom = self.settings.agent_command.clone().unwrap_or_default();
+        let canvas = self.canvas;
+        let job = move || {
+            let wake = move || {
+                if let Some(id) = canvas {
+                    request_canvas_redraw(id);
+                }
+            };
+            let pipe = agent
+                .command(&custom)
+                .and_then(|(program, args)| agent::acp::Pipe::spawn(&program, &args, &root, wake));
+            Done::AgentUp(pipe)
+        };
+        if !self.procs.run(job)
+            && let Some(chat) = &mut self.chat
+        {
+            chat.started(Err("the worker is not running".to_owned()));
+        }
+    }
+
+    /// puts `view`'s file, and its selected lines or the caret's line,
+    /// before the next agent message; the panel comes up with the keyboard.
+    fn ask_agent(&mut self, view: Option<ViewId>) {
+        let picked = view.and_then(|view| {
             let doc = self.docs.doc_of(view)?;
             if doc.untitled {
                 return None;
             }
-            let rel = doc
-                .path
-                .strip_prefix(self.explorer.root())
-                .unwrap_or(&doc.path);
-            let rel = rel.to_string_lossy().replace('\\', "/");
             let v = self.docs.view(view)?;
             let text = doc.buffer.text();
             let (a, b) = (v.sel.anchor.min(v.sel.head), v.sel.anchor.max(v.sel.head));
@@ -1182,17 +1247,193 @@ impl App {
             if b > a && last > first && text.line_start(last).ok() == Some(b) {
                 last -= 1;
             }
-            Some(agent.mention(&rel, Some((first + 1, last + 1))))
+            Some(agent::Ref {
+                path: doc.path.clone(),
+                lines: Some((first + 1, last + 1)),
+            })
         });
-        if !self.shells.front_agent(agent) && self.shells.add_agent(agent).is_none() {
-            self.say(self.texts.tr("Shell limit reached").to_owned());
+        self.start_agent(false);
+        if let (Some(chat), Some(picked)) = (&mut self.chat, picked)
+            && !chat.refs.contains(&picked)
+        {
+            chat.refs.push(picked);
+        }
+        self.bench.show(Panel::Agent);
+        self.ui.focus(Id::AgentInput, 0);
+    }
+
+    /// what the agent asked for since last frame: reads from open files or
+    /// the disk, writes into open files as one edit each (saved, and undone
+    /// like any edit) or to the disk.
+    fn poll_agent(&mut self) {
+        // back from a saved layout: a conversation to start by hand
+        if self.chat.is_none() && self.shows(Panel::Agent) {
+            let root = self.explorer.root().to_path_buf();
+            self.chat = Some(agent::Chat::new(self.settings.agent, root));
+        }
+        let Some(chat) = &mut self.chat else { return };
+        let needs = chat.poll();
+        if let Some(dead) = chat.take_dead() {
+            self.jobs.run(move || {
+                drop(dead);
+                Done::Note(None)
+            });
+        }
+        for need in needs {
+            match need {
+                agent::Need::Read {
+                    id,
+                    path,
+                    line,
+                    limit,
+                } => {
+                    let open = self
+                        .view_of_path(&path)
+                        .and_then(|v| self.docs.doc_of(v))
+                        .filter(|d| d.load == document::Load::Ready)
+                        .map(|d| d.buffer.snapshot());
+                    match open {
+                        Some(snap) => {
+                            let text = String::from(&snap);
+                            if let Some(chat) = &self.chat {
+                                chat.respond(
+                                    &id,
+                                    Ok(serde_json::json!({"content": agent::lines_of(&text, line, limit)})),
+                                );
+                            }
+                        }
+                        None => {
+                            self.jobs.run(move || {
+                                Done::AgentRead(id, document::read_text(&path), line, limit)
+                            });
+                        }
+                    }
+                }
+                agent::Need::Write { id, path, text } => self.agent_write(id, path, text),
+                agent::Need::Terminal(args) => self.agent_login(args),
+            }
+        }
+    }
+
+    /// the agent's write: into the open buffer as the smallest edit that
+    /// gets there, then saved; else straight to disk, atomically.
+    fn agent_write(&mut self, id: serde_json::Value, path: PathBuf, text: String) {
+        if text.len() as u64 > document::MAX_FILE {
+            if let Some(chat) = &self.chat {
+                chat.respond(&id, Err("the text is past the file size cap".to_owned()));
+            }
             return;
         }
-        if let Some(mention) = mention {
-            // typed before the agent is up, it waits and goes in once it is
-            self.shells.current_mut().write(&mention);
+        if let Some(view) = self.view_of_path(&path) {
+            let now = self
+                .docs
+                .doc_of(view)
+                .filter(|d| d.load == document::Load::Ready)
+                .map(|d| String::from(&d.buffer.snapshot()));
+            if let Some(now) = now {
+                let (range, middle) = smallest_edit(&now, &text);
+                let done = range.is_empty() && middle.is_empty()
+                    || self.docs.edit(view, vec![(range, middle)], false);
+                if done {
+                    self.save_with(view, false);
+                }
+                if let Some(chat) = &self.chat {
+                    let result = if done {
+                        Ok(serde_json::Value::Null)
+                    } else {
+                        Err("the open file took no edit".to_owned())
+                    };
+                    chat.respond(&id, result);
+                }
+                return;
+            }
         }
-        self.show_terminal();
+        self.jobs.run(move || {
+            let result = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    document::write_atomic(
+                        &path,
+                        &resolvase::TextBuffer::from_text(&text).snapshot(),
+                    )
+                });
+            Done::AgentWrote(id, result, path)
+        });
+    }
+
+    /// a sign in that runs in a terminal: the agent's program with `args`,
+    /// typed into a new shell so the person can follow it.
+    fn agent_login(&mut self, args: Vec<String>) {
+        let agent = self.settings.agent;
+        let custom = self.settings.agent_command.clone().unwrap_or_default();
+        self.procs.run(move || {
+            let line = agent.command(&custom).map(|(program, mut first)| {
+                first.extend(args);
+                let quote = |s: &str| {
+                    if s.contains([' ', '"']) {
+                        format!("\"{}\"", s.replace('"', ""))
+                    } else {
+                        s.to_owned()
+                    }
+                };
+                std::iter::once(quote(&program.to_string_lossy()))
+                    .chain(first.iter().map(|a| quote(a)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            Done::AgentLogin(line)
+        });
+    }
+
+    /// what the agent panel asked for.
+    fn agent_ask(&mut self, ask: agent::view::Ask) {
+        use agent::view::Ask;
+        match ask {
+            Ask::Send => {
+                self.start_agent(false);
+                if let Some(chat) = &mut self.chat {
+                    chat.send();
+                }
+            }
+            Ask::Stop => {
+                if let Some(pipe) = self.chat.as_mut().and_then(agent::Chat::stop) {
+                    // its close waits on the program
+                    self.jobs.run(move || {
+                        drop(pipe);
+                        Done::Note(None)
+                    });
+                }
+            }
+            Ask::New | Ask::Start => self.start_agent(true),
+            Ask::Answer(option) => {
+                if let Some(chat) = &mut self.chat {
+                    chat.answer(&option);
+                }
+            }
+            Ask::SignIn(n) => {
+                let need = self.chat.as_mut().and_then(|c| c.sign_in(n));
+                if let Some(agent::Need::Terminal(args)) = need {
+                    self.agent_login(args);
+                }
+            }
+            Ask::Retry => {
+                if let Some(chat) = &mut self.chat {
+                    chat.retry();
+                }
+            }
+            Ask::Open(path, line) => {
+                self.open_at_start(path, line.map(|l| l.saturating_sub(1) as usize));
+            }
+            Ask::Unref(i) => {
+                if let Some(chat) = &mut self.chat
+                    && i < chat.refs.len()
+                {
+                    chat.refs.remove(i);
+                }
+            }
+        }
     }
 
     pub fn run(&mut self, command: Command) {
@@ -1603,11 +1844,18 @@ impl App {
                     .insert(view, crate::preview::Preview::new(kind, line, &self.texts));
                 return;
             }
-            Command::NewAgent => {
-                if self.shells.add_agent(self.settings.agent).is_none() {
-                    self.say(self.texts.tr("Shell limit reached").to_owned());
+            Command::ToggleAgent => {
+                self.bench.toggle(Panel::Agent);
+                if self.shows(Panel::Agent) {
+                    self.start_agent(false);
+                    self.ui.focus(Id::AgentInput, 0);
                 }
-                self.show_terminal();
+                return;
+            }
+            Command::NewAgent => {
+                self.start_agent(true);
+                self.bench.show(Panel::Agent);
+                self.ui.focus(Id::AgentInput, 0);
                 return;
             }
             Command::AskAgent => {
@@ -3549,6 +3797,7 @@ impl App {
 
     fn poll(&mut self) {
         self.finder.poll();
+        self.poll_agent();
         self.watcher.watch(self.docs.on_disk());
         if self.watcher.take_changed() {
             self.check_disk();
@@ -3839,6 +4088,37 @@ impl App {
                         }
                     }
                 }
+                Done::AgentUp(pipe) => {
+                    if let Some(chat) = &mut self.chat {
+                        chat.started(pipe);
+                    }
+                }
+                Done::AgentRead(id, text, line, limit) => {
+                    if let Some(chat) = &self.chat {
+                        let text = text.map(
+                            |t| serde_json::json!({"content": agent::lines_of(&t, line, limit)}),
+                        );
+                        chat.respond(&id, text);
+                    }
+                }
+                Done::AgentWrote(id, result, path) => {
+                    if let Some(chat) = &self.chat {
+                        chat.respond(&id, result.map(|()| serde_json::Value::Null));
+                    }
+                    // a new file shows in the explorer
+                    if let Some(dir) = path.parent() {
+                        self.scan(dir.to_path_buf());
+                    }
+                }
+                Done::AgentLogin(line) => match line {
+                    Ok(line) => {
+                        if self.shells.add().is_some() {
+                            self.shells.current_mut().write(&format!("{line}\r"));
+                            self.show_terminal();
+                        }
+                    }
+                    Err(why) => self.say(why),
+                },
                 Done::Shell(id, result) => {
                     if let Some(shell) = self.shells.get_mut(id) {
                         shell.started(result);
@@ -4044,6 +4324,7 @@ impl App {
                         .unwrap_or_default(),
                     Panel::Search => self.texts.tr("Search").to_owned(),
                     Panel::Terminal => self.texts.tr("Terminal").to_owned(),
+                    Panel::Agent => self.texts.tr("Agent").to_owned(),
                     Panel::Problems => {
                         let n = self.problems.rows.len();
                         if n == 0 {
@@ -4104,6 +4385,7 @@ impl App {
                     Panel::Search => "search",
                     Panel::Git | Panel::Diff(_) => "source-control",
                     Panel::Terminal => "shell",
+                    Panel::Agent => "agent",
                     Panel::Problems | Panel::Welcome => return None,
                 };
                 Some((id, name))
@@ -4167,6 +4449,7 @@ impl App {
         }
         let mut problem_picked = None;
         let mut ext_asked = None;
+        let mut agent_asked: Option<agent::view::Ask> = None;
         let mut view_done: Vec<extension::draw::Done> = Vec::new();
         let mut scm_asked = None;
         let mut diff_asked: Option<(DocumentId, crate::git::diff::Ask)> = None;
@@ -4225,6 +4508,7 @@ impl App {
             let previews = &mut self.previews;
             let finder = &mut self.finder;
             let problems = &mut self.problems;
+            let chat = &mut self.chat;
             let (scm, changes) = (&mut self.scm, &self.changes);
             let repos = &self.repos;
             let extensions = &mut self.extensions;
@@ -4328,6 +4612,14 @@ impl App {
                 }
                 Some(Panel::Problems) => {
                     problem_picked = problems::show(ui, problems, &root, rect, texts)?;
+                    Ok(())
+                }
+                Some(Panel::Agent) => {
+                    if let Some(chat) = chat.as_mut() {
+                        agent_asked = agent::view::show(ui, chat, rect, texts)?;
+                    } else {
+                        ui.fill(rect, ui.theme.palette.surface)?;
+                    }
                     Ok(())
                 }
                 Some(Panel::Extensions) => {
@@ -4706,6 +4998,9 @@ impl App {
         self.point_at(pointer);
         if let Some(ask) = remote_asked {
             self.remote_ask(ask);
+        }
+        if let Some(ask) = agent_asked {
+            self.agent_ask(ask);
         }
         match read_ask {
             Some((view, crate::preview::Ask::Open(url))) => self.open_link(view, &url),
@@ -5447,6 +5742,13 @@ impl App {
                 Some(Panel::Problems),
                 problems,
             ),
+            item(
+                "agent",
+                "Agent",
+                Command::ToggleAgent,
+                Some(Panel::Agent),
+                0,
+            ),
             item("settings", "Settings", Command::OpenSettings, None, 0),
         ];
         // extension views: side ones with the side panels, bottom ones by
@@ -5991,12 +6293,35 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::Grave), Command::ToggleTerminal)
         .bind(Chord::command(KeyCode::Grave).shift(), Command::NewTerminal)
         .bind(Chord::command(KeyCode::A).shift(), Command::AskAgent)
+        .bind(Chord::command(KeyCode::I).shift(), Command::ToggleAgent)
         .bind(Chord::command(KeyCode::V).shift(), Command::TogglePreview)
         .bind(Chord::command(KeyCode::M).shift(), Command::ToggleProblems)
         .bind(Chord::command(KeyCode::G).shift(), Command::ToggleGit)
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
+}
+
+/// the one edit that turns `now` into `want`: the middle between what both
+/// start and end with, on char edges, so marks and the undo step stay small.
+fn smallest_edit(now: &str, want: &str) -> (std::ops::Range<usize>, String) {
+    let front = now
+        .char_indices()
+        .zip(want.chars())
+        .take_while(|((_, a), b)| a == b)
+        .last()
+        .map_or(0, |((i, a), _)| i + a.len_utf8());
+    let (now_rest, want_rest) = (&now[front..], &want[front..]);
+    let back = now_rest
+        .chars()
+        .rev()
+        .zip(want_rest.chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum::<usize>();
+    let end = now.len() - back;
+    let want_end = want.len() - back;
+    (front..end, want[front..want_end].to_owned())
 }
 
 /// how far a scroll went in wheel notches; a trackpad's pixels count as
@@ -6008,6 +6333,29 @@ fn notches(scroll: &aurea::ScrollEvent) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_smallest_edit_gets_there() {
+        for (now, want) in [
+            ("fn a() {}\n", "fn b() {}\n"),
+            ("same", "same"),
+            ("", "new"),
+            ("old", ""),
+            ("가나다", "가X다"),
+            ("aaa", "aaaa"),
+            ("ab\ncd\n", "ab\nxx\ncd\n"),
+        ] {
+            let (range, middle) = smallest_edit(now, want);
+            let mut got = now.to_owned();
+            got.replace_range(range.clone(), &middle);
+            assert_eq!(got, want, "{now:?} -> {want:?}");
+            assert!(now.is_char_boundary(range.start) && now.is_char_boundary(range.end));
+        }
+        assert_eq!(
+            smallest_edit("fn a() {}", "fn b() {}"),
+            (3..4, "b".to_owned())
+        );
+    }
     use aurea::dialog::MessageChoice;
 
     #[test]

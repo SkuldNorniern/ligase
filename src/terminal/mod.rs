@@ -1,8 +1,6 @@
 //! terminal panel: one shell from vanta, started the first time the panel
 //! is drawn. while the panel has focus its keys go to the shell.
 
-pub mod agent;
-
 use std::path::Path;
 
 use aurea::render::{Color, Font, Rect};
@@ -74,8 +72,6 @@ pub struct Shell {
     early: String,
     /// the host this shell runs on over ssh; none for this machine.
     pub remote: Option<String>,
-    /// the coding agent running here in place of a shell.
-    pub agent: Option<agent::Agent>,
 }
 
 /// most shells in the panel.
@@ -144,24 +140,6 @@ impl Shells {
         Some(id)
     }
 
-    /// a new tab running `agent`, in front. none past the cap.
-    pub fn add_agent(&mut self, agent: agent::Agent) -> Option<u32> {
-        let id = self.add()?;
-        self.current_mut().agent = Some(agent);
-        Some(id)
-    }
-
-    /// the newest tab running `agent` that is still going, put in front.
-    pub fn front_agent(&mut self, agent: agent::Agent) -> bool {
-        let found = self.list.iter().rposition(|(_, s)| {
-            s.agent == Some(agent) && !matches!(s.state, State::Ended | State::Failed(_))
-        });
-        if let Some(i) = found {
-            self.at = i;
-        }
-        found.is_some()
-    }
-
     /// a new shell on `host` over ssh, in front. none past the cap.
     pub fn add_remote(&mut self, host: &str) -> Option<u32> {
         let id = self.add()?;
@@ -206,10 +184,9 @@ pub fn strip(ui: &mut Ui<'_, Id>, shells: &Shells, rect: Rect) -> AureaResult<Op
     let mut x = rect.x + 8.0;
     for (i, (_, shell)) in shells.list.iter().enumerate() {
         let n = u16::try_from(i).unwrap_or(u16::MAX);
-        let label = match (&shell.remote, shell.agent) {
-            (Some(host), _) => format!("⇄ {}", host.chars().take(24).collect::<String>()),
-            (None, Some(agent)) => format!("✦ {}", agent.name()),
-            (None, None) => format!("{}", i + 1),
+        let label = match &shell.remote {
+            Some(host) => format!("⇄ {}", host.chars().take(24).collect::<String>()),
+            None => format!("{}", i + 1),
         };
         let w = ui.text_width(&label, &font) + 34.0;
         let tab = Rect::new(x, rect.y + 3.0, w, rect.height - 6.0);
@@ -278,30 +255,17 @@ pub fn host_ok(host: &str) -> bool {
         })
 }
 
-/// starts a shell in `root`, `ssh` to `remote` from there, or `agent`'s
-/// own program. runs on the worker; `wake` runs on vanta's reader thread
-/// after each chunk of output.
+/// starts a shell in `root`, or `ssh` to `remote` from there. runs on the
+/// worker; `wake` runs on vanta's reader thread after each chunk of output.
 pub fn spawn(
     root: &Path,
     remote: Option<&str>,
-    agent: Option<agent::Agent>,
     wake: impl Fn() + Send + 'static,
 ) -> Result<Terminal, String> {
     let mut config = SpawnConfig {
         cwd: Some(root.to_path_buf()),
         ..SpawnConfig::default()
     };
-    if let Some(agent) = agent {
-        let Some((program, args)) = agent.command() else {
-            return Err(format!(
-                "{} is not installed: `{}` is not on PATH",
-                agent.name(),
-                agent.word()
-            ));
-        };
-        config.program = Some(program.into_os_string());
-        config.args = args.into_iter().map(Into::into).collect();
-    }
     if let Some(host) = remote {
         if !host_ok(host) {
             return Err(format!("not a host name: {host}"));
