@@ -5323,7 +5323,20 @@ impl App {
             menu_act = self.menu.show(&mut ui, texts, &self.keymap);
             palette_ask = palette::view::show(&mut ui, &mut self.palette, main, texts)?;
             sheet_ask = settings::view::show(&mut ui, &mut self.sheet, settings, main, texts)?;
-            status_pick = status_bar(&mut ui, status, self.branch.as_deref(), &message, &place)?;
+            let remote_host = self.remote.as_ref().map(|b| {
+                let up = matches!(b.state, crate::remote::browse::State::Ready(_));
+                (b.host.clone(), up)
+            });
+            status_pick = status_bar(
+                &mut ui,
+                status,
+                (
+                    self.branch.as_deref(),
+                    remote_host.as_ref().map(|(h, up)| (h.as_str(), *up)),
+                ),
+                &message,
+                &place,
+            )?;
         }
         if self.settings.side_overlay && !pressed.is_empty() {
             // a click in the code puts the floating bar away
@@ -6566,16 +6579,14 @@ impl App {
                 self.extensions.broken(),
             ),
         ];
-        // the remote folder has a button while a link is open
-        if self.remote.is_some() {
-            top.push(item(
-                "folder",
-                "Remote",
-                Command::OpenRemoteFolder,
-                Some(Panel::Remote),
-                0,
-            ));
-        }
+        // a remote folder is a click away, linked or not, as in vs code
+        top.push(item(
+            "remote",
+            "Remote",
+            Command::OpenRemoteFolder,
+            Some(Panel::Remote),
+            0,
+        ));
         let mut bottom = vec![
             item(
                 "shell",
@@ -6803,12 +6814,13 @@ fn settings_file(path: &Path) -> Result<PathBuf, String> {
 pub const NEW_WINDOW: &str = "--new-window";
 
 /// what the welcome page offers, with the label its menu item has.
-const WELCOME: [(&str, Command); 8] = [
+const WELCOME: [(&str, Command); 9] = [
     ("Quick Open", Command::QuickOpen),
     ("Command Palette", Command::Commands),
     ("New File", Command::NewFile),
     ("Open File", Command::OpenFile),
     ("Open Folder", Command::OpenFolder),
+    ("Open Remote Folder (SSH)", Command::OpenRemoteFolder),
     ("Find in Files", Command::FindInFiles),
     ("Terminal", Command::ToggleTerminal),
     ("Settings", Command::OpenSettings),
@@ -6925,7 +6937,7 @@ const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(8);
 fn status_bar(
     ui: &mut Ui<'_, Id>,
     rect: Rect,
-    branch: Option<&str>,
+    (branch, remote): (Option<&str>, Option<(&str, bool)>),
     message: &str,
     place: &[(String, Option<Command>)],
 ) -> AureaResult<Option<Command>> {
@@ -6949,7 +6961,35 @@ fn status_bar(
             }
             ui.text(text, at, &font, colour, Align::Center)
         };
-    let mut x = rect.x + 4.0;
+    let mut x = rect.x;
+    // the remote mark at the very left, as vs code has it: the host when
+    // linked, lit; a click opens the remote panel or its picker
+    let small = ui.theme.font(11.5);
+    let (label, lit) = match remote {
+        Some((host, up)) => (
+            format!("⇄ {}", host.chars().take(30).collect::<String>()),
+            up,
+        ),
+        None => ("⇄".to_owned(), false),
+    };
+    let w = ui.text_width(&label, &small) + 18.0;
+    let at = Rect::new(x, rect.y, w, rect.height);
+    let input = ui.interact(Id::Status, 90, at, Sense::Click, true);
+    let fill = if lit {
+        palette.accent
+    } else if input.hovered {
+        palette.hover
+    } else {
+        palette.raised
+    };
+    ui.fill(at, fill)?;
+    let ink = if lit { palette.on_accent } else { palette.dim };
+    ui.text(&label, at, &small, ink, Align::Center)?;
+    if input.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    let remote_click = input.clicked;
+    x += w + 4.0;
     // the branch first, the way vs code and zed start theirs
     if let Some(branch) = branch {
         let w = (ui.text_width(branch, &font) + 16.0).min(rect.width * 0.3);
@@ -6983,7 +7023,7 @@ fn status_bar(
     }
     let left = Rect::new(x + 6.0, rect.y, (right - x - 12.0).max(0.0), rect.height);
     ui.text_clipped(message, left, &font, palette.dim, Align::Start)?;
-    Ok(picked)
+    Ok(picked.or(remote_click.then_some(Command::OpenRemoteFolder)))
 }
 
 /// the card for what the pointer rests on.

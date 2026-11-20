@@ -325,6 +325,11 @@ fn menus(window: &mut Window, app: &Rc<RefCell<App>>, id: CanvasId) -> AureaResu
     add(&mut file, "New Window", Command::NewWindow)?;
     add(&mut file, "Open File", Command::OpenFile)?;
     add(&mut file, "Open Folder", Command::OpenFolder)?;
+    add(
+        &mut file,
+        "Open Remote Folder (SSH)",
+        Command::OpenRemoteFolder,
+    )?;
     add(&mut file, "Quick Open", Command::QuickOpen)?;
     file.add_separator()?;
     add(&mut file, "Save", Command::Save)?;
