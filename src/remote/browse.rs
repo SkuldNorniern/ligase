@@ -583,8 +583,8 @@ pub fn known_hosts() -> Vec<String> {
         .unwrap_or_default();
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     if let Some(home) = home {
-        let config = PathBuf::from(home).join(".ssh").join("config");
-        if let Ok(text) = std::fs::read_to_string(config) {
+        let dot = PathBuf::from(home).join(".ssh");
+        for text in ssh_configs(&dot) {
             for host in super::ssh_hosts(&text) {
                 if !out
                     .iter()
@@ -595,6 +595,75 @@ pub fn known_hosts() -> Vec<String> {
             }
         }
     }
+    out
+}
+
+/// `~/.ssh/config` and the files its `Include` lines name, one level deep:
+/// `~/` and paths relative to `~/.ssh`, a `*` in the file name. at most 32
+/// files, each under 1 MiB.
+fn ssh_configs(dot: &std::path::Path) -> Vec<String> {
+    let read = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .ok()
+            .filter(|m| m.is_file() && m.len() < 1024 * 1024)
+            .and_then(|_| std::fs::read_to_string(p).ok())
+    };
+    let Some(main) = read(&dot.join("config")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in main.lines().take(10_000) {
+        let line = line.trim();
+        let Some(rest) = line
+            .get(..8)
+            .filter(|w| w.eq_ignore_ascii_case("include "))
+            .map(|_| &line[8..])
+        else {
+            continue;
+        };
+        for pattern in rest.split_whitespace() {
+            let path = match pattern.strip_prefix("~/") {
+                Some(r) => dot
+                    .parent()
+                    .map_or_else(|| dot.join(r), |home| home.join(r)),
+                None => dot.join(pattern),
+            };
+            let (Some(dir), Some(name)) =
+                (path.parent(), path.file_name().and_then(|n| n.to_str()))
+            else {
+                continue;
+            };
+            if let Some((head, tail)) = name.split_once('*') {
+                let Ok(list) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                let mut found: Vec<PathBuf> = list
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                            n.starts_with(head)
+                                && n.ends_with(tail)
+                                && n.len() >= head.len() + tail.len()
+                        })
+                    })
+                    .collect();
+                found.sort();
+                for p in found {
+                    if out.len() < 32
+                        && let Some(t) = read(&p)
+                    {
+                        out.push(t);
+                    }
+                }
+            } else if out.len() < 32
+                && let Some(t) = read(&path)
+            {
+                out.push(t);
+            }
+        }
+    }
+    out.insert(0, main);
     out
 }
 
@@ -638,6 +707,21 @@ mod tests {
         );
         assert_eq!(join("/", "a"), "/a");
         assert_eq!(join("/srv", "a"), "/srv/a");
+    }
+
+    #[test]
+    fn included_ssh_configs_are_read() {
+        let dot = std::env::temp_dir().join(format!("ligase-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dot);
+        std::fs::create_dir_all(dot.join("config.d")).unwrap();
+        std::fs::write(dot.join("config"), "Include config.d/*\nHost main\n").unwrap();
+        std::fs::write(dot.join("config.d/work"), "Host build-box\n").unwrap();
+        let hosts: Vec<String> = ssh_configs(&dot)
+            .iter()
+            .flat_map(|t| crate::remote::ssh_hosts(t))
+            .collect();
+        assert_eq!(hosts, ["main", "build-box"]);
+        std::fs::remove_dir_all(&dot).unwrap();
     }
 
     #[test]
