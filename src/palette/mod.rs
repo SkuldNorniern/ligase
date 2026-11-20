@@ -111,9 +111,11 @@ impl Palette {
 
     /// new symbols for `@`; rows made from the old ones are made again.
     pub fn set_symbols(&mut self, symbols: Vec<Item>, at: Vec<usize>) {
+        // the places move with every edit above them, the names don't: a
+        // jump must take the new place even when the rows look the same
+        self.symbol_at = at;
         if self.symbols != symbols {
             self.symbols = symbols;
-            self.symbol_at = at;
             self.generation += 1;
         }
     }
