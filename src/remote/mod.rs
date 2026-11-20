@@ -254,6 +254,42 @@ impl Session {
         Ok(parse_grep(&out))
     }
 
+    /// makes an empty file, or a folder, at `path`. never over something
+    /// already there.
+    pub fn create(&mut self, path: &str, folder: bool) -> Result<(), String> {
+        let q = quoted(path)?;
+        let script = if folder {
+            format!("mkdir -- {q}")
+        } else {
+            format!("[ ! -e {q} ] && : > {q}")
+        };
+        let (_, status) = self.run(&script, CALL_TIMEOUT)?;
+        if status != 0 {
+            return Err(format!("cannot make {path}: it may be there already"));
+        }
+        Ok(())
+    }
+
+    /// renames `from` to `to`; never over something already at `to`.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let (f, t) = (quoted(from)?, quoted(to)?);
+        let (_, status) = self.run(&format!("[ ! -e {t} ] && mv -- {f} {t}"), CALL_TIMEOUT)?;
+        if status != 0 {
+            return Err(format!("cannot rename to {to}: it may be there already"));
+        }
+        Ok(())
+    }
+
+    /// deletes `path`, a folder with all in it.
+    pub fn remove(&mut self, path: &str) -> Result<(), String> {
+        let q = quoted(path)?;
+        let (_, status) = self.run(&format!("rm -rf -- {q}"), CALL_TIMEOUT)?;
+        if status != 0 {
+            return Err(format!("cannot delete {path}"));
+        }
+        Ok(())
+    }
+
     /// the remote home directory (`printf %s "$HOME"`).
     pub fn home(&mut self) -> Result<String, String> {
         let (out, status) = self.run("printf %s \"$HOME\"", CALL_TIMEOUT)?;
@@ -607,6 +643,35 @@ Host box
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn files_are_made_renamed_and_removed_without_overwriting() {
+        let Some(mut s) = session() else { return };
+        let dir = std::env::temp_dir().join(format!("ligase-rops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = posix(&dir);
+        let a = format!("{root}/a.txt");
+        s.create(&a, false).unwrap();
+        std::fs::write(dir.join("a.txt"), "kept").unwrap();
+        assert!(s.create(&a, false).is_err(), "never over a file");
+        s.create(&format!("{root}/sub"), true).unwrap();
+        assert!(s.create(&format!("{root}/sub"), true).is_err());
+        std::fs::write(dir.join("b.txt"), "other").unwrap();
+        assert!(
+            s.rename(&a, &format!("{root}/b.txt")).is_err(),
+            "never over b"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "other");
+        s.rename(&a, &format!("{root}/sub/c.txt")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/c.txt")).unwrap(),
+            "kept"
+        );
+        s.remove(&format!("{root}/sub")).unwrap();
+        assert!(!dir.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

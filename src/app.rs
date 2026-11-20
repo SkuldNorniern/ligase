@@ -414,6 +414,10 @@ enum Target {
     Root,
     Tab(PaneId),
     Editor(ViewId),
+    /// a row of the remote tree: its far-side path, and whether a folder.
+    Remote(String, bool),
+    /// the remote tree's empty space: its root.
+    RemoteRoot,
 }
 
 /// what a prompt in the palette is for.
@@ -421,6 +425,10 @@ enum Target {
 enum PromptFor {
     /// a host for a shell over ssh.
     RemoteShell,
+    /// a name for a new remote file (or folder) in this remote folder.
+    RemoteNew(String, bool),
+    /// a new name for this remote path.
+    RemoteRename(String),
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
@@ -590,6 +598,8 @@ pub struct App {
     shells: terminal::Shells,
     /// the agent conversation, made the first time the panel is used.
     chat: Option<agent::Chat>,
+    /// the remote path a delete is waiting on the person for.
+    remote_delete: Option<String>,
     /// the remote panel before a link: a target and known hosts.
     remote_pick: crate::remote::browse::Picker,
     /// the editor and documents' stamp the symbol list was filled at.
@@ -758,6 +768,7 @@ impl App {
             syntax: Syntax::default(),
             shells: terminal::Shells::default(),
             chat: None,
+            remote_delete: None,
             remote_pick: crate::remote::browse::Picker::default(),
             symbols_seen: None,
             agent_saves: Vec::new(),
@@ -2321,6 +2332,10 @@ impl App {
         let Some(target) = self.menu_target.take() else {
             return;
         };
+        if let Target::Remote(..) | Target::RemoteRoot = target {
+            self.remote_act(act, target);
+            return;
+        }
         let root = self.explorer.root().to_path_buf();
         // the folder new entries go in, and the path the row is about
         let (folder, path) = match &target {
@@ -2330,7 +2345,8 @@ impl App {
                     .map_or_else(|| root.clone(), Path::to_path_buf),
                 Some(path.clone()),
             ),
-            Target::Root => (root.clone(), None),
+            // handled above; nothing local to act on
+            Target::Root | Target::Remote(..) | Target::RemoteRoot => (root.clone(), None),
             Target::Tab(pane) => match self.bench.panels.get(*pane) {
                 Some(Panel::Editor(view)) => {
                     let p = self
@@ -2465,6 +2481,26 @@ impl App {
         let Some(prompt) = self.prompt_for.take() else {
             return;
         };
+        if let PromptFor::RemoteNew(dir, folder) = &prompt {
+            let Some(name) = explorer::plain_name(answer) else {
+                self.say(self.texts.tr("Invalid name").to_owned());
+                return;
+            };
+            let (dir, folder) = (dir.clone(), *folder);
+            let path = crate::remote::browse::join(&dir, name);
+            self.remote_change(dir, move |s| s.create(&path, folder));
+            return;
+        }
+        if let PromptFor::RemoteRename(from) = &prompt {
+            let Some(name) = explorer::plain_name(answer) else {
+                self.say(self.texts.tr("Invalid name").to_owned());
+                return;
+            };
+            let dir = parent_of(from);
+            let (from, to) = (from.clone(), crate::remote::browse::join(&dir, name));
+            self.remote_change(dir, move |s| s.rename(&from, &to));
+            return;
+        }
         if let PromptFor::RemoteShell = prompt {
             let host = answer.trim();
             if !terminal::host_ok(host) {
@@ -2487,7 +2523,9 @@ impl App {
         };
         let name = name.to_owned();
         let job: Box<dyn FnOnce() -> Done + Send> = match prompt {
-            PromptFor::RemoteShell => return,
+            PromptFor::RemoteShell | PromptFor::RemoteNew(..) | PromptFor::RemoteRename(_) => {
+                return;
+            }
             PromptFor::NewFile(dir) => Box::new(move || {
                 let path = dir.join(&name);
                 Done::FileOp(explorer::create_file(&path).map(|()| FileDone {
@@ -2817,11 +2855,12 @@ impl App {
                 DialogStart::Confirm(title, text)
             }
             Dialog::ConfirmDelete => {
-                let name = self
-                    .delete_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
+                let name = self.remote_delete.clone().unwrap_or_else(|| {
+                    self.delete_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                });
                 // open files with edits in there are named: their text stays
                 // open, but there will be no folder to save them to
                 let dirty: Vec<String> = self
@@ -2886,6 +2925,14 @@ impl App {
             {
                 self.procs
                     .run(move || Done::GitDid(crate::git::discard(&top, &rels).map(|()| false)));
+            }
+            return;
+        }
+        if dialog == Dialog::ConfirmDelete
+            && let Some(path) = self.remote_delete.take()
+        {
+            if choice == MessageChoice::Ok {
+                self.remote_change(parent_of(&path), move |s| s.remove(&path));
             }
             return;
         }
@@ -5545,6 +5592,15 @@ impl App {
                 self.open_remote(&target);
                 return;
             }
+            Ask::Menu(at, node) => {
+                let at = *at;
+                self.menu_target = Some(match node {
+                    Some((path, dir)) => Target::Remote(path.clone(), *dir),
+                    None => Target::RemoteRoot,
+                });
+                self.menu.ask(at, context_menu::remote(node.is_some()));
+                return;
+            }
             Ask::Disconnect => {
                 // the link's ssh is let go off the ui thread
                 if let Some(old) = self.remote.take() {
@@ -5589,7 +5645,7 @@ impl App {
         let host = browser.host.clone();
         let root = browser.root.clone();
         match ask {
-            Ask::Connect(_) | Ask::Disconnect | Ask::Reconnect | Ask::Terminal => {}
+            Ask::Connect(_) | Ask::Disconnect | Ask::Reconnect | Ask::Terminal | Ask::Menu(..) => {}
             Ask::Refresh => {
                 self.procs.run(move || {
                     let result = link
@@ -5649,6 +5705,88 @@ impl App {
                 });
             }
         }
+    }
+
+    /// a menu act on the remote tree: new, rename, delete, all on the far
+    /// side and kept inside the remote folder.
+    fn remote_act(&mut self, act: Act, target: Target) {
+        let Some(root) = self.remote.as_ref().map(|b| b.root.clone()) else {
+            return;
+        };
+        let (folder, path) = match target {
+            Target::Remote(path, true) => (path.clone(), Some(path)),
+            Target::Remote(path, false) => (parent_of(&path), Some(path)),
+            _ => (root.clone(), None),
+        };
+        // nothing outside the folder, and never the folder itself
+        let inside = |p: &str| {
+            p.starts_with(&format!("{}/", root.trim_end_matches('/')))
+                && !p.split('/').any(|part| part == "..")
+        };
+        match act {
+            Act::NewFile | Act::NewFolder => {
+                let file = act == Act::NewFile;
+                let hint = if file {
+                    self.texts.tr("File name")
+                } else {
+                    self.texts.tr("Folder name")
+                };
+                self.prompt_for = Some(PromptFor::RemoteNew(folder, !file));
+                self.palette.prompt(hint.to_owned(), String::new());
+                self.ui.focus(Id::PaletteField, 0);
+            }
+            Act::Rename => {
+                let Some(path) = path.filter(|p| inside(p)) else {
+                    return;
+                };
+                let name = path.rsplit('/').next().unwrap_or("").to_owned();
+                self.prompt_for = Some(PromptFor::RemoteRename(path));
+                self.palette
+                    .prompt(self.texts.tr("new name").to_owned(), name);
+                self.ui.focus(Id::PaletteField, 0);
+            }
+            Act::Delete => {
+                if let Some(path) = path.filter(|p| inside(p)) {
+                    self.remote_delete = Some(path);
+                    self.dialog = Some(Dialog::ConfirmDelete);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// runs `change` over the link, then reads `dir` again.
+    fn remote_change(
+        &mut self,
+        dir: String,
+        change: impl FnOnce(&mut crate::remote::Session) -> Result<(), String> + Send + 'static,
+    ) {
+        let Some(crate::remote::browse::State::Ready(link)) =
+            self.remote.as_ref().map(|b| &b.state)
+        else {
+            self.say(self.texts.tr("The remote link is down").to_owned());
+            return;
+        };
+        let link = std::sync::Arc::clone(link);
+        let root = self
+            .remote
+            .as_ref()
+            .map(|b| b.root.clone())
+            .unwrap_or_default();
+        self.procs.run(move || {
+            let result = link
+                .lock()
+                .map_err(|_| "the link broke".to_owned())
+                .and_then(|mut s| {
+                    change(&mut s)?;
+                    s.list(&dir)
+                });
+            match result {
+                Ok(entries) if dir == root => Done::RemoteRoot(Ok(entries)),
+                Ok(entries) => Done::RemoteListed(dir, Ok(entries)),
+                Err(why) => Done::Note(Some(why)),
+            }
+        });
     }
 
     /// the picker's hosts, read on the worker.
@@ -6687,6 +6825,14 @@ fn keymap() -> Keymap<Command> {
         .bind(Chord::command(KeyCode::N).shift(), Command::NewWindow)
         .bind(Chord::command(KeyCode::Backslash), Command::SplitEditor);
     map
+}
+
+/// a far-side path's folder: `/srv/a/b` gives `/srv/a`, `/a` gives `/`.
+fn parent_of(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some(("", _)) | None => "/".to_owned(),
+        Some((dir, _)) => dir.to_owned(),
+    }
 }
 
 /// writes the agent key to its own file, readable only by its owner where

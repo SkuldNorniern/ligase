@@ -84,6 +84,9 @@ pub enum Ask {
     Disconnect,
     /// connect to `user@host:/path` from the picker.
     Connect(String),
+    /// a right click at this point, on this row (path, folder) or the
+    /// empty space.
+    Menu(aurea::render::Point, Option<(String, bool)>),
 }
 
 /// `dir` and `name` as one far-side path.
@@ -420,6 +423,15 @@ pub fn show(
             Ok(())
         })?;
     browser.picked = picked;
+    // a right click: the row under it, from the scroll and row height
+    if let Some(at) = ui.secondary_at(Id::RemoteList, 0) {
+        let row = ((at.y - list.y + browser.scroll) / ROW).floor();
+        let node = (row >= 0.0)
+            .then_some(row as usize)
+            .and_then(|r| browser.rows.get(r))
+            .map(|n| (n.path.clone(), n.dir));
+        return Ok(Some(Ask::Menu(at, node)));
+    }
     let clicked = response
         .row_clicked
         .or(response.activated.then_some(picked).flatten());

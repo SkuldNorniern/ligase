@@ -120,6 +120,22 @@ pub fn explorer(on_entry: bool, previews: bool) -> Vec<Entry> {
     rows
 }
 
+/// rows for a right click in the remote tree.
+pub fn remote(on_entry: bool) -> Vec<Entry> {
+    let mut rows = vec![
+        Entry::Item("New File", Act::NewFile),
+        Entry::Item("New Folder", Act::NewFolder),
+    ];
+    if on_entry {
+        rows.extend([
+            Entry::Line,
+            Entry::Item("Rename", Act::Rename),
+            Entry::Item("Delete", Act::Delete),
+        ]);
+    }
+    rows
+}
+
 /// rows for a right click in an editor.
 pub fn editor() -> Vec<Entry> {
     use crate::editor::LineOp;
