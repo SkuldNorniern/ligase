@@ -30,7 +30,9 @@ const LINK_DOWN: &str = "the link is down";
 
 pub struct Session {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// the writer thread: a script and where to say it was written. a
+    /// stalled link blocks that thread, never the caller past its limit.
+    stdin: Option<std::sync::mpsc::Sender<(Vec<u8>, std::sync::mpsc::Sender<bool>)>>,
     lines: Receiver<String>,
     counter: u64,
     broken: bool,
@@ -97,7 +99,7 @@ impl Session {
         }
         Ok(Session {
             child,
-            stdin: Some(stdin),
+            stdin: Some(writer(stdin)),
             lines,
             counter: 0,
             broken: false,
@@ -337,15 +339,20 @@ impl Session {
     }
 
     fn send(&mut self, text: &str) -> Result<(), String> {
-        let result = match self.stdin.as_mut() {
-            Some(stdin) => stdin
-                .write_all(text.as_bytes())
-                .and_then(|()| stdin.flush()),
-            None => Err(std::io::Error::other("stdin closed")),
+        let Some(stdin) = &self.stdin else {
+            return Err(self.fail(LINK_DOWN));
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) => Err(self.fail(LINK_DOWN)),
+        let (done, written) = std::sync::mpsc::channel();
+        if stdin.send((text.as_bytes().to_vec(), done)).is_err() {
+            return Err(self.fail(LINK_DOWN));
+        }
+        // half a minute, and a second more per 64 KiB: a big save on a slow
+        // link gets its time, a stalled one is given up on
+        let limit = Duration::from_secs(30 + (text.len() / (64 * 1024)) as u64);
+        match written.recv_timeout(limit) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => Err(self.fail(LINK_DOWN)),
+            Err(RecvTimeoutError::Timeout) => Err(self.fail("timed out sending")),
         }
     }
 
@@ -376,6 +383,24 @@ impl Drop for Session {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// the thread that writes to the link, so a stalled write holds it, not
+/// the worker. it ends when the session lets go of it.
+fn writer(
+    mut stdin: ChildStdin,
+) -> std::sync::mpsc::Sender<(Vec<u8>, std::sync::mpsc::Sender<bool>)> {
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, std::sync::mpsc::Sender<bool>)>();
+    std::thread::spawn(move || {
+        for (bytes, done) in rx {
+            let ok = stdin.write_all(&bytes).and_then(|()| stdin.flush()).is_ok();
+            let _ = done.send(ok);
+            if !ok {
+                return;
+            }
+        }
+    });
+    tx
 }
 
 fn read_lines(stdout: ChildStdout, tx: SyncSender<String>) {
