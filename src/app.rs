@@ -476,6 +476,8 @@ enum Done {
     Saved(Result<(), String>),
     /// a picture file read: its number, size in bytes, and what it shows.
     Picture(u32, u64, Result<viewer::Look, String>),
+    /// a pdf page drawn for a tab: tab, page, zoom, pixels.
+    PdfPage(u32, usize, f32, Result<aurea::render::Image, String>),
     /// the saved agent conversations, newest first.
     History(Vec<agent::Past>),
     /// one saved conversation: its title and entries.
@@ -771,6 +773,8 @@ pub struct App {
     /// picture tabs by number, and the last number given.
     pictures: HashMap<u32, viewer::Picture>,
     next_picture: u32,
+    /// pdfium, loaded on a worker when the first pdf opens.
+    pdf: crate::pdf::Slot,
     diff_shown: HashMap<DocumentId, crate::git::diff::Shown>,
     /// stats the open files now and then, so outside edits show without a
     /// trip away from the window.
@@ -894,6 +898,7 @@ impl App {
             diffs: HashMap::new(),
             pictures: HashMap::new(),
             next_picture: 0,
+            pdf: crate::pdf::Slot::default(),
             diff_shown: HashMap::new(),
             watcher: document::watch::Watcher::default(),
             status_at: Instant::now(),
@@ -4398,8 +4403,9 @@ impl App {
             self.pictures
                 .insert(n, viewer::Picture::new(path.to_path_buf()));
             let at = path.to_path_buf();
+            let pdf = std::sync::Arc::clone(&self.pdf);
             self.jobs.run(move || {
-                let (bytes, look) = viewer::load(&at);
+                let (bytes, look) = viewer::load(&at, &pdf);
                 Done::Picture(n, bytes, look)
             });
             n
@@ -5324,6 +5330,9 @@ impl App {
                         self.texts.tr("Couldn't open the conversation")
                     ));
                 }
+                Done::PdfPage(n, page, zoom, image) => {
+                    viewer::page_drawn(&mut self.pictures, n, page, zoom, image);
+                }
                 Done::Picture(n, bytes, result) => {
                     if let Some(pic) = self.pictures.get_mut(&n) {
                         pic.bytes = bytes;
@@ -5382,8 +5391,9 @@ impl App {
                 self.next_picture = next;
                 for (n, path) in pictures {
                     self.pictures.insert(n, viewer::Picture::new(path.clone()));
+                    let pdf = std::sync::Arc::clone(&self.pdf);
                     self.jobs.run(move || {
-                        let (bytes, look) = viewer::load(&path);
+                        let (bytes, look) = viewer::load(&path, &pdf);
                         Done::Picture(n, bytes, look)
                     });
                 }
@@ -6217,6 +6227,11 @@ impl App {
         }
         if let Some((r, view)) = review {
             self.review(view, r);
+        }
+        // pdf pages that came in sight are drawn on the workers
+        for (n, page, zoom, book) in viewer::pages_wanted(&mut self.pictures) {
+            self.jobs
+                .run(move || Done::PdfPage(n, page, zoom, book.render(page, zoom)));
         }
         if let Some((path, at)) = file_drop {
             self.drop_file(&path, at);

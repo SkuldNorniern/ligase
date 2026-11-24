@@ -419,3 +419,6 @@
 "Keep" = "유지"
 "(nothing was here)" = "(원래 비어 있음)"
 "The change could not be undone" = "변경을 되돌릴 수 없습니다"
+"The PDF has no pages" = "PDF에 페이지가 없습니다"
+"page" = "페이지"
+"Fit width" = "너비 맞춤"

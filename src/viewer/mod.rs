@@ -12,6 +12,8 @@ use aurea::ui::{Align, Button, Sense, Ui};
 use crate::app::Id;
 use crate::lang::Texts;
 
+mod pages;
+
 /// biggest picture file read.
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 /// biggest decoded picture, in bytes of pixels.
@@ -22,8 +24,44 @@ const FOOT: f32 = 32.0;
 
 /// file kinds shown here: the ones drawn, and the ones known to be pictures
 /// that are not drawn yet, so they don't open as text.
-const DRAWN: [&str; 2] = ["png", "svg"];
+const DRAWN: [&str; 3] = ["png", "svg", "pdf"];
 const KNOWN: [&str; 8] = ["jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff"];
+
+/// pages pdf tabs want drawn: tab, page, zoom and the book. emptied as
+/// they are sent.
+pub fn pages_wanted(
+    pictures: &mut std::collections::HashMap<u32, Picture>,
+) -> Vec<(u32, usize, f32, std::sync::Arc<crate::pdf::Book>)> {
+    let mut out = Vec::new();
+    for (n, pic) in pictures.iter_mut() {
+        if let State::Ready(Look::Pdf(pages)) = &mut pic.state {
+            for (page, zoom) in pages.want.drain(..) {
+                out.push((*n, page, zoom, std::sync::Arc::clone(&pages.book)));
+            }
+        }
+    }
+    out
+}
+
+/// a pdf page came back for tab `n`.
+pub fn page_drawn(
+    pictures: &mut std::collections::HashMap<u32, Picture>,
+    n: u32,
+    page: usize,
+    zoom: f32,
+    image: Result<Image, String>,
+) {
+    if let Some(Picture {
+        state: State::Ready(Look::Pdf(pages)),
+        ..
+    }) = pictures.get_mut(&n)
+    {
+        match image {
+            Ok(image) => pages.drawn(page, zoom, image),
+            Err(_) => pages.failed(page),
+        }
+    }
+}
 
 /// whether `path` opens here instead of in a text editor.
 pub fn is_picture(path: &Path) -> bool {
@@ -36,6 +74,8 @@ pub fn is_picture(path: &Path) -> bool {
 pub enum Look {
     Raster(Image),
     Vector(VectorImage),
+    /// a pdf's pages, drawn as they come in sight.
+    Pdf(pages::Pages),
 }
 
 pub enum State {
@@ -83,7 +123,7 @@ impl Picture {
 }
 
 /// reads and decodes `path`. worker only.
-pub fn load(path: &Path) -> (u64, Result<Look, String>) {
+pub fn load(path: &Path, pdf: &crate::pdf::Slot) -> (u64, Result<Look, String>) {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -110,6 +150,8 @@ pub fn load(path: &Path) -> (u64, Result<Look, String>) {
             .map_err(|_| "not UTF-8 text".to_owned())
             .and_then(|t| VectorImage::parse(t).map_err(|e| format!("{e:?}")))
             .map(Look::Vector),
+        "pdf" => crate::pdf::open(pdf, std::sync::Arc::from(bytes))
+            .map(|book| Look::Pdf(pages::Pages::new(book))),
         _ => Err("this kind of picture can't be shown yet".to_owned()),
     };
     (size, look)
@@ -121,6 +163,7 @@ fn natural(look: &Look) -> (f32, f32) {
         #[allow(clippy::cast_precision_loss)]
         Look::Raster(i) => (i.width as f32, i.height as f32),
         Look::Vector(v) => (v.view_box.width.max(1.0), v.view_box.height.max(1.0)),
+        Look::Pdf(_) => (1.0, 1.0),
     }
 }
 
@@ -143,6 +186,10 @@ pub fn show(
     let palette = ui.theme.palette;
     let small = ui.theme.font(12.0);
     ui.fill(rect, palette.background)?;
+    // a pdf is pages one under another, not one picture
+    if let State::Ready(Look::Pdf(pages)) = &mut pic.state {
+        return pages::show(ui, n, pages, rect, texts);
+    }
     let look = match &pic.state {
         State::Loading => {
             return ui.text(
@@ -168,7 +215,7 @@ pub fn show(
         Look::Vector(_) => (room.width / size.0)
             .min(room.height / size.1)
             .clamp(MIN_ZOOM, MAX_ZOOM),
-        Look::Raster(_) => fit(size, room),
+        Look::Raster(_) | Look::Pdf(_) => fit(size, room),
     };
     let mut zoom = pic.zoom.unwrap_or(fitted);
 
@@ -239,6 +286,8 @@ pub fn show(
         match look {
             Look::Raster(image) => ui.ctx.draw_image_rect(image, at),
             Look::Vector(v) => v.draw(ui.ctx, at, palette.text),
+            // drawn by its own view above
+            Look::Pdf(_) => Ok(()),
         }
     })?;
 
@@ -247,6 +296,7 @@ pub fn show(
     let kind = match look {
         Look::Raster(_) => "PNG",
         Look::Vector(_) => "SVG",
+        Look::Pdf(_) => "PDF",
     };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let info = format!(
@@ -273,7 +323,7 @@ pub fn show(
     if Button::new(texts.tr("Fit"))
         .quiet()
         .selected(pic.zoom.is_none())
-        .show(ui, Id::PictureTool(n * 2), fit_at)?
+        .show(ui, Id::PictureTool(n * 4), fit_at)?
         .clicked
     {
         pic.zoom = None;
@@ -282,7 +332,7 @@ pub fn show(
     if Button::new("1:1")
         .quiet()
         .selected(pic.zoom == Some(1.0))
-        .show(ui, Id::PictureTool(n * 2 + 1), one)?
+        .show(ui, Id::PictureTool(n * 4 + 1), one)?
         .clicked
     {
         pic.zoom = Some(1.0);
@@ -362,11 +412,11 @@ mod tests {
         ] {
             let p = dir.join(name);
             std::fs::write(&p, bytes).unwrap();
-            assert!(load(&p).1.is_err(), "{name}");
+            assert!(load(&p, &crate::pdf::Slot::default()).1.is_err(), "{name}");
         }
         let svg = dir.join("ok.svg");
         std::fs::write(&svg, r#"<svg viewBox="0 0 10 20" xmlns="http://www.w3.org/2000/svg"><rect width="10" height="20"/></svg>"#).unwrap();
-        match load(&svg).1 {
+        match load(&svg, &crate::pdf::Slot::default()).1 {
             Ok(Look::Vector(v)) => assert!((v.view_box.height - 20.0).abs() < f32::EPSILON),
             _ => panic!("svg not read"),
         }
