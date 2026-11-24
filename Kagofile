@@ -15,6 +15,11 @@ app ligase
   windows target/release/ligase.exe
   icon windows assets/icons/app/ligase.ico
 
+# pdf pages; fetched by packaging/package.sh
+copy third_party/pdfium/bin/pdfium.dll
+copy third_party/pdfium/LICENSE -> {app}/licenses/pdfium/LICENSE
+copy third_party/pdfium/licenses -> {app}/licenses/pdfium
+
 shortcut
 path optional "Add ligase to PATH"
 
