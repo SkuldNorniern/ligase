@@ -163,7 +163,13 @@ pub fn show(
     let (foot, stage) = rect.split_bottom(FOOT, 0.0);
     let size = natural(look);
     let room = stage.inset(16.0);
-    let fitted = fit(size, room);
+    // a vector keeps sharp at any size: it fills the tab, small or not
+    let fitted = match look {
+        Look::Vector(_) => (room.width / size.0)
+            .min(room.height / size.1)
+            .clamp(MIN_ZOOM, MAX_ZOOM),
+        Look::Raster(_) => fit(size, room),
+    };
     let mut zoom = pic.zoom.unwrap_or(fitted);
 
     let input = ui.interact(Id::Picture(n), 0, stage, Sense::Click, true);
