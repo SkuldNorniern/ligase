@@ -205,7 +205,7 @@ pub const STARTER: &str = r#"# ligase settings. remove the # in front of a line 
 # word_highlight = true
 # auto_pairs = true
 # terminal_size = 13
-# agent = "claude"          # "claude", "codex", "gemini" or "opencode"
+# agent = "claude"          # "claude", "codex", "opencode" or "custom"
 # agent_command = ""        # a program and args that speak acp, in place of the agent's own
 # model_profile = ""        # which [models."..."] the custom agent uses
 
@@ -586,11 +586,8 @@ fn apply(out: &mut Settings, key: &str, value: &toml::Value) -> bool {
             Some(name) => out.model_profile = Some(name.to_owned()),
             None => return false,
         },
-        "agent" => match word(
-            value,
-            &["claude", "codex", "gemini", "opencode", "custom", "openai"],
-        )
-        .and_then(crate::agent::Agent::from_word)
+        "agent" => match word(value, &["claude", "codex", "opencode", "custom", "openai"])
+            .and_then(crate::agent::Agent::from_word)
         {
             Some(agent) => out.agent = agent,
             None => return false,
@@ -787,7 +784,7 @@ pub const FIELDS: &[Field] = &[
         label: "Coding Agent",
         about: "The agent the agent panel talks to. It signs in on its own.",
         group: "Agent",
-        kind: FieldKind::Choice(&["claude", "codex", "gemini", "opencode", "custom"]),
+        kind: FieldKind::Choice(&["claude", "codex", "opencode", "custom"]),
     },
     Field {
         key: "agent_command",

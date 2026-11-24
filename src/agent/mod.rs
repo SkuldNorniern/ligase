@@ -1,4 +1,4 @@
-//! the agent panel: a coding agent (claude code, codex, gemini, opencode)
+//! the agent panel: a coding agent (claude code, codex, opencode)
 //! talked to over the agent client protocol. ligase starts the agent's acp
 //! program and draws the conversation itself; the agent signs in on its
 //! own and keeps its keys, ligase never sees them. the agent reads and
@@ -6,6 +6,7 @@
 //! each edit can be undone.
 
 pub mod acp;
+pub mod claude;
 pub mod native;
 pub mod view;
 
@@ -20,27 +21,19 @@ use acp::{Fail, Incoming, Pipe};
 pub enum Agent {
     Claude,
     Codex,
-    Gemini,
     OpenCode,
     /// the built-in one, on any openai-compatible api.
     OpenAi,
 }
 
 impl Agent {
-    pub const ALL: [Self; 5] = [
-        Self::Claude,
-        Self::Codex,
-        Self::Gemini,
-        Self::OpenCode,
-        Self::OpenAi,
-    ];
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::OpenCode, Self::OpenAi];
 
     /// the settings word.
     pub fn word(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
             Self::OpenAi => "custom",
         }
@@ -58,14 +51,14 @@ impl Agent {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
-            Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
             Self::OpenAi => "Custom",
         }
     }
 
-    /// how the agent speaks acp: its own program when installed, else the
-    /// adapter through `npx`. checked against the adapters' docs, late 2026.
+    /// the program each agent runs, all native: no node anywhere. claude
+    /// code is its own `claude`, bridged in process from stream-json;
+    /// codex speaks acp through the rust `codex-acp`; opencode has `acp`.
     fn launch(
         self,
     ) -> (
@@ -73,16 +66,15 @@ impl Agent {
         &'static [&'static str],
         &'static [&'static str],
     ) {
-        // (program on PATH, its args, the npx package when the program is missing)
+        // (program on PATH, its args, where to get it)
         match self {
-            Self::Claude => (
-                "claude-agent-acp",
+            Self::Claude => ("claude", &[], &["https://claude.com/download"]),
+            Self::Codex => (
+                "codex-acp",
                 &[],
-                &["@agentclientprotocol/claude-agent-acp"],
+                &["https://github.com/zed-industries/codex-acp/releases"],
             ),
-            Self::Codex => ("codex-acp", &[], &["@zed-industries/codex-acp"]),
-            Self::Gemini => ("gemini", &["--experimental-acp"], &[]),
-            Self::OpenCode => ("opencode", &["acp"], &[]),
+            Self::OpenCode => ("opencode", &["acp"], &["https://opencode.ai"]),
             // runs inside ligase; never started as a program
             Self::OpenAi => ("", &[], &[]),
         }
@@ -97,22 +89,15 @@ impl Agent {
                 find_on_path(program).ok_or_else(|| format!("`{program}` is not on PATH"))?;
             return Ok(runnable(found, args.to_vec()));
         }
-        let (program, args, package) = self.launch();
+        let (program, args, from) = self.launch();
         if let Some(found) = find_on_path(program) {
             return Ok(runnable(
                 found,
                 args.iter().map(|a| (*a).to_owned()).collect(),
             ));
         }
-        if let Some(package) = package.first()
-            && let Some(npx) = find_on_path("npx")
-        {
-            return Ok(runnable(npx, vec!["-y".to_owned(), (*package).to_owned()]));
-        }
-        Err(match package.first() {
-            Some(package) => {
-                format!("`{program}` is not on PATH, and npx is missing to run {package}")
-            }
+        Err(match from.first() {
+            Some(from) => format!("`{program}` is not on PATH; get it from {from}"),
             None => format!("`{program}` is not on PATH"),
         })
     }
@@ -299,6 +284,8 @@ pub enum Need {
         id: Value,
         path: PathBuf,
         text: String,
+        /// the file before, when the agent changed it on disk itself.
+        before: Option<String>,
     },
     /// sign in by running the agent's program with these args in a terminal.
     Terminal(Vec<String>),
@@ -737,10 +724,15 @@ impl Chat {
                     refuse(self, "no content");
                     return None;
                 };
+                let before = params["_meta"]["before"]
+                    .as_str()
+                    .filter(|b| b.len() as u64 <= crate::document::MAX_FILE)
+                    .map(str::to_owned);
                 Some(Need::Write {
                     id,
                     path,
                     text: text.to_owned(),
+                    before,
                 })
             }
             // after stop, nothing more is allowed this turn

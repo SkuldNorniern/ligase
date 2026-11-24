@@ -710,7 +710,13 @@ pub struct App {
     waiting_edits: Vec<(DocumentId, Vec<lsp::edit::Edit>, Encoding)>,
     /// agent writes to files being opened for them: the document, the
     /// request, the path and the text.
-    agent_waiting: Vec<(DocumentId, serde_json::Value, PathBuf, String)>,
+    agent_waiting: Vec<(
+        DocumentId,
+        serde_json::Value,
+        PathBuf,
+        String,
+        Option<String>,
+    )>,
     /// replace all waiting on files to load: the query and what replaces it.
     waiting_replace: Vec<(DocumentId, String, String, crate::search::Opts)>,
     sheet: settings::view::Sheet,
@@ -1395,6 +1401,13 @@ impl App {
                 agent::acp::Pipe::in_process(move |lines, out| {
                     agent::native::serve(config, root, lines, out, Box::new(wake));
                 })
+            } else if agent == agent::Agent::Claude && custom.trim().is_empty() {
+                // claude code's own program, bridged here: no node adapter
+                agent.command("").and_then(|program| {
+                    agent::acp::Pipe::in_process(move |lines, out| {
+                        agent::claude::serve(program, root, lines, out, Box::new(wake));
+                    })
+                })
             } else {
                 agent.command(&custom).and_then(|(program, args)| {
                     agent::acp::Pipe::spawn(&program, &args, &root, wake)
@@ -1480,7 +1493,12 @@ impl App {
                         Done::AgentRead(id, text, line, limit)
                     });
                 }
-                agent::Need::Write { id, path, text } => self.agent_write(id, path, text),
+                agent::Need::Write {
+                    id,
+                    path,
+                    text,
+                    before,
+                } => self.agent_write(id, path, text, before),
                 agent::Need::Terminal(args) => self.agent_login(args),
             }
         }
@@ -1488,7 +1506,13 @@ impl App {
 
     /// the agent's write: into the open buffer as the smallest edit that
     /// gets there, then saved; else straight to disk, atomically.
-    fn agent_write(&mut self, id: serde_json::Value, path: PathBuf, text: String) {
+    fn agent_write(
+        &mut self,
+        id: serde_json::Value,
+        path: PathBuf,
+        text: String,
+        before: Option<String>,
+    ) {
         if text.len() as u64 > document::MAX_FILE {
             if let Some(chat) = &self.chat {
                 chat.respond(&id, Err("the text is past the file size cap".to_owned()));
@@ -1504,11 +1528,13 @@ impl App {
             if let Some(now) = now {
                 // the file before the agent's changes still waiting: the new
                 // marks are against it, so kept ones stay kept
-                let base = self
-                    .docs
-                    .doc_of(view)
-                    .and_then(|d| document::before_agent(&now, &d.agent))
-                    .unwrap_or_else(|| now.clone());
+                // or what the agent says it was, when it changed the disk itself
+                let base = before.clone().unwrap_or_else(|| {
+                    self.docs
+                        .doc_of(view)
+                        .and_then(|d| document::before_agent(&now, &d.agent))
+                        .unwrap_or_else(|| now.clone())
+                });
                 let (range, middle) = smallest_edit(&now, &text);
                 let same = range.is_empty() && middle.is_empty();
                 let doc = self.docs.view(view).map(|v| v.doc);
@@ -1517,7 +1543,14 @@ impl App {
                     .doc_of(view)
                     .is_some_and(document::Document::is_dirty);
                 if same && !dirty {
-                    // already on disk as asked
+                    // already on disk as asked; a change made on disk by the
+                    // agent is still marked to look over
+                    if before.is_some()
+                        && let Some(doc) = doc
+                        && let Some(marks) = self.docs.agent_marks(doc)
+                    {
+                        *marks = document::agent_marks(&base, &text);
+                    }
                     if let Some(chat) = &self.chat {
                         chat.respond(&id, Ok(serde_json::Value::Null));
                     }
@@ -1550,7 +1583,7 @@ impl App {
                     .doc(doc)
                     .is_some_and(|d| d.load == document::Load::Loading);
                 if loading {
-                    self.agent_waiting.push((doc, id, path, text));
+                    self.agent_waiting.push((doc, id, path, text, before));
                     return;
                 }
                 if self
@@ -1558,7 +1591,7 @@ impl App {
                     .doc(doc)
                     .is_some_and(|d| d.load == document::Load::Ready)
                 {
-                    self.agent_write(id, path, text);
+                    self.agent_write(id, path, text, before);
                     return;
                 }
             }
@@ -4850,8 +4883,8 @@ impl App {
                         .into_iter()
                         .partition(|w| w.0 == doc);
                     self.agent_waiting = later;
-                    for (_, id, path, text) in now {
-                        self.agent_write(id, path, text);
+                    for (_, id, path, text, before) in now {
+                        self.agent_write(id, path, text, before);
                     }
                     let waiting: Vec<_> = self
                         .waiting_edits

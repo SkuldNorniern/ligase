@@ -45,8 +45,15 @@ pub struct Config {
 
 /// ready-made servers for the setup card: name, base url, a model to start
 /// with, whether a key is needed.
-pub const PRESETS: [(&str, &str, &str, bool); 6] = [
+pub const PRESETS: [(&str, &str, &str, bool); 7] = [
     ("OpenAI", "https://api.openai.com/v1", "gpt-4.1", true),
+    // gemini without its node cli: google's openai-compatible endpoint
+    (
+        "Gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini-2.5-pro",
+        true,
+    ),
     (
         "OpenRouter",
         "https://openrouter.ai/api/v1",
