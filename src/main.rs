@@ -17,6 +17,7 @@ mod lang;
 mod lsp;
 mod markdown;
 mod palette;
+mod pdf;
 mod preview;
 mod problems;
 mod remote;
