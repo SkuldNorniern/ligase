@@ -61,6 +61,14 @@ pub enum Ask {
     CloseOver,
     /// the agent to this mode.
     Mode(String),
+    /// the agent to this model.
+    Model(String),
+    /// the mode or model list, open or shut.
+    Modes,
+    Models,
+    /// the file open in the editor, and its selected lines, before the
+    /// next message.
+    AddFile,
 }
 
 #[derive(Clone, Debug)]
@@ -71,8 +79,8 @@ enum Row {
     Dim(String),
     /// a file the tool touches, clickable.
     Place(String, PathBuf, Option<u32>),
-    /// a tool's own line: its mark, colour key and title.
-    Tool(char, &'static str, String),
+    /// a tool's own line: its icon, colour key and title.
+    Tool(&'static str, &'static str, String),
     Step(Step, String),
 }
 
@@ -157,12 +165,13 @@ fn lay(ui: &mut Ui<'_, Id>, entry: &Entry, width: f32, root: &std::path::Path) -
             }
         }
         Entry::Tool(t) => {
-            let (mark, tone) = match t.status.as_str() {
-                "completed" => ('✓', "ok"),
-                "failed" => ('✗', "bad"),
-                "in_progress" => ('◐', "busy"),
-                _ => ('○', "dim"),
+            let tone = match t.status.as_str() {
+                "completed" => "ok",
+                "failed" => "bad",
+                "in_progress" => "busy",
+                _ => "dim",
             };
+            let mark = tool_icon(&t.kind);
             let title = if t.title.is_empty() {
                 t.kind.clone()
             } else {
@@ -495,58 +504,63 @@ fn show_inner(
         ask = Some(Ask::Send);
     }
     let buttons = Rect::new(foot.x, field.bottom() + 8.0, foot.width, 28.0);
-    let go = Rect::new(buttons.right() - 76.0, buttons.y, 76.0, 28.0);
-    // the agent's mode left of the button, a click for the next; with no
-    // modes, the keys, quietly
-    let left = Rect::new(buttons.x, buttons.y, go.x - buttons.x - 8.0, 28.0);
-    if chat.modes.is_empty() {
+    // narrow: the send button is its icon alone
+    let go_w = if buttons.width < 300.0 { 34.0 } else { 80.0 };
+    let go = Rect::new(buttons.right() - go_w, buttons.y, go_w, 28.0);
+    let at_file = Rect::new(go.x - 32.0, buttons.y, 28.0, 28.0);
+    if Button::icon_only(crate::icons::image("at"))
+        .quiet()
+        .icon_size(15.0)
+        .show(ui, Id::AgentButton(26), at_file)?
+        .clicked
+    {
+        ask = Some(Ask::AddFile);
+    }
+    // the agent's mode and model left of the buttons, each a list on click;
+    // with neither, the keys, quietly
+    let mut left = Rect::new(buttons.x, buttons.y, at_file.x - buttons.x - 6.0, 28.0);
+    if chat.modes.is_empty() && chat.models.is_empty() {
         let keys = texts.tr("Enter to send · Ctrl+Shift+J adds lines");
         if ui.text_width(keys, &small) <= left.width {
             ui.text(keys, left, &small, palette.faint, Align::Start)?;
         }
-    } else {
-        let name = chat
-            .mode
-            .as_ref()
-            .and_then(|m| chat.modes.iter().find(|(id, _)| id == m))
-            .map_or_else(|| chat.modes[0].1.clone(), |(_, n)| n.clone());
-        let label = format!("◇ {name}");
-        let w = (ui.text_width(&label, &small) + 22.0).min(left.width);
-        let chip = Rect::new(left.x, left.y + 2.0, w, 24.0);
-        let input = ui.interact(Id::AgentButton(23), 0, chip, Sense::Click, true);
-        ui.round(
-            chip,
-            12.0,
-            if input.hovered {
-                palette.hover
-            } else {
-                palette.raised
-            },
-        )?;
-        ui.text_clipped(
-            &label,
-            chip.inset_xy(10.0, 0.0),
-            &small,
-            palette.text,
-            Align::Start,
-        )?;
-        if input.hovered {
-            ui.set_cursor(CursorIcon::Pointer);
-        }
-        if input.clicked
-            && let Some(next) = chat.next_mode()
-        {
-            ask = Some(Ask::Mode(next));
+    }
+    if let Some(mode) = chat.current_mode() {
+        let (icon, name) = (mode_icon(&mode.id), texts.tr(&mode.name).to_owned());
+        let open = matches!(chat.over, super::Over::Modes);
+        let (chip, clicked) = pill(ui, 23, left, icon, &name, open, &small)?;
+        left = Rect::new(
+            chip.right() + 6.0,
+            left.y,
+            (left.right() - chip.right() - 6.0).max(0.0),
+            28.0,
+        );
+        if clicked {
+            ask = Some(Ask::Modes);
         }
     }
+    if let Some(model) = chat.current_model()
+        && left.width >= 30.0
+    {
+        let name = texts.tr(&model.name).to_owned();
+        let open = matches!(chat.over, super::Over::Models);
+        if pill(ui, 24, left, "chip", &name, open, &small)?.1 {
+            ask = Some(Ask::Models);
+        }
+    }
+    let label = |t: &'static str| if go_w < 80.0 { "" } else { texts.tr(t) };
     if chat.state == State::Working {
-        if Button::new(texts.tr("Stop"))
+        if Button::new(label("Stop"))
+            .icon(crate::icons::image("stop"))
+            .icon_size(12.0)
             .show(ui, Id::AgentButton(1), go)?
             .clicked
         {
             ask = Some(Ask::Stop);
         }
-    } else if Button::new(texts.tr("Send"))
+    } else if Button::new(label("Send"))
+        .icon(crate::icons::image("send"))
+        .icon_size(14.0)
         .primary()
         .enabled(!chat.input.trim().is_empty())
         .show(ui, Id::AgentButton(2), go)?
@@ -555,6 +569,90 @@ fn show_inner(
         ask = Some(Ask::Send);
     }
 
+    // the mode or model list sits over the box
+    let talk = match chat.over {
+        super::Over::Modes | super::Over::Models => {
+            let models = matches!(chat.over, super::Over::Models);
+            let (list, now) = if models {
+                (&chat.models, chat.current_model().map(|c| c.id.clone()))
+            } else {
+                (&chat.modes, chat.current_mode().map(|c| c.id.clone()))
+            };
+            let row_h = 44.0;
+            let card_h = 30.0 + list.len() as f32 * row_h + 6.0;
+            let (card, above) = talk.split_bottom(card_h.min(talk.height) + PAD, 0.0);
+            let card = Rect::new(
+                card.x + PAD,
+                card.y,
+                card.width - 2.0 * PAD,
+                card_h.min(card.height),
+            );
+            ui.round(card.inset(-1.0), 9.0, palette.border)?;
+            ui.round(card, 8.0, palette.raised)?;
+            ui.text(
+                texts.tr(if models { "Model" } else { "Mode" }),
+                Rect::new(card.x + 12.0, card.y + 6.0, card.width - 24.0, 20.0),
+                &small,
+                palette.dim,
+                Align::Start,
+            )?;
+            for (i, c) in list.iter().enumerate() {
+                let row = Rect::new(
+                    card.x + 4.0,
+                    card.y + 28.0 + i as f32 * row_h,
+                    card.width - 8.0,
+                    row_h - 2.0,
+                );
+                let n = u16::try_from(i).unwrap_or(u16::MAX);
+                let id = if models {
+                    Id::AgentModel(n)
+                } else {
+                    Id::AgentMode(n)
+                };
+                let input = ui.interact(id, 0, row, Sense::Click, true);
+                let lit = now.as_ref() == Some(&c.id);
+                if input.hovered {
+                    ui.round(row, 6.0, palette.hover)?;
+                    ui.set_cursor(CursorIcon::Pointer);
+                }
+                let icon = if models { "chip" } else { mode_icon(&c.id) };
+                crate::icons::draw(
+                    ui,
+                    icon,
+                    Rect::new(row.x + 8.0, row.y + 6.0, 16.0, 16.0),
+                    if lit { palette.accent } else { palette.dim },
+                )?;
+                let words = Rect::new(row.x + 32.0, row.y + 3.0, row.width - 60.0, 20.0);
+                ui.text_clipped(texts.tr(&c.name), words, &font, palette.text, Align::Start)?;
+                if !c.about.is_empty() {
+                    ui.text_clipped(
+                        texts.tr(&c.about),
+                        Rect::new(words.x, words.y + 19.0, words.width, 18.0),
+                        &small,
+                        palette.dim,
+                        Align::Start,
+                    )?;
+                }
+                if lit {
+                    crate::icons::draw(
+                        ui,
+                        "check",
+                        Rect::new(row.right() - 24.0, row.y + 6.0, 16.0, 16.0),
+                        palette.accent,
+                    )?;
+                }
+                if input.clicked {
+                    ask = Some(if models {
+                        Ask::Model(c.id.clone())
+                    } else {
+                        Ask::Mode(c.id.clone())
+                    });
+                }
+            }
+            above
+        }
+        _ => talk,
+    };
     // a permission the agent waits on sits over the box
     let talk = if let Some(p) = &chat.permission {
         let lines = hover::wrap(ui, &p.title, &font, talk.width - 2.0 * PAD - 20.0);
@@ -697,6 +795,102 @@ fn show_inner(
     Ok(transcript(ui, chat, talk, (&font, &small, &bold, &mono))?.or(ask))
 }
 
+/// the icon for a mode, by what its id says it lets through.
+fn mode_icon(id: &str) -> &'static str {
+    let id = id.to_ascii_lowercase();
+    if id.contains("plan") {
+        "plan"
+    } else if ["bypass", "full", "yolo", "danger"]
+        .iter()
+        .any(|w| id.contains(w))
+    {
+        "bolt"
+    } else if ["accept", "auto", "edit", "write"]
+        .iter()
+        .any(|w| id.contains(w))
+    {
+        "pencil"
+    } else {
+        "shield"
+    }
+}
+
+/// the icon for an acp tool kind.
+fn tool_icon(kind: &str) -> &'static str {
+    match kind {
+        "read" => "eye",
+        "edit" => "pencil",
+        "delete" => "discard",
+        "move" => "open-file",
+        "search" => "search",
+        "execute" => "terminal",
+        "think" => "bulb",
+        "fetch" => "globe",
+        "switch_mode" => "plan",
+        _ => "agent",
+    }
+}
+
+/// a rounded chip at the left of `room`: icon, name and a down arrow; lit
+/// while its list is open. gives where it went and whether it was clicked.
+fn pill(
+    ui: &mut Ui<'_, Id>,
+    n: u16,
+    room: Rect,
+    icon: &str,
+    name: &str,
+    open: bool,
+    small: &Font,
+) -> AureaResult<(Rect, bool)> {
+    let palette = ui.theme.palette;
+    let w = ui.text_width(name, small) + 48.0;
+    // no room for the name: the icon alone
+    let bare = w > room.width;
+    let w = if bare { 30.0 } else { w };
+    let chip = Rect::new(room.x, room.y + 2.0, w, 24.0);
+    let input = ui.interact(Id::AgentButton(n), 0, chip, Sense::Click, true);
+    ui.round(
+        chip,
+        12.0,
+        if input.hovered || open {
+            palette.hover
+        } else {
+            palette.raised
+        },
+    )?;
+    crate::icons::draw(
+        ui,
+        icon,
+        Rect::new(chip.x + 8.0, chip.y + 5.0, 14.0, 14.0),
+        if open { palette.accent } else { palette.dim },
+    )?;
+    if input.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    if bare {
+        return Ok((chip, input.clicked));
+    }
+    ui.text_clipped(
+        name,
+        Rect::new(
+            chip.x + 26.0,
+            chip.y,
+            (chip.width - 44.0).max(0.0),
+            chip.height,
+        ),
+        small,
+        palette.text,
+        Align::Start,
+    )?;
+    crate::icons::draw(
+        ui,
+        "chevron-down",
+        Rect::new(chip.right() - 18.0, chip.y + 6.0, 12.0, 12.0),
+        palette.dim,
+    )?;
+    Ok((chip, input.clicked))
+}
+
 /// the conversation in `talk`: rows laid out where they changed, the ones
 /// in sight drawn, following the end while it is in sight.
 fn transcript(
@@ -806,25 +1000,40 @@ fn transcript(
                             }
                             Row::Tool(mark, tone, title) => {
                                 let c = match *tone {
-                                    "ok" => palette.success,
+                                    "ok" => palette.dim,
                                     "bad" => palette.danger,
                                     "busy" => palette.accent,
                                     _ => palette.faint,
                                 };
-                                ui.text(
-                                    &mark.to_string(),
-                                    Rect::new(x, y, 16.0, rh),
-                                    &font,
-                                    c,
-                                    Align::Center,
-                                )?;
-                                ui.text(
+                                let icon = Rect::new(x, y + (rh - 14.0) / 2.0, 14.0, 14.0);
+                                crate::icons::draw(ui, mark, icon, c)?;
+                                // a failed step says so at its end
+                                let (tail, tail_c) = match *tone {
+                                    "bad" => ("✗", palette.danger),
+                                    "busy" => ("…", palette.accent),
+                                    _ => ("", palette.dim),
+                                };
+                                let tail_w = if tail.is_empty() { 0.0 } else { 18.0 };
+                                ui.text_clipped(
                                     title,
-                                    Rect::new(x + 20.0, y, width - 20.0, rh),
+                                    Rect::new(x + 20.0, y, width - 20.0 - tail_w, rh),
                                     &font,
-                                    palette.text,
+                                    if *tone == "bad" {
+                                        palette.danger
+                                    } else {
+                                        palette.text
+                                    },
                                     Align::Start,
                                 )?;
+                                if !tail.is_empty() {
+                                    ui.text(
+                                        tail,
+                                        Rect::new(x + width - 16.0, y, 16.0, rh),
+                                        &font,
+                                        tail_c,
+                                        Align::Center,
+                                    )?;
+                                }
                             }
                             Row::Step(step, t) => {
                                 let (mark, c) = match step {

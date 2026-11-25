@@ -299,6 +299,35 @@ enum Pending {
     SignIn,
     Prompt,
     Mode,
+    Model,
+}
+
+/// one of the agent's modes or models: its id, name and a line on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    pub name: String,
+    pub about: String,
+}
+
+/// acp's list of modes or models: the ids under `id`, at most 16.
+fn choices(list: &Value, id: &str) -> Vec<Choice> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .take(16)
+        .filter_map(|m| {
+            let id: String = m[id].as_str()?.chars().take(60).collect();
+            let name = m["name"]
+                .as_str()
+                .map_or_else(|| id.clone(), |n| n.chars().take(40).collect());
+            let about = m["description"]
+                .as_str()
+                .map(|d| d.chars().take(120).collect())
+                .unwrap_or_default();
+            Some(Choice { id, name, about })
+        })
+        .collect()
 }
 
 /// a saved conversation, listed in the history.
@@ -325,6 +354,10 @@ pub enum Over {
     Past(String, Vec<Entry>, view::Cache, f32),
     /// agents to switch to: (label, settings word, model profile).
     Agents(Vec<(String, String, Option<String>)>),
+    /// the modes to pick from, over the box.
+    Modes,
+    /// the models to pick from, over the box.
+    Models,
 }
 
 /// the built-in agent's setup card, filled in by the person.
@@ -373,9 +406,12 @@ pub struct Chat {
     queued: Option<Value>,
     /// stop was asked once this turn; asked again, the agent is ended.
     stopping: bool,
-    /// the agent's modes, (id, name), and the one it is in.
-    pub modes: Vec<(String, String)>,
+    /// the agent's modes and the one it is in.
+    pub modes: Vec<Choice>,
     pub mode: Option<String>,
+    /// the models the agent offers and the one in use.
+    pub models: Vec<Choice>,
+    pub model: Option<String>,
     /// history, a past conversation or the agent picker over the talk.
     pub over: Over,
     /// laid out rows per entry, kept while width and text stay.
@@ -407,6 +443,8 @@ impl Chat {
             stopping: false,
             modes: Vec::new(),
             mode: None,
+            models: Vec::new(),
+            model: None,
             over: Over::None,
             laid: view::Cache::default(),
             list_scroll: 0.0,
@@ -632,6 +670,7 @@ impl Chat {
                     self.session = Some(session.to_owned());
                     self.state = State::Ready;
                     self.take_modes(&result["modes"]);
+                    self.take_models(&result["models"]);
                     if let Some(prompt) = self.queued.take()
                         && let Some(pipe) = &mut self.pipe
                     {
@@ -657,7 +696,8 @@ impl Chat {
             }
             (Pending::SignIn, Ok(_)) => self.new_session(),
             (Pending::Mode, Ok(_)) => {}
-            (Pending::Mode, Err(fail)) => self.note(fail.message, true),
+            (Pending::Mode | Pending::Model, Err(fail)) => self.note(fail.message, true),
+            (Pending::Model, Ok(_)) => {}
             (Pending::Prompt, Ok(result)) => {
                 self.state = State::Ready;
                 self.stopping = false;
@@ -913,22 +953,49 @@ impl Chat {
 
     /// acp's `modes`: what the agent offers and where it is.
     fn take_modes(&mut self, modes: &Value) {
-        self.modes = modes["availableModes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(12)
-            .filter_map(|m| {
-                let id: String = m["id"].as_str()?.chars().take(60).collect();
-                let name = m["name"]
-                    .as_str()
-                    .map_or_else(|| id.clone(), |n| n.chars().take(40).collect());
-                Some((id, name))
-            })
-            .collect();
+        self.modes = choices(&modes["availableModes"], "id");
         self.mode = modes["currentModeId"]
             .as_str()
             .map(|m| m.chars().take(60).collect());
+    }
+
+    /// acp's `models`: what the agent can run on and which one it is.
+    fn take_models(&mut self, models: &Value) {
+        self.models = choices(&models["availableModels"], "modelId");
+        self.model = models["currentModelId"]
+            .as_str()
+            .map(|m| m.chars().take(60).collect());
+    }
+
+    /// the mode it is in, or the first.
+    pub fn current_mode(&self) -> Option<&Choice> {
+        let at = self.mode.as_ref();
+        self.modes
+            .iter()
+            .find(|c| Some(&c.id) == at)
+            .or(self.modes.first())
+    }
+
+    /// the model in use, or the first.
+    pub fn current_model(&self) -> Option<&Choice> {
+        let at = self.model.as_ref();
+        self.models
+            .iter()
+            .find(|c| Some(&c.id) == at)
+            .or(self.models.first())
+    }
+
+    /// moves the agent to model `id`; shown at once, the agent says if not.
+    pub fn set_model(&mut self, id: &str) {
+        let (Some(pipe), Some(session)) = (&mut self.pipe, &self.session) else {
+            return;
+        };
+        let rid = pipe.request(
+            "session/set_model",
+            json!({"sessionId": session, "modelId": id}),
+        );
+        self.pending.push((rid, Pending::Model));
+        self.model = Some(id.to_owned());
     }
 
     /// moves the agent to mode `id`; shown at once, the agent says if not.
@@ -942,18 +1009,6 @@ impl Chat {
         );
         self.pending.push((rid, Pending::Mode));
         self.mode = Some(id.to_owned());
-    }
-
-    /// the mode after the one it is in, round; for one click.
-    pub fn next_mode(&self) -> Option<String> {
-        let at = self
-            .mode
-            .as_ref()
-            .and_then(|m| self.modes.iter().position(|(id, _)| id == m))
-            .map_or(0, |i| i + 1);
-        self.modes
-            .get(at % self.modes.len().max(1))
-            .map(|(id, _)| id.clone())
     }
 
     /// the conversation as a plain record to keep: none when nothing was
@@ -1341,6 +1396,26 @@ mod tests {
         assert_eq!(lines_of(text, Some(2), Some(2)), "b\nc\n");
         assert_eq!(lines_of(text, Some(4), None), "d");
         assert_eq!(lines_of(text, Some(9), None), "");
+    }
+
+    #[test]
+    fn modes_and_models_come_with_the_session() {
+        let mut c = chat();
+        c.take_modes(&json!({"currentModeId": "plan", "availableModes": [
+            {"id": "default", "name": "Ask first", "description": "asks"},
+            {"id": "plan", "name": "Plan only"},
+            {"name": "no id"}
+        ]}));
+        c.take_models(&json!({"currentModelId": "gone", "availableModels": [
+            {"modelId": "opus", "name": "Opus", "description": "big"},
+            {"modelId": "haiku"}
+        ]}));
+        assert_eq!(c.modes.len(), 2);
+        assert_eq!(c.current_mode().map(|m| m.name.as_str()), Some("Plan only"));
+        assert_eq!(c.modes[0].about, "asks");
+        // a current model not listed falls back to the first
+        assert_eq!(c.current_model().map(|m| m.id.as_str()), Some("opus"));
+        assert_eq!(c.models[1].name, "haiku");
     }
 
     #[test]

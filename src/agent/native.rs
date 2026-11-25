@@ -203,17 +203,25 @@ struct Link {
 }
 
 /// the built-in agent's modes: id, name, what it lets through.
-const MODES: [(&str, &str); 4] = [
-    ("ask", "Ask first"),
-    ("auto", "Auto edits"),
-    ("full", "Full auto"),
-    ("plan", "Plan only"),
+const MODES: [(&str, &str, &str); 4] = [
+    ("ask", "Ask first", "Asks before each edit or command"),
+    (
+        "auto",
+        "Auto edits",
+        "Edits files on its own, asks before commands",
+    ),
+    (
+        "full",
+        "Full auto",
+        "Edits and runs anything without asking",
+    ),
+    ("plan", "Plan only", "Reads and plans, changes nothing"),
 ];
 
 fn modes_json(current: &str) -> Value {
     json!({
         "currentModeId": current,
-        "availableModes": MODES.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+        "availableModes": MODES.iter().map(|(id, name, about)| json!({"id": id, "name": name, "description": about})).collect::<Vec<_>>(),
     })
 }
 
@@ -307,8 +315,8 @@ pub fn serve(
                     }
                     "session/set_mode" => {
                         let asked = message["params"]["modeId"].as_str().unwrap_or("");
-                        match MODES.iter().find(|(id, _)| *id == asked) {
-                            Some((id, _)) => {
+                        match MODES.iter().find(|(id, ..)| *id == asked) {
+                            Some((id, ..)) => {
                                 if let Ok(mut m) = link.mode.lock() {
                                     *m = id;
                                 }

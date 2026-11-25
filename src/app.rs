@@ -68,6 +68,10 @@ pub enum Id {
     ScmRepo(u16),
     /// the agent panel's buttons, by number.
     AgentButton(u16),
+    /// a row in the agent's mode list.
+    AgentMode(u16),
+    /// a row in the agent's model list.
+    AgentModel(u16),
     /// a file put before the agent message, by place.
     AgentRef(u16),
     /// a file link in the agent's conversation.
@@ -2037,7 +2041,29 @@ impl App {
             Ask::Mode(id) => {
                 if let Some(chat) = &mut self.chat {
                     chat.set_mode(&id);
+                    chat.over = agent::Over::None;
                 }
+            }
+            Ask::Model(id) => {
+                if let Some(chat) = &mut self.chat {
+                    chat.set_model(&id);
+                    chat.over = agent::Over::None;
+                }
+            }
+            Ask::Modes | Ask::Models => {
+                if let Some(chat) = &mut self.chat {
+                    let models = ask == Ask::Models;
+                    chat.over = match (&chat.over, models) {
+                        (agent::Over::Modes, false) | (agent::Over::Models, true) => {
+                            agent::Over::None
+                        }
+                        (_, false) => agent::Over::Modes,
+                        (_, true) => agent::Over::Models,
+                    };
+                }
+            }
+            Ask::AddFile => {
+                self.ask_agent(self.last_editor);
             }
             Ask::Unref(i) => {
                 if let Some(chat) = &mut self.chat

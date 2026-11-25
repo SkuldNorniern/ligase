@@ -32,12 +32,32 @@ const MAX_SHOWN: usize = 4000;
 /// biggest file read to remember before an edit.
 const MAX_BEFORE: u64 = 4 * 1024 * 1024;
 
-/// claude's permission modes: id, name.
-const MODES: [(&str, &str); 4] = [
-    ("default", "Ask first"),
-    ("acceptEdits", "Auto edits"),
-    ("bypassPermissions", "Full auto"),
-    ("plan", "Plan only"),
+/// claude's permission modes: id, name, what it lets through.
+const MODES: [(&str, &str, &str); 4] = [
+    ("default", "Ask first", "Asks before each edit or command"),
+    (
+        "acceptEdits",
+        "Auto edits",
+        "Edits files on its own, asks before commands",
+    ),
+    (
+        "bypassPermissions",
+        "Full auto",
+        "Edits and runs anything without asking",
+    ),
+    ("plan", "Plan only", "Reads and plans, changes nothing"),
+];
+
+/// claude's model aliases: id, name, a line on it.
+const MODELS: [(&str, &str, &str); 4] = [
+    (
+        "default",
+        "Default",
+        "The one Claude Code picks for the account",
+    ),
+    ("opus", "Opus", "Most capable, for hard work"),
+    ("sonnet", "Sonnet", "Fast and capable, for everyday work"),
+    ("haiku", "Haiku", "Fastest, for quick small things"),
 ];
 
 /// tools that change files, and the input key naming the file.
@@ -130,7 +150,14 @@ impl Link {
 fn modes_json(current: &str) -> Value {
     json!({
         "currentModeId": current,
-        "availableModes": MODES.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+        "availableModes": MODES.iter().map(|(id, name, about)| json!({"id": id, "name": name, "description": about})).collect::<Vec<_>>(),
+    })
+}
+
+fn models_json(current: &str) -> Value {
+    json!({
+        "currentModelId": current,
+        "availableModels": MODELS.iter().map(|(id, name, about)| json!({"modelId": id, "name": name, "description": about})).collect::<Vec<_>>(),
     })
 }
 
@@ -187,13 +214,13 @@ pub fn serve(
                             }
                         }
                         reply(Ok(
-                            json!({"sessionId": SESSION, "modes": modes_json("default")}),
+                            json!({"sessionId": SESSION, "modes": modes_json("default"), "models": models_json("default")}),
                         ));
                     }
                     "session/set_mode" => {
                         let asked = message["params"]["modeId"].as_str().unwrap_or("");
-                        match MODES.iter().find(|(m, _)| *m == asked) {
-                            Some((m, _))
+                        match MODES.iter().find(|(m, ..)| *m == asked) {
+                            Some((m, ..))
                                 if link.control(
                                     json!({"subtype": "set_permission_mode", "mode": m}),
                                 ) =>
@@ -204,6 +231,20 @@ pub fn serve(
                             _ => reply(Err(Fail {
                                 code: -32602,
                                 message: format!("no mode {asked}"),
+                            })),
+                        }
+                    }
+                    "session/set_model" => {
+                        let asked = message["params"]["modelId"].as_str().unwrap_or("");
+                        match MODELS.iter().find(|(m, ..)| *m == asked) {
+                            Some((m, ..))
+                                if link.control(json!({"subtype": "set_model", "model": m})) =>
+                            {
+                                reply(Ok(json!({})));
+                            }
+                            _ => reply(Err(Fail {
+                                code: -32602,
+                                message: format!("no model {asked}"),
                             })),
                         }
                     }
