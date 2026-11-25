@@ -13,7 +13,7 @@ use aurea::ui::{Component, IconMark, Ui};
 use crate::app::Id;
 
 /// every icon by name, its svg text built in.
-const ICONS: [(&str, &str); 67] = [
+const ICONS: [(&str, &str); 68] = [
     // ui: actions, panes and tree folders, drawn in currentColor or their own fill.
     ("agent", include_str!("../../assets/icons/ui/agent.svg")),
     ("branch", include_str!("../../assets/icons/ui/branch.svg")),
@@ -33,6 +33,10 @@ const ICONS: [(&str, &str); 67] = [
         include_str!("../../assets/icons/ui/extensions.svg"),
     ),
     ("files", include_str!("../../assets/icons/ui/files.svg")),
+    (
+        "fit-width",
+        include_str!("../../assets/icons/ui/fit-width.svg"),
+    ),
     ("folder", include_str!("../../assets/icons/ui/folder.svg")),
     (
         "folder-open",

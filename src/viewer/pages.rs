@@ -176,51 +176,69 @@ pub fn show(
 
     // the foot: where, how big, and the zooms a click away
     ui.fill(Rect::new(foot.x, foot.y, foot.width, 1.0), palette.border)?;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let info = format!(
-        "PDF · {} {} / {} · {}%",
-        texts.tr("page"),
-        current + 1,
-        sizes.len(),
-        (zoom * 100.0).round() as u32
-    );
-    let buttons = Rect::new(foot.right() - 196.0, foot.y + 4.0, 192.0, FOOT - 8.0);
-    ui.text_clipped(
-        &info,
-        Rect::new(
-            foot.x + 12.0,
-            foot.y,
-            (buttons.x - foot.x - 16.0).max(0.0),
-            FOOT,
-        ),
-        &small,
-        palette.dim,
-        Align::Start,
-    )?;
-    let (plus, rest) = buttons.split_right(32.0, 4.0);
-    let (minus, rest) = rest.split_right(32.0, 4.0);
-    let (_, width) = rest.split_right(112.0, 4.0);
-    if Button::new(texts.tr("Fit width"))
+    // right to left: +, −, fit; the words take what is left, the short
+    // form when the long one does not fit
+    let row = |x: f32, w: f32| Rect::new(x, foot.y + 4.0, w, FOOT - 8.0);
+    let plus = row(foot.right() - 8.0 - 30.0, 30.0);
+    let minus = row(plus.x - 2.0 - 30.0, 30.0);
+    let fit_label = texts.tr("Fit width");
+    let fit_w = ui.text_width(fit_label, &small) + 44.0;
+    let wide = foot.width > fit_w + 260.0;
+    let fit = if wide {
+        row(minus.x - 6.0 - fit_w, fit_w)
+    } else {
+        row(minus.x - 2.0 - 30.0, 30.0)
+    };
+    let fit_button = if wide {
+        Button::new(fit_label).icon(crate::icons::image("fit-width"))
+    } else {
+        Button::icon_only(crate::icons::image("fit-width"))
+    };
+    if fit_button
         .quiet()
+        .icon_size(14.0)
         .selected(pages.zoom.is_none())
-        .show(ui, Id::PictureTool(n * 4), width)?
+        .show(ui, Id::PictureTool(n * 4), fit)?
         .clicked
     {
         pages.zoom = None;
     }
-    if Button::new("−")
+    if Button::icon_only(crate::icons::image("minus"))
         .quiet()
+        .icon_size(14.0)
         .show(ui, Id::PictureTool(n * 4 + 1), minus)?
         .clicked
     {
         pages.zoom = Some((zoom / 1.2).clamp(MIN_ZOOM, MAX_ZOOM));
     }
-    if Button::new("+")
+    if Button::icon_only(crate::icons::image("plus"))
         .quiet()
+        .icon_size(14.0)
         .show(ui, Id::PictureTool(n * 4 + 2), plus)?
         .clicked
     {
         pages.zoom = Some((zoom * 1.2).clamp(MIN_ZOOM, MAX_ZOOM));
     }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let percent = (zoom * 100.0).round() as u32;
+    let words = Rect::new(
+        foot.x + 12.0,
+        foot.y,
+        (fit.x - foot.x - 20.0).max(0.0),
+        FOOT,
+    );
+    let long = format!(
+        "PDF · {} {} / {} · {percent}%",
+        texts.tr("page"),
+        current + 1,
+        sizes.len(),
+    );
+    let short = format!("{} / {} · {percent}%", current + 1, sizes.len());
+    let info = if ui.text_width(&long, &small) <= words.width {
+        long
+    } else {
+        short
+    };
+    ui.text_clipped(&info, words, &small, palette.dim, Align::Start)?;
     Ok(())
 }
