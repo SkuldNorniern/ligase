@@ -13,7 +13,7 @@ use aurea::ui::{Component, IconMark, Ui};
 use crate::app::Id;
 
 /// every icon by name, its svg text built in.
-const ICONS: [(&str, &str); 55] = [
+const ICONS: [(&str, &str); 67] = [
     // ui: actions, panes and tree folders, drawn in currentColor or their own fill.
     ("agent", include_str!("../../assets/icons/ui/agent.svg")),
     ("branch", include_str!("../../assets/icons/ui/branch.svg")),
@@ -59,6 +59,21 @@ const ICONS: [(&str, &str); 55] = [
     (
         "source-control",
         include_str!("../../assets/icons/ui/source-control.svg"),
+    ),
+    ("at", include_str!("../../assets/icons/ui/at.svg")),
+    ("bolt", include_str!("../../assets/icons/ui/bolt.svg")),
+    ("bulb", include_str!("../../assets/icons/ui/bulb.svg")),
+    ("chip", include_str!("../../assets/icons/ui/chip.svg")),
+    ("eye", include_str!("../../assets/icons/ui/eye.svg")),
+    ("globe", include_str!("../../assets/icons/ui/globe.svg")),
+    ("pencil", include_str!("../../assets/icons/ui/pencil.svg")),
+    ("plan", include_str!("../../assets/icons/ui/plan.svg")),
+    ("send", include_str!("../../assets/icons/ui/send.svg")),
+    ("shield", include_str!("../../assets/icons/ui/shield.svg")),
+    ("stop", include_str!("../../assets/icons/ui/stop.svg")),
+    (
+        "terminal",
+        include_str!("../../assets/icons/ui/terminal.svg"),
     ),
     // lang: language and file-type icons, each with its own colours.
     ("c", include_str!("../../assets/icons/lang/c.svg")),
