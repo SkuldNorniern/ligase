@@ -35,6 +35,8 @@ pub struct Session {
     broken: bool,
     /// the tail of what ssh said on stderr, to tell why a link failed.
     said: std::sync::Arc<std::sync::Mutex<String>>,
+    /// the thread filling `said`; done once ssh is gone and its stderr read.
+    heard: Option<thread::JoinHandle<()>>,
 }
 
 /// env var that makes ligase answer ssh's password prompt and exit.
@@ -141,9 +143,10 @@ impl Session {
         };
         // ssh's own words, the last 2 KiB of them
         let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut heard = None;
         if let Some(mut stderr) = child.stderr.take() {
             let tail = std::sync::Arc::clone(&said);
-            let _ = thread::Builder::new()
+            heard = thread::Builder::new()
                 .name("remote-stderr".into())
                 .spawn(move || {
                     let mut chunk = [0u8; 1024];
@@ -162,7 +165,8 @@ impl Session {
                             }
                         }
                     }
-                });
+                })
+                .ok();
         }
         let (tx, lines) = mpsc::sync_channel(QUEUE);
         let reader = thread::Builder::new()
@@ -180,6 +184,7 @@ impl Session {
             counter: 0,
             broken: false,
             said,
+            heard,
         })
     }
 
@@ -207,11 +212,6 @@ impl Session {
                     return Err(self.fail(&why));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    // ssh may still be writing why; a moment for its last line
-                    let until = Instant::now() + Duration::from_millis(300);
-                    while Instant::now() < until && matches!(self.child.try_wait(), Ok(None)) {
-                        thread::sleep(Duration::from_millis(20));
-                    }
                     let why = self.why("the link closed");
                     return Err(self.fail(&why));
                 }
@@ -432,20 +432,44 @@ impl Session {
         };
         let (done, written) = std::sync::mpsc::channel();
         if stdin.send((text.as_bytes().to_vec(), done)).is_err() {
-            return Err(self.fail(LINK_DOWN));
+            let why = self.why(LINK_DOWN);
+            return Err(self.fail(&why));
         }
         // half a minute, and a second more per 64 KiB: a big save on a slow
         // link gets its time, a stalled one is given up on
         let limit = Duration::from_secs(30 + (text.len() / (64 * 1024)) as u64);
         match written.recv_timeout(limit) {
             Ok(true) => Ok(()),
-            Ok(false) | Err(RecvTimeoutError::Disconnected) => Err(self.fail(LINK_DOWN)),
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => {
+                let why = self.why(LINK_DOWN);
+                Err(self.fail(&why))
+            }
             Err(RecvTimeoutError::Timeout) => Err(self.fail("timed out sending")),
         }
     }
 
     /// ssh's last line on stderr when it said something, else `fallback`.
-    fn why(&self, fallback: &str) -> String {
+    /// a gone ssh may still have words in the pipe: its reader is given a
+    /// moment to finish them first.
+    fn why(&mut self, fallback: &str) -> String {
+        // up to 200 ms for ssh to go, then up to 500 ms in all for its
+        // stderr to be read to the end; a live ssh is not waited on
+        let start = Instant::now();
+        loop {
+            let read = self
+                .heard
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished);
+            let alive = matches!(self.child.try_wait(), Ok(None));
+            let waited = start.elapsed();
+            if read
+                || waited >= Duration::from_millis(500)
+                || (alive && waited >= Duration::from_millis(200))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let said = self.said.lock().map(|s| s.clone()).unwrap_or_default();
         said.lines()
             .map(str::trim)
