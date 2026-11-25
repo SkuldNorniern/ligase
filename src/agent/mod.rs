@@ -1011,6 +1011,18 @@ impl Chat {
         self.mode = Some(id.to_owned());
     }
 
+    /// the mode after the one it is in, round; for shift+tab.
+    pub fn next_mode(&self) -> Option<String> {
+        let at = self
+            .mode
+            .as_ref()
+            .and_then(|m| self.modes.iter().position(|c| &c.id == m))
+            .map_or(0, |i| i + 1);
+        self.modes
+            .get(at % self.modes.len().max(1))
+            .map(|c| c.id.clone())
+    }
+
     /// the conversation as a plain record to keep: none when nothing was
     /// said. text only; tool steps by their title.
     pub fn record(&self) -> Option<Value> {
@@ -1413,6 +1425,8 @@ mod tests {
         assert_eq!(c.modes.len(), 2);
         assert_eq!(c.current_mode().map(|m| m.name.as_str()), Some("Plan only"));
         assert_eq!(c.modes[0].about, "asks");
+        // the last mode wraps round to the first
+        assert_eq!(c.next_mode().as_deref(), Some("default"));
         // a current model not listed falls back to the first
         assert_eq!(c.current_model().map(|m| m.id.as_str()), Some("opus"));
         assert_eq!(c.models[1].name, "haiku");

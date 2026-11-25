@@ -501,12 +501,22 @@ fn show_inner(
         State::Working => texts.tr("Working… Stop to break in"),
         _ => asking.as_str(),
     };
+    // shift+tab in the box moves to the next mode, as claude code has it
     let typed = TextArea::new(&mut chat.input)
         .placeholder(hint)
         .max_chars(20_000)
+        .keeps_tab(!chat.modes.is_empty())
         .show(ui, Id::AgentInput, field)?;
     if typed.submitted && chat.state != State::Working {
         ask = Some(Ask::Send);
+    }
+    if typed.focused
+        && ui
+            .keys()
+            .any(|(key, mods)| key == aurea::KeyCode::Tab && mods.shift)
+        && let Some(next) = chat.next_mode()
+    {
+        ask = Some(Ask::Mode(next));
     }
     let buttons = Rect::new(foot.x, field.bottom() + 8.0, foot.width, 28.0);
     // narrow: the send button is its icon alone
@@ -535,7 +545,8 @@ fn show_inner(
     {
         let (icon, name) = (mode_icon(&mode.id), texts.tr(&mode.name).to_owned());
         let open = matches!(chat.over, super::Over::Modes);
-        let (chip, clicked) = pill(ui, 23, left, icon, &name, open, &small)?;
+        let tip = texts.tr("Mode · Shift+Tab for the next");
+        let (chip, clicked) = pill(ui, 23, left, (icon, &name, tip), open, &small)?;
         left = Rect::new(
             chip.right() + 6.0,
             left.y,
@@ -551,7 +562,16 @@ fn show_inner(
     {
         let name = texts.tr(&model.name).to_owned();
         let open = matches!(chat.over, super::Over::Models);
-        if pill(ui, 24, left, "chip", &name, open, &small)?.1 {
+        if pill(
+            ui,
+            24,
+            left,
+            ("chip", &name, texts.tr("Model")),
+            open,
+            &small,
+        )?
+        .1
+        {
             ask = Some(Ask::Models);
         }
     }
@@ -841,14 +861,13 @@ fn tool_icon(kind: &str) -> &'static str {
     }
 }
 
-/// a rounded chip at the left of `room`: icon, name and a down arrow; lit
-/// while its list is open. gives where it went and whether it was clicked.
+/// a rounded chip at the left of `room`: icon, name and a down arrow, the
+/// tip on hover; lit while its list is open. gives where it went and whether it was clicked.
 fn pill(
     ui: &mut Ui<'_, Id>,
     n: u16,
     room: Rect,
-    icon: &str,
-    name: &str,
+    (icon, name, tip): (&str, &str, &str),
     open: bool,
     small: &Font,
 ) -> AureaResult<(Rect, bool)> {
@@ -876,6 +895,12 @@ fn pill(
     )?;
     if input.hovered {
         ui.set_cursor(CursorIcon::Pointer);
+        let hover = aurea::ui::Response {
+            rect: chip,
+            hovered: true,
+            ..aurea::ui::Response::default()
+        };
+        ui.tooltip(&hover, tip);
     }
     if bare {
         return Ok((chip, input.clicked));
