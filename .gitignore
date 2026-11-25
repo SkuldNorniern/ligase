@@ -26,5 +26,3 @@ rustc-ice-*.txt
 # kago setup output
 dist
 
-# pdfium fetched for packaging
-third_party

@@ -1,5 +1,5 @@
 //! a pdf in a tab: its pages one under another, fit to the width at first.
-//! pages are drawn by pdfium on a worker at the zoom in use and kept for a
+//! pages are drawn by hayro on a worker at the zoom in use and kept for a
 //! while; one still coming shows as a blank sheet.
 
 use std::collections::{HashMap, HashSet};

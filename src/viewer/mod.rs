@@ -123,7 +123,7 @@ impl Picture {
 }
 
 /// reads and decodes `path`. worker only.
-pub fn load(path: &Path, pdf: &crate::pdf::Slot) -> (u64, Result<Look, String>) {
+pub fn load(path: &Path) -> (u64, Result<Look, String>) {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -150,7 +150,7 @@ pub fn load(path: &Path, pdf: &crate::pdf::Slot) -> (u64, Result<Look, String>) 
             .map_err(|_| "not UTF-8 text".to_owned())
             .and_then(|t| VectorImage::parse(t).map_err(|e| format!("{e:?}")))
             .map(Look::Vector),
-        "pdf" => crate::pdf::open(pdf, std::sync::Arc::from(bytes))
+        "pdf" => crate::pdf::open(std::sync::Arc::from(bytes))
             .map(|book| Look::Pdf(pages::Pages::new(book))),
         _ => Err("this kind of picture can't be shown yet".to_owned()),
     };
@@ -412,11 +412,11 @@ mod tests {
         ] {
             let p = dir.join(name);
             std::fs::write(&p, bytes).unwrap();
-            assert!(load(&p, &crate::pdf::Slot::default()).1.is_err(), "{name}");
+            assert!(load(&p).1.is_err(), "{name}");
         }
         let svg = dir.join("ok.svg");
         std::fs::write(&svg, r#"<svg viewBox="0 0 10 20" xmlns="http://www.w3.org/2000/svg"><rect width="10" height="20"/></svg>"#).unwrap();
-        match load(&svg, &crate::pdf::Slot::default()).1 {
+        match load(&svg).1 {
             Ok(Look::Vector(v)) => assert!((v.view_box.height - 20.0).abs() < f32::EPSILON),
             _ => panic!("svg not read"),
         }

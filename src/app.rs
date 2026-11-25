@@ -773,8 +773,6 @@ pub struct App {
     /// picture tabs by number, and the last number given.
     pictures: HashMap<u32, viewer::Picture>,
     next_picture: u32,
-    /// pdfium, loaded on a worker when the first pdf opens.
-    pdf: crate::pdf::Slot,
     diff_shown: HashMap<DocumentId, crate::git::diff::Shown>,
     /// stats the open files now and then, so outside edits show without a
     /// trip away from the window.
@@ -898,7 +896,6 @@ impl App {
             diffs: HashMap::new(),
             pictures: HashMap::new(),
             next_picture: 0,
-            pdf: crate::pdf::Slot::default(),
             diff_shown: HashMap::new(),
             watcher: document::watch::Watcher::default(),
             status_at: Instant::now(),
@@ -4403,9 +4400,8 @@ impl App {
             self.pictures
                 .insert(n, viewer::Picture::new(path.to_path_buf()));
             let at = path.to_path_buf();
-            let pdf = std::sync::Arc::clone(&self.pdf);
             self.jobs.run(move || {
-                let (bytes, look) = viewer::load(&at, &pdf);
+                let (bytes, look) = viewer::load(&at);
                 Done::Picture(n, bytes, look)
             });
             n
@@ -5391,9 +5387,8 @@ impl App {
                 self.next_picture = next;
                 for (n, path) in pictures {
                     self.pictures.insert(n, viewer::Picture::new(path.clone()));
-                    let pdf = std::sync::Arc::clone(&self.pdf);
                     self.jobs.run(move || {
-                        let (bytes, look) = viewer::load(&path, &pdf);
+                        let (bytes, look) = viewer::load(&path);
                         Done::Picture(n, bytes, look)
                     });
                 }
