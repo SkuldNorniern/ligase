@@ -1327,8 +1327,34 @@ pub fn show(
             return Ok(shown);
         }
         Load::Failed(why) => {
-            let line = format!("{}: {why}", texts.tr("Open failed"));
-            ui.text(&line, rect, &font, palette.danger, Align::Center)?;
+            // a quiet card in the middle: what kind of trouble, then why
+            let binary = why == "not UTF-8 text";
+            let (title, detail) = if binary {
+                (
+                    texts.tr("Not a text file"),
+                    texts.tr("It isn't UTF-8 text, so it can't be edited here."),
+                )
+            } else {
+                (texts.tr("Open failed"), why.as_str())
+            };
+            let title_font = ui
+                .theme
+                .font(15.0)
+                .with_weight(aurea::render::FontWeight::Bold);
+            let body = ui.theme.font(13.0);
+            let mid = rect.y + rect.height / 2.0;
+            let icon = Rect::new(rect.x + rect.width / 2.0 - 16.0, mid - 64.0, 32.0, 32.0);
+            crate::icons::draw(ui, "file", icon, palette.faint)?;
+            let line = |y: f32| Rect::new(rect.x + 16.0, y, (rect.width - 32.0).max(0.0), 22.0);
+            ui.text_clipped(
+                title,
+                line(mid - 22.0),
+                &title_font,
+                palette.text,
+                Align::Center,
+            )?;
+            let tone = if binary { palette.dim } else { palette.danger };
+            ui.text_clipped(detail, line(mid + 4.0), &body, tone, Align::Center)?;
             return Ok(shown);
         }
         Load::Ready => {}
