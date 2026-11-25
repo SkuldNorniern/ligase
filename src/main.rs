@@ -193,13 +193,18 @@ fn run() -> AureaResult<()> {
             let _ = window.set_icon_set(set);
         }
         let Ok(mut a) = input.try_borrow_mut() else {
-            // an event sent from inside a frame; the frame redraws anyway
+            // an event sent from inside a frame; a new size still wants the
+            // frame after, the one going is laid out at the old size
+            if matches!(event, WindowEvent::Resized { .. }) {
+                request_canvas_redraw(id);
+            }
             return;
         };
         if matches!(event, WindowEvent::OpenRequested) {
             a.open_requested(aurea::app::take_opened());
         }
-        let redraw = a.event(event);
+        // a new size always wants a whole frame, or the new part stays blank
+        let redraw = a.event(event) | matches!(event, WindowEvent::Resized { .. });
         let close = std::mem::take(&mut a.close_now);
         drop(a);
         if close && let Some(window) = weak.upgrade() {
