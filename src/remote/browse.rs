@@ -491,8 +491,13 @@ pub fn show(
             let x = row.rect.x + 8.0 + f32::from(node.depth) * INDENT;
             let arrow = Rect::new(x, row.rect.y, 12.0, ROW);
             if node.dir {
-                let glyph = if node.open { "▾" } else { "▸" };
-                ui.text(glyph, arrow, &small, palette.dim, Align::Center)?;
+                let mark = if node.open {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                };
+                let at = Rect::new(arrow.x, arrow.y + (ROW - 12.0) / 2.0, 12.0, 12.0);
+                icons::draw(ui, mark, at, palette.dim)?;
             }
             let icon_box = Rect::new(x + 14.0, row.rect.y + (ROW - 16.0) / 2.0, 16.0, 16.0);
             let icon = icons::for_path(std::path::Path::new(&node.name), node.dir, node.open);

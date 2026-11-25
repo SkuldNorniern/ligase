@@ -452,10 +452,15 @@ fn sync_row(
             "Push",
             Ask::Push,
         ),
-        (Id::ScmFetch, "⟳".to_owned(), true, "Fetch", Ask::Fetch),
+        // no words: the refresh icon
+        (Id::ScmFetch, String::new(), true, "Fetch", Ask::Fetch),
     ];
     for (id, label, on, tip, want) in specs {
-        let w = ui.text_width(&label, &small) + 14.0;
+        let w = if label.is_empty() {
+            26.0
+        } else {
+            ui.text_width(&label, &small) + 14.0
+        };
         if x + w > rect.right() {
             break;
         }
@@ -472,7 +477,17 @@ fn sync_row(
             ui.tooltip(&tip_at, texts.tr(tip));
         }
         let ink = if on { lit } else { quiet };
-        ui.text_clipped(&label, at, &small, ink, Align::Center)?;
+        if label.is_empty() {
+            let icon = Rect::new(
+                at.x + (w - 14.0) / 2.0,
+                at.y + (at.height - 14.0) / 2.0,
+                14.0,
+                14.0,
+            );
+            crate::icons::draw(ui, "refresh", icon, ink)?;
+        } else {
+            ui.text_clipped(&label, at, &small, ink, Align::Center)?;
+        }
         if hit.clicked {
             ask = Some(want);
         }

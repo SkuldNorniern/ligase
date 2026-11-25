@@ -7714,13 +7714,16 @@ fn status_bar(
     // linked, lit; a click opens the remote panel or its picker
     let small = ui.theme.font(11.5);
     let (label, lit) = match remote {
-        Some((host, up)) => (
-            format!("⇄ {}", host.chars().take(30).collect::<String>()),
-            up,
-        ),
-        None => ("⇄".to_owned(), false),
+        Some((host, up)) => (host.chars().take(30).collect::<String>(), up),
+        None => (String::new(), false),
     };
-    let w = ui.text_width(&label, &small) + 18.0;
+    // the remote icon, then the host when there is one
+    let text_w = if label.is_empty() {
+        0.0
+    } else {
+        ui.text_width(&label, &small) + 6.0
+    };
+    let w = 14.0 + text_w + 20.0;
     let at = Rect::new(x, rect.y, w, rect.height);
     let input = ui.interact(Id::Status, 90, at, Sense::Click, true);
     let fill = if lit {
@@ -7732,7 +7735,12 @@ fn status_bar(
     };
     ui.fill(at, fill)?;
     let ink = if lit { palette.on_accent } else { palette.dim };
-    ui.text(&label, at, &small, ink, Align::Center)?;
+    let icon = Rect::new(at.x + 10.0, at.y + (at.height - 14.0) / 2.0, 14.0, 14.0);
+    crate::icons::draw(ui, "remote", icon, ink)?;
+    if !label.is_empty() {
+        let words = Rect::new(icon.right() + 6.0, at.y, text_w, at.height);
+        ui.text(&label, words, &small, ink, Align::Start)?;
+    }
     if input.hovered {
         ui.set_cursor(CursorIcon::Pointer);
     }
