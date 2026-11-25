@@ -292,35 +292,96 @@ fn show_inner(
         Rect::new(head.x, head.bottom() - 1.0, head.width, 1.0),
         palette.border,
     )?;
-    let icon = Rect::new(head.x + PAD, head.y + (HEAD - 16.0) / 2.0, 16.0, 16.0);
-    crate::icons::draw(ui, "agent", icon, palette.accent)?;
-    // the name, its first word when narrow, none when narrower still
-    let gear_w = if chat.agent == super::Agent::OpenAi {
-        30.0
+    // right to left: new, history, the model setup; then the agent switch
+    // takes what is left, its name first to go, then the state
+    let new_w = if head.width < 320.0 { 28.0 } else { 64.0 };
+    let new = Rect::new(
+        head.right() - PAD + 4.0 - new_w,
+        head.y + 6.0,
+        new_w,
+        HEAD - 12.0,
+    );
+    let new_button = if new_w < 64.0 {
+        Button::icon_only(crate::icons::image("plus"))
     } else {
-        0.0
+        Button::new(texts.tr("New")).icon(crate::icons::image("plus"))
     };
-    // narrow panels get a "+" in place of "New"
-    let new_w = if head.width < 320.0 { 30.0 } else { 56.0 };
-    let room = head.right() - PAD - new_w - gear_w - 30.0 - 8.0 - (icon.right() + 8.0) - 14.0;
+    if new_button
+        .quiet()
+        .icon_size(14.0)
+        .show(ui, Id::AgentButton(0), new)?
+        .clicked
+    {
+        ask = Some(Ask::New);
+    }
+    let mut right = new.x - 2.0;
+    let history = matches!(chat.over, super::Over::History(_) | super::Over::Past(..));
+    if head.width >= 150.0 {
+        let clock = Rect::new(right - 28.0, head.y + 6.0, 28.0, HEAD - 12.0);
+        if Button::icon_only(crate::icons::image("history"))
+            .quiet()
+            .selected(history)
+            .icon_size(16.0)
+            .show(ui, Id::AgentButton(21), clock)?
+            .clicked
+        {
+            ask = Some(if matches!(chat.over, super::Over::History(_)) {
+                Ask::CloseOver
+            } else {
+                Ask::History
+            });
+        }
+        right = clock.x - 2.0;
+    }
+    // the built-in agent's model can change any time
+    if chat.agent == super::Agent::OpenAi && head.width >= 190.0 {
+        let gear = Rect::new(right - 28.0, head.y + 6.0, 28.0, HEAD - 12.0);
+        if Button::icon_only(crate::icons::image("settings"))
+            .quiet()
+            .icon_size(16.0)
+            .show(ui, Id::AgentButton(6), gear)?
+            .clicked
+        {
+            ask = Some(Ask::SetupOpen);
+        }
+        right = gear.x - 2.0;
+    }
+    let icon = Rect::new(head.x + PAD, head.y + (HEAD - 16.0) / 2.0, 16.0, 16.0);
+    // icon, name and arrow: the name as a whole, its first word, or none
+    let room = right - 6.0 - (icon.right() + 8.0) - 18.0;
     let full = chat.title.as_str();
     let short = full.split(' ').next().unwrap_or(full);
     let shown = [full, short]
         .into_iter()
         .find(|n| ui.text_width(n, &bold) <= room)
-        .unwrap_or(short);
-    let name = Rect::new(icon.right() + 8.0, head.y, room.max(0.0), HEAD);
-    let name_w = ui.text_width(shown, &bold).min(name.width);
-    // the name is the agent switch: a click lists the others
-    let hit = Rect::new(icon.x - 4.0, head.y + 5.0, name_w + 40.0, HEAD - 10.0);
+        .unwrap_or("");
+    let name_w = if shown.is_empty() {
+        0.0
+    } else {
+        ui.text_width(shown, &bold) + 8.0
+    };
+    let hit = Rect::new(
+        icon.x - 6.0,
+        head.y + 6.0,
+        (name_w + 46.0).min(right - icon.x + 4.0),
+        HEAD - 12.0,
+    );
     let input = ui.interact(Id::AgentButton(20), 0, hit, Sense::Click, true);
-    if input.hovered {
+    if input.hovered || matches!(chat.over, super::Over::Agents(_)) {
         ui.round(hit, 6.0, palette.hover)?;
+    }
+    if input.hovered {
         ui.set_cursor(CursorIcon::Pointer);
     }
-    ui.text_clipped(shown, name, &bold, palette.text, Align::Start)?;
-    let arrow = Rect::new(name.x + name_w + 4.0, head.y, 12.0, HEAD);
-    ui.text("▾", arrow, &small, palette.dim, Align::Start)?;
+    crate::icons::draw(ui, "agent", icon, palette.accent)?;
+    let name = Rect::new(icon.right() + 8.0, head.y, name_w, HEAD);
+    if !shown.is_empty() {
+        ui.text_clipped(shown, name, &bold, palette.text, Align::Start)?;
+    }
+    let arrow = Rect::new(name.right(), head.y + (HEAD - 12.0) / 2.0, 12.0, 12.0);
+    if arrow.right() <= right {
+        crate::icons::draw(ui, "chevron-down", arrow, palette.dim)?;
+    }
     if input.clicked {
         ask = Some(if matches!(chat.over, super::Over::Agents(_)) {
             Ask::CloseOver
@@ -328,7 +389,6 @@ fn show_inner(
             Ask::Agents
         });
     }
-    let name_w = name_w + 14.0;
     let (state, tone) = match &chat.state {
         State::Off => (texts.tr("not started"), palette.faint),
         State::Starting => (texts.tr("starting…"), palette.dim),
@@ -337,70 +397,15 @@ fn show_inner(
         State::Working => (texts.tr("working…"), palette.accent),
         State::Failed(_) => (texts.tr("stopped"), palette.danger),
     };
-    let new = Rect::new(head.right() - PAD - new_w, head.y + 6.0, new_w, HEAD - 12.0);
-    // the saved conversations
-    let clock = Rect::new(new.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
-    let input = ui.interact(Id::AgentButton(21), 0, clock, Sense::Click, true);
-    if input.hovered || matches!(chat.over, super::Over::History(_) | super::Over::Past(..)) {
-        ui.round(clock, 6.0, palette.hover)?;
-    }
-    if input.hovered {
-        ui.set_cursor(CursorIcon::Pointer);
-    }
-    let at = Rect::new(
-        clock.x + 5.0,
-        clock.y + (clock.height - 16.0) / 2.0,
-        16.0,
-        16.0,
-    );
-    crate::icons::draw(ui, "history", at, palette.dim)?;
-    if input.clicked {
-        ask = Some(if matches!(chat.over, super::Over::History(_)) {
-            Ask::CloseOver
-        } else {
-            Ask::History
-        });
-    }
-    // the built-in agent's model can change any time
-    let gear = Rect::new(clock.x - 30.0, head.y + 6.0, 26.0, HEAD - 12.0);
-    if chat.agent == super::Agent::OpenAi {
-        let input = ui.interact(Id::AgentButton(6), 0, gear, Sense::Click, true);
-        if input.hovered {
-            ui.round(gear, 6.0, palette.hover)?;
-            ui.set_cursor(CursorIcon::Pointer);
-        }
-        let icon = Rect::new(
-            gear.x + 5.0,
-            gear.y + (gear.height - 16.0) / 2.0,
-            16.0,
-            16.0,
-        );
-        crate::icons::draw(ui, "settings", icon, palette.dim)?;
-        if input.clicked {
-            ask = Some(Ask::SetupOpen);
-        }
-    }
-    // the state's dot always; its word only where it fits before the button
-    let first_button = if chat.agent == super::Agent::OpenAi {
-        gear.x
-    } else {
-        clock.x
-    };
-    let dot = Rect::new(name.x + name_w + 10.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
-    if dot.right() < first_button - 4.0 {
+    // the state's dot where it fits; its word where that fits too
+    let dot = Rect::new(arrow.right() + 8.0, head.y + HEAD / 2.0 - 3.0, 6.0, 6.0);
+    if dot.right() < right - 4.0 {
         ui.round(dot, 3.0, tone)?;
-        let room = first_button - 8.0 - (dot.right() + 6.0);
+        let room = right - 4.0 - (dot.right() + 6.0);
         if ui.text_width(state, &small) <= room {
             let state_at = Rect::new(dot.right() + 6.0, head.y, room, HEAD);
             ui.text(state, state_at, &small, palette.dim, Align::Start)?;
         }
-    }
-    if Button::new(if new_w < 56.0 { "+" } else { texts.tr("New") })
-        .quiet()
-        .show(ui, Id::AgentButton(0), new)?
-        .clicked
-    {
-        ask = Some(Ask::New);
     }
 
     if chat.setup.is_some() {
@@ -525,7 +530,9 @@ fn show_inner(
             ui.text(keys, left, &small, palette.faint, Align::Start)?;
         }
     }
-    if let Some(mode) = chat.current_mode() {
+    if let Some(mode) = chat.current_mode()
+        && left.width >= 30.0
+    {
         let (icon, name) = (mode_icon(&mode.id), texts.tr(&mode.name).to_owned());
         let open = matches!(chat.over, super::Over::Modes);
         let (chip, clicked) = pill(ui, 23, left, icon, &name, open, &small)?;
@@ -720,8 +727,10 @@ fn show_inner(
         talk
     };
 
-    // nothing said yet: what this is, or what is in the way
+    // nothing said yet: what this is, or what is in the way; kept inside
+    // the talk, a narrow panel cuts it rather than draw over the box
     if chat.entries.is_empty() {
+        return ui.clipped(talk, move |ui| {
         let mid = talk.inset(PAD * 2.0);
         let mut cy = mid.y + 24.0;
         let line = |ui: &mut Ui<'_, Id>, text: &str, y: f32, f: &Font, c: Color| {
@@ -789,7 +798,8 @@ fn show_inner(
                 ask = Some(Ask::Start);
             }
         }
-        return Ok(ask);
+        Ok(ask)
+        });
     }
 
     Ok(transcript(ui, chat, talk, (&font, &small, &bold, &mono))?.or(ask))
