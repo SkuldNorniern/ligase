@@ -658,7 +658,7 @@ fn stream(link: &Link, config: &Config, messages: &[Value]) -> Result<(String, V
 /// posts `body` to the chat endpoint; an http error gives the server's own
 /// message.
 fn post(config: &Config, body: &Value) -> Result<ureq::Response, String> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = https()?
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(180))
         .build();
@@ -679,6 +679,17 @@ fn post(config: &Config, body: &Value) -> Result<ureq::Response, String> {
         }
         Err(e) => Err(format!("{url}: {e}")),
     }
+}
+
+/// an agent builder that speaks https: schannel on windows, the security
+/// framework on macos, both with the system's roots; rustls elsewhere.
+fn https() -> Result<ureq::AgentBuilder, String> {
+    let builder = ureq::AgentBuilder::new();
+    #[cfg(any(windows, target_os = "macos"))]
+    let builder = builder.tls_connector(std::sync::Arc::new(
+        ureq::native_tls::TlsConnector::new().map_err(|e| format!("tls: {e}"))?,
+    ));
+    Ok(builder)
 }
 
 /// a rough token count: four bytes a token.

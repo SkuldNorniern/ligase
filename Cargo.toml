@@ -13,11 +13,19 @@ vanta = { git = "https://github.com/SkuldNorniern/vanta", rev = "40fe8683dab31a7
 toml = "1"
 serde_json = "1"
 # the built-in agent's https calls to openai-compatible servers
-ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
 sylven = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-runtime = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 sylven-dsl = { git = "https://github.com/SkuldNorniern/sylven", rev = "f51e7b42ecec2072545c9f300d28f682073dad32" }
 hayro = "0.9.0"
+
+# https: the system's own tls on windows and macos, so no c compiler or
+# assembler is needed there; rustls elsewhere
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [build-dependencies]
 winres = "0.1"
